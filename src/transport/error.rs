@@ -1,0 +1,1 @@
+//! Transport-level error type.

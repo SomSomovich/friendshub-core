@@ -1,0 +1,17 @@
+* text=auto eol=lf
+
+*.rs      text eol=lf
+*.toml    text eol=lf
+*.md      text eol=lf
+*.proto   text eol=lf
+*.sql     text eol=lf
+*.h       text eol=lf
+*.ps1     text eol=crlf
+*.bat     text eol=crlf
+
+*.dll     binary
+*.so      binary
+*.dylib   binary
+*.a       binary
+*.lib     binary
+*.exe     binary

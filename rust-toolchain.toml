@@ -1,0 +1,5 @@
+# Pin to stable. libsignal-protocol MSRV must be satisfied.
+
+[toolchain]
+channel = "stable"
+components = ["rustfmt", "clippy"]
