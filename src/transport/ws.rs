@@ -56,6 +56,10 @@ impl WsClient {
     /// Starts the connect loop as a background task. Returns immediately.
     /// The caller learns about connection state from ws_connected /
     /// ws_disconnected events rather than from this call.
+    ///
+    /// spawn_local, not spawn: decrypting envelopes calls libsignal, whose
+    /// store traits are declared with `#[async_trait(?Send)]`, which makes the
+    /// futures `!Send`. A plain `tokio::spawn` will not accept them.
     pub async fn start(self: Arc<Self>, state: Arc<ActorState>) -> Result<()> {
         if self.inner.running.swap(true, Ordering::SeqCst) {
             return Err(Error::Internal("websocket already running".into()));
@@ -65,7 +69,7 @@ impl WsClient {
         *self.inner.cmd_tx.lock().await = Some(tx);
 
         let self_clone = self.clone();
-        tokio::spawn(async move {
+        tokio::task::spawn_local(async move {
             run_loop(state, self_clone, rx).await;
         });
 
@@ -128,6 +132,7 @@ async fn run_loop(
     state.events.push(Event::ephemeral("ws_stopped", json!({})));
 }
 
+/// Returns Ok(true) when a Shutdown command ended the loop on purpose.
 async fn run_once(
     state: &Arc<ActorState>,
     cmd_rx: &mut mpsc::UnboundedReceiver<Cmd>,
@@ -285,7 +290,24 @@ async fn handle_frame(state: &Arc<ActorState>, frame: ServerFrame) {
 
         server_frame::Kind::Delivery(d) => {
             for env in &d.envelopes {
-                let payload = envelope_to_json(env);
+                let mut payload = envelope_to_json(env);
+
+                // Decryption is attempted eagerly so the consumer sees plaintext
+                // without a second round trip. A failure is not fatal: the raw
+                // ciphertext still goes out in the event payload, and the client
+                // can retry once its local state (session, identity) is fixed.
+                let plaintext_hex = match crate::crypto::manager::decrypt_envelope(state, &payload).await {
+                    Ok(pt) => Some(hex::encode(&pt)),
+                    Err(e) => {
+                        tracing::debug!(error = %e, "envelope decryption failed; delivering ciphertext only");
+                        None
+                    }
+                };
+
+                if let Some(obj) = payload.as_object_mut() {
+                    obj.insert("plaintext_hex".into(), json!(plaintext_hex));
+                }
+
                 let text = match serde_json::to_string(&payload) {
                     Ok(t) => t,
                     Err(e) => {

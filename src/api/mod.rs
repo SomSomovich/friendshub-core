@@ -176,6 +176,13 @@ pub async fn dispatch(state: Arc<ActorState>, method: u32, payload: Vec<u8>) -> 
 
         // webrtc
         0x0011_0001 => webrtc::ice_servers(&state, payload).await,
+        0x0012_0001 => webrtc::create_offer(&state, payload).await,
+        0x0012_0002 => webrtc::accept_offer(&state, payload).await,
+        0x0012_0003 => webrtc::apply_answer(&state, payload).await,
+        0x0012_0004 => webrtc::add_ice(&state, payload).await,
+        0x0012_0005 => webrtc::create_data_channel(&state, payload).await,
+        0x0012_0006 => webrtc::close_call(&state, payload).await,
+        0x0012_0007 => webrtc::list_active(&state, payload).await,
 
         // websocket lifecycle
         0x00FF_0001 => ws::start(&state).await,

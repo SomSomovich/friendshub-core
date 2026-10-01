@@ -57,7 +57,9 @@ fn kyber_u32(id: KyberPreKeyId) -> u32 {
 
 /// Rebuilds an `IdentityKeyPair` from the byte layout `serialize` produces:
 /// a 33-byte public key followed by a 32-byte private key.
-fn decode_identity_key_pair(blob: &[u8]) -> std::result::Result<IdentityKeyPair, SignalProtocolError> {
+pub fn decode_identity_key_pair(
+    blob: &[u8],
+) -> std::result::Result<IdentityKeyPair, SignalProtocolError> {
     if blob.len() != 65 {
         return Err(SignalProtocolError::InvalidArgument(format!(
             "identity key pair blob is {} bytes, expected 65",

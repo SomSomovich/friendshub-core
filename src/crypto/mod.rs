@@ -2,6 +2,7 @@
 
 pub mod device_cache;
 pub mod error;
+pub mod init;
 pub mod manager;
 pub mod stores;
 

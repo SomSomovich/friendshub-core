@@ -10,6 +10,7 @@ use crate::db::Db;
 use crate::error::{Error, Result};
 use crate::events::EventQueue;
 use crate::transport::{HttpClient, WsClient};
+use crate::webrtc::WebRtcManager;
 
 pub struct Actor {
     tx: mpsc::UnboundedSender<Request>,
@@ -27,6 +28,7 @@ pub struct ActorState {
     pub http: HttpClient,
     pub ws: Arc<WsClient>,
     pub events: EventQueue,
+    pub webrtc: Arc<WebRtcManager>,
 }
 
 impl ActorState {
@@ -37,6 +39,7 @@ impl ActorState {
             http,
             ws: Arc::new(WsClient::new()),
             events: EventQueue::new(),
+            webrtc: Arc::new(WebRtcManager::new()),
         }
     }
 }
@@ -79,12 +82,23 @@ impl Actor {
                         }
                     };
 
+                    let state = Arc::new(state);
+
+                    // WebRTC event forwarder. Runs for the lifetime of the actor.
+                    {
+                        let state_for_loop = state.clone();
+                        let manager = state.webrtc.clone();
+                        tokio::task::spawn_local(async move {
+                            manager.run_event_loop(state_for_loop).await;
+                        });
+                    }
+
                     if init_tx.send(Ok(())).is_err() {
                         return;
                     }
                     drop(init_tx);
 
-                    run(rx, Arc::new(state)).await;
+                    run(rx, state).await;
                 }));
             })
             .map_err(|e| Error::SpawnThread(e.to_string()))?;
