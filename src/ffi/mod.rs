@@ -8,6 +8,7 @@ use crate::config::Config;
 use crate::db;
 use crate::error::{Error, Result};
 use crate::runtime::{Actor, ActorState};
+use crate::transport::HttpClient;
 
 pub mod handle;
 pub mod panic;
@@ -21,6 +22,9 @@ use panic::guard;
 pub const ABI_VERSION: u32 = 1;
 
 const ABI_STRING: &[u8] = b"0.1.0\\0";
+
+const METHOD_POLL_EVENT: u32 = 0x0000_0003;
+const METHOD_ACK_EVENT: u32 = 0x0000_0004;
 
 #[unsafe(no_mangle)]
 pub extern "C" fn fh_abi_version() -> u32 {
@@ -70,6 +74,11 @@ pub unsafe extern "C" fn fh_init(
         };
 
         let db_path = cfg.db_path.clone();
+        let http = match HttpClient::new(&cfg) {
+            Ok(h) => h,
+            Err(e) => return write_error(out, &e),
+        };
+
         let actor = match Actor::spawn(move || {
             Box::pin(async move {
                 let db = db::pool::open(&db_path).await?;
@@ -77,7 +86,7 @@ pub unsafe extern "C" fn fh_init(
                     .run(&db)
                     .await
                     .map_err(|e| Error::Database(format!("migrations failed: {e}")))?;
-                Ok(ActorState::new(cfg, db))
+                Ok(ActorState::new(cfg, db, http))
             })
         }) {
             Ok(a) => a,
@@ -131,26 +140,51 @@ pub unsafe extern "C" fn fh_call(
     })
 }
 
-/// Placeholder until the event queue lands. Returns 0 with an empty buffer,
-/// which the caller reads as "no event within the timeout".
+/// Blocks up to timeout_ms for the next event. On timeout returns 0 with an
+/// empty buffer. On any other outcome the buffer carries a JSON event.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fh_poll_event(
-    _handle: *mut FhHandle,
-    _timeout_ms: u32,
+    handle: *mut FhHandle,
+    timeout_ms: u32,
     out: *mut FhBuffer,
 ) -> i32 {
     guard(-1, || {
-        if out.is_null() {
+        if handle.is_null() || out.is_null() {
             return -1;
         }
         unsafe { *out = FhBuffer::EMPTY; }
-        0
+
+        let h = unsafe { &*handle };
+        let payload = timeout_ms.to_le_bytes().to_vec();
+        match h.call(METHOD_POLL_EVENT, payload) {
+            Ok(bytes) => {
+                unsafe { *out = FhBuffer::from_vec(bytes); }
+                0
+            }
+            Err(e) => write_error(out, &e),
+        }
     })
 }
 
+/// Releases the database row for a durable event and, where the event is an
+/// incoming envelope, sends the matching receipt.
 #[unsafe(no_mangle)]
-pub unsafe extern "C" fn fh_ack_event(_handle: *mut FhHandle, _event_id: u64) -> i32 {
-    guard(-1, || 0)
+pub unsafe extern "C" fn fh_ack_event(handle: *mut FhHandle, event_id: u64) -> i32 {
+    guard(-1, || {
+        if handle.is_null() {
+            return -1;
+        }
+
+        let h = unsafe { &*handle };
+        let payload = event_id.to_le_bytes().to_vec();
+        match h.call(METHOD_ACK_EVENT, payload) {
+            Ok(_) => 0,
+            Err(e) => {
+                tracing::warn!(error = %e, event_id, "fh_ack_event failed");
+                1
+            }
+        }
+    })
 }
 
 fn write_error(out: *mut FhBuffer, e: &Error) -> i32 {

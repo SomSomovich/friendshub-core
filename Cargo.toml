@@ -57,7 +57,7 @@ hex = "0.4.3"
 base64 = "0.23.1"
 uuid = { version = "1.26.1", features = ["v4", "v5", "v7"] }
 # rand 0.10: Rng renamed to RngExt, OsRng renamed to SysRng.
-rand = "0.10.3"
+rand = "0.9.4"
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 url = "2.5.8"

@@ -1119,7 +1119,7 @@ dependencies = [
  "parking_lot",
  "prost",
  "prost-build",
- "rand 0.10.3",
+ "rand 0.9.5",
  "reqwest",
  "rustls",
  "rustls-platform-verifier",

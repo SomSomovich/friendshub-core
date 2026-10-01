@@ -3,10 +3,13 @@ use std::thread;
 
 use futures::future::BoxFuture;
 use tokio::sync::mpsc;
+use tokio::task::LocalSet;
 
 use crate::config::Config;
 use crate::db::Db;
 use crate::error::{Error, Result};
+use crate::events::EventQueue;
+use crate::transport::{HttpClient, WsClient};
 
 pub struct Actor {
     tx: mpsc::UnboundedSender<Request>,
@@ -21,11 +24,20 @@ pub struct Request {
 pub struct ActorState {
     pub config: Config,
     pub db: Db,
+    pub http: HttpClient,
+    pub ws: Arc<WsClient>,
+    pub events: EventQueue,
 }
 
 impl ActorState {
-    pub fn new(config: Config, db: Db) -> Self {
-        Self { config, db }
+    pub fn new(config: Config, db: Db, http: HttpClient) -> Self {
+        Self {
+            config,
+            db,
+            http,
+            ws: Arc::new(WsClient::new()),
+            events: EventQueue::new(),
+        }
     }
 }
 
@@ -37,14 +49,15 @@ impl Actor {
         let (tx, rx) = mpsc::unbounded_channel::<Request>();
         let (init_tx, init_rx) = crossbeam_channel::bounded::<Result<()>>(1);
 
-        // The thread owns the runtime; nothing else may hold a handle to it,
-        // otherwise Runtime::drop panics when it runs on the wrong thread.
         thread::Builder::new()
             .name("friendshub-core".into())
             .spawn(move || {
-                let rt = match tokio::runtime::Builder::new_multi_thread()
-                    .worker_threads(2)
-                    .thread_name("friendshub-core-w")
+                // libsignal declares its store traits with `#[async_trait(?Send)]`,
+                // which makes every future awaiting them `!Send`. A multi-threaded
+                // runtime will not schedule such a future at all, so the actor runs
+                // on a single-threaded runtime with a LocalSet and request handlers
+                // are dispatched through spawn_local.
+                let rt = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
                 {
@@ -55,7 +68,9 @@ impl Actor {
                     }
                 };
 
-                rt.block_on(async move {
+                let local = LocalSet::new();
+
+                rt.block_on(local.run_until(async move {
                     let state = match init().await {
                         Ok(s) => s,
                         Err(e) => {
@@ -70,7 +85,7 @@ impl Actor {
                     drop(init_tx);
 
                     run(rx, Arc::new(state)).await;
-                });
+                }));
             })
             .map_err(|e| Error::SpawnThread(e.to_string()))?;
 
@@ -92,8 +107,8 @@ impl Actor {
 async fn run(mut rx: mpsc::UnboundedReceiver<Request>, state: Arc<ActorState>) {
     while let Some(req) = rx.recv().await {
         let state = state.clone();
-        tokio::spawn(async move {
-            let result = crate::api::dispatch(&state, req.method, req.payload).await;
+        tokio::task::spawn_local(async move {
+            let result = crate::api::dispatch(state, req.method, req.payload).await;
             let _ = req.reply.send(result);
         });
     }

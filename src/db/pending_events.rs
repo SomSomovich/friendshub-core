@@ -23,14 +23,14 @@ pub async fn push(db: &SqlitePool, event_type: &str, payload: &str) -> Result<i6
     Ok(id)
 }
 
-pub async fn list(db: &SqlitePool, limit: i64) -> Result<Vec<PendingEvent>> {
-    let rows = sqlx::query_as::<_, PendingEvent>(
-        "SELECT id, event_type, payload, created_at FROM pending_events ORDER BY id ASC LIMIT ?",
+pub async fn get(db: &SqlitePool, id: i64) -> Result<Option<PendingEvent>> {
+    let row = sqlx::query_as::<_, PendingEvent>(
+        "SELECT id, event_type, payload, created_at FROM pending_events WHERE id = ?",
     )
-    .bind(limit)
-    .fetch_all(db)
+    .bind(id)
+    .fetch_optional(db)
     .await?;
-    Ok(rows)
+    Ok(row)
 }
 
 pub async fn ack(db: &SqlitePool, id: i64) -> Result<bool> {
