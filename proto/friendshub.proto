@@ -1,0 +1,142 @@
+syntax = "proto3";
+
+package fh;
+
+message ProtocolVersion {
+  uint32 major = 1;
+  uint32 minor = 2;
+  uint32 patch = 3;
+}
+
+message Envelope {
+  bytes envelope_id = 1;
+  bytes sender_account_id = 2;
+  uint32 sender_device_number = 3;
+  bytes recipient_account_id = 4;
+  uint32 recipient_device_number = 5;
+  EnvelopeType envelope_type = 6;
+  bool is_prekey_message = 7;
+  bytes ciphertext = 8;
+  int64 client_timestamp = 9;
+  bytes conversation_id = 10;
+  bool sender_is_bot = 11;
+}
+
+enum EnvelopeType {
+  ENVELOPE_TYPE_UNSPECIFIED = 0;
+  ENVELOPE_TYPE_MESSAGE = 1;
+  ENVELOPE_TYPE_SYNC = 2;
+  ENVELOPE_TYPE_SENDER_KEY = 3;
+  ENVELOPE_TYPE_EDIT = 4;
+  ENVELOPE_TYPE_DELETE = 5;
+  ENVELOPE_TYPE_REACTION = 6;
+  ENVELOPE_TYPE_READ_RECEIPT = 7;
+  ENVELOPE_TYPE_TYPING = 8;
+  ENVELOPE_TYPE_ATTACHMENT_KEY = 9;
+  ENVELOPE_TYPE_CALL_OFFER = 10;
+  ENVELOPE_TYPE_CALL_ANSWER = 11;
+  ENVELOPE_TYPE_CALL_ICE = 12;
+  ENVELOPE_TYPE_CALL_HANGUP = 13;
+  ENVELOPE_TYPE_CALL_REJECT = 14;
+  ENVELOPE_TYPE_BOT_MESSAGE = 15;
+  ENVELOPE_TYPE_PIN = 16;
+  ENVELOPE_TYPE_UNPIN = 17;
+}
+
+message ClientFrame {
+  oneof kind {
+    ClientHello hello = 1;
+    EnvelopeUpload upload = 2;
+    EnvelopeAck ack = 3;
+    Ping ping = 4;
+  }
+}
+
+message ClientHello {
+  string session_token = 1;
+  uint32 device_number = 2;
+  uint32 protocol_major = 3;
+  uint32 protocol_minor = 4;
+  uint32 protocol_patch = 5;
+  string client_name = 6;
+  string client_version = 7;
+}
+
+message EnvelopeUpload {
+  repeated Envelope envelopes = 1;
+}
+
+message EnvelopeAck {
+  repeated bytes envelope_ids = 1;
+}
+
+message Ping {
+  uint64 client_timestamp = 1;
+}
+
+message ServerFrame {
+  oneof kind {
+    ServerHello hello = 1;
+    EnvelopeDelivery delivery = 2;
+    EnvelopeAck receipt = 3;
+    Pong pong = 4;
+    ErrorFrame error = 5;
+    PresenceUpdate presence = 6;
+    BotMessageDelivery bot_message = 7;
+    ChannelPostDelivery channel_post = 8;
+  }
+}
+
+message ServerHello {
+  string session_id = 1;
+  bytes account_id = 2;
+  uint32 device_number = 3;
+  uint64 server_timestamp = 4;
+  uint32 protocol_major = 5;
+  uint32 protocol_minor = 6;
+  uint32 protocol_patch = 7;
+}
+
+message EnvelopeDelivery {
+  repeated Envelope envelopes = 1;
+}
+
+message Pong {
+  uint64 client_timestamp = 1;
+  uint64 server_timestamp = 2;
+}
+
+message ErrorFrame {
+  string code = 1;
+  string message = 2;
+  bool fatal = 3;
+}
+
+message PresenceUpdate {
+  bytes account_id = 1;
+  bool is_online = 2;
+  optional int64 last_seen = 3;
+  optional string custom_status_text = 4;
+  optional string custom_status_emoji = 5;
+  optional int64 custom_status_expires_at = 6;
+}
+
+message BotMessageDelivery {
+  string message_id = 1;
+  bytes bot_id = 2;                // UUID
+  bytes account_id = 3;            // UUID (the human user)
+  string text = 4;
+  optional string reply_to_message_id = 5;
+  int64 created_at = 6;
+}
+
+message ChannelPostDelivery {
+  string post_id = 1;
+  bytes channel_id = 2;
+  string author_type = 3;
+  bytes author_id = 4;
+  string text = 5;
+  repeated string attachment_ids = 6;
+  optional string reply_to_post_id = 7;
+  int64 created_at = 8;
+}

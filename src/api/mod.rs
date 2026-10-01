@@ -16,6 +16,7 @@ pub mod channels;
 pub mod common;
 pub mod contacts;
 pub mod conversations;
+pub mod device_init;
 pub mod devices;
 pub mod groups;
 pub mod invites;
@@ -67,11 +68,15 @@ pub async fn dispatch(state: Arc<ActorState>, method: u32, payload: Vec<u8>) -> 
         0x0004_0001 => messages::establish_session(&state, payload).await,
         0x0004_0002 => messages::send(&state, payload).await,
         0x0004_0003 => messages::decrypt(&state, payload).await,
+        0x0004_0004 => messages::send_message(&state, payload).await,
 
         // devices
         0x0005_0001 => devices::list(&state, payload).await,
         0x0005_0002 => devices::register(&state, payload).await,
         0x0005_0003 => devices::revoke(&state, payload).await,
+        0x0005_0004 => device_init::initialize(&state, payload).await,
+        0x0005_0005 => device_init::status(&state, payload).await,
+        0x0005_0015 => device_init::ensure_prekeys(&state, payload).await,
 
         // prekeys
         0x0005_0011 => prekeys::upload(&state, payload).await,

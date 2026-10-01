@@ -1,14 +1,13 @@
 // Build script: compile friendshub.proto into Rust types via prost-build.
 //
-// The proto file lives in the friendshubB repository, which is private. We do
-// not clone it from git — the path is resolved locally.
-//
 // Resolution order:
 //   1. FRIENDSHUB_PROTO_DIR environment variable (directory containing the .proto)
-//   2. ../friendshubB/proto relative to this crate's manifest directory
+//   2. proto/ next to this crate's manifest — the vendored copy, used by CI
 //
-// The resulting Rust file is named after the proto package (`fh`), so it
-// lands in $OUT_DIR/fh.rs and is pulled in by src/proto/mod.rs via include!.
+// The vendored copy under proto/ is what CI and downstream builds see. Local
+// development against the live backend is a matter of pointing
+// FRIENDSHUB_PROTO_DIR at friendshubB/proto; the vendored file can then be
+// refreshed by copying it over.
 
 use std::env;
 use std::path::PathBuf;
@@ -20,15 +19,16 @@ fn main() {
 
     let proto_dir = match env::var("FRIENDSHUB_PROTO_DIR") {
         Ok(p) => PathBuf::from(p),
-        Err(_) => manifest_dir.join("../friendshubB/proto"),
+        Err(_) => manifest_dir.join("proto"),
     };
 
     if !proto_dir.is_dir() {
         panic!(
             "proto directory does not exist: {}. \\
              Set FRIENDSHUB_PROTO_DIR to the directory containing friendshub.proto, \\
-             or place the friendshubB repository next to friendshub-core.",
-            proto_dir.display()
+             or place a copy at {}/proto/friendshub.proto.",
+            proto_dir.display(),
+            manifest_dir.display()
         );
     }
 

@@ -34,6 +34,23 @@ async fn local_address(state: &ActorState) -> CryptoResult<ProtocolAddress> {
     Ok(ProtocolAddress::new(account_id, device))
 }
 
+/// True when a session already exists for the given peer device.
+pub async fn has_session(
+    state: &ActorState,
+    account_id: &str,
+    device_number: i64,
+) -> CryptoResult<bool> {
+    let n: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sessions WHERE account_id = ? AND device_number = ?",
+    )
+    .bind(account_id)
+    .bind(device_number)
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| CryptoError::Database(e.to_string()))?;
+    Ok(n > 0)
+}
+
 fn bundle_from_json(v: &serde_json::Value) -> CryptoResult<PreKeyBundle> {
     let registration_id = v
         .get("registration_id")
