@@ -8,6 +8,7 @@ use serde_json::json;
 use tokio::sync::{mpsc, Mutex};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
+use crate::crypto::groups;
 use crate::db::{auth as db_auth, pending_events};
 use crate::error::{Error, Result};
 use crate::events::types::Event;
@@ -23,6 +24,9 @@ const PROTOCOL_MINOR: u32 = 1;
 const PROTOCOL_PATCH: u32 = 0;
 const PING_INTERVAL_SECS: u64 = 30;
 const CLIENT_NAME: &str = "friendshub-core";
+
+const ENVELOPE_TYPE_MESSAGE: i32 = 1;
+const ENVELOPE_TYPE_SENDER_KEY: i32 = 3;
 
 enum Cmd {
     Send(ClientFrame),
@@ -290,45 +294,7 @@ async fn handle_frame(state: &Arc<ActorState>, frame: ServerFrame) {
 
         server_frame::Kind::Delivery(d) => {
             for env in &d.envelopes {
-                let mut payload = envelope_to_json(env);
-
-                // Decryption is attempted eagerly so the consumer sees plaintext
-                // without a second round trip. A failure is not fatal: the raw
-                // ciphertext still goes out in the event payload, and the client
-                // can retry once its local state (session, identity) is fixed.
-                let plaintext_hex = match crate::crypto::manager::decrypt_envelope(state, &payload).await {
-                    Ok(pt) => Some(hex::encode(&pt)),
-                    Err(e) => {
-                        tracing::debug!(error = %e, "envelope decryption failed; delivering ciphertext only");
-                        None
-                    }
-                };
-
-                if let Some(obj) = payload.as_object_mut() {
-                    obj.insert("plaintext_hex".into(), json!(plaintext_hex));
-                }
-
-                let text = match serde_json::to_string(&payload) {
-                    Ok(t) => t,
-                    Err(e) => {
-                        tracing::warn!(error = %e, "failed to serialize envelope");
-                        continue;
-                    }
-                };
-
-                let id = match pending_events::push(&state.db, "envelope_received", &text).await {
-                    Ok(id) => id,
-                    Err(e) => {
-                        tracing::warn!(error = ?e, "failed to persist pending envelope");
-                        continue;
-                    }
-                };
-
-                state.events.push(Event {
-                    id: Some(id as u64),
-                    kind: "envelope_received".to_string(),
-                    payload,
-                });
+                handle_envelope(state, env).await;
             }
         }
 
@@ -383,6 +349,119 @@ async fn handle_frame(state: &Arc<ActorState>, frame: ServerFrame) {
             state.events.push(Event::ephemeral("channel_post", payload));
         }
     }
+}
+
+/// One envelope, three possibilities.
+///
+/// - `SENDER_KEY`: a distribution message from another member of a group.
+///   Fed to the group machinery; the sender key it carries is stored so
+///   future group messages from that device can be decrypted. No plaintext
+///   is produced.
+/// - `MESSAGE` whose ciphertext begins with the SenderKeyMessage version byte:
+///   a group message. Decrypted through the group path.
+/// - anything else: an ordinary Signal-encrypted envelope, decrypted through
+///   the pairwise session.
+async fn handle_envelope(state: &Arc<ActorState>, env: &Envelope) {
+    let mut payload = envelope_to_json(env);
+
+    let sender_account_id = uuid_or_hex(&env.sender_account_id);
+    let sender_device_number = env.sender_device_number as i64;
+    let conversation_id = if env.conversation_id.is_empty() {
+        None
+    } else {
+        Some(uuid_or_hex(&env.conversation_id))
+    };
+
+    let outcome = if env.envelope_type == ENVELOPE_TYPE_SENDER_KEY {
+        match groups::process_distribution(
+            state,
+            &sender_account_id,
+            sender_device_number,
+            &env.ciphertext,
+        )
+        .await
+        {
+            Ok(()) => EnvelopeOutcome::DistributionStored,
+            Err(e) => EnvelopeOutcome::Failed(e.to_string()),
+        }
+    } else if env.envelope_type == ENVELOPE_TYPE_MESSAGE
+        && groups::looks_like_sender_key_message(&env.ciphertext)
+    {
+        match groups::decrypt_from_group(
+            state,
+            &sender_account_id,
+            sender_device_number,
+            &env.ciphertext,
+        )
+        .await
+        {
+            Ok(pt) => EnvelopeOutcome::Plaintext(hex::encode(&pt)),
+            Err(e) => EnvelopeOutcome::Failed(e.to_string()),
+        }
+    } else {
+        match crate::crypto::manager::decrypt_envelope(state, &payload).await {
+            Ok(pt) => EnvelopeOutcome::Plaintext(hex::encode(&pt)),
+            Err(e) => EnvelopeOutcome::Failed(e.to_string()),
+        }
+    };
+
+    match outcome {
+        EnvelopeOutcome::Plaintext(hex) => {
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("plaintext_hex".into(), json!(hex));
+                obj.insert("group".into(), json!(env.envelope_type == ENVELOPE_TYPE_MESSAGE && groups::looks_like_sender_key_message(&env.ciphertext)));
+            }
+        }
+        EnvelopeOutcome::DistributionStored => {
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("plaintext_hex".into(), json!(null));
+                obj.insert("distribution".into(), json!(true));
+            }
+        }
+        EnvelopeOutcome::Failed(reason) => {
+            tracing::debug!(
+                error = %reason,
+                envelope_type = env.envelope_type,
+                "envelope could not be decrypted; delivering ciphertext only"
+            );
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert("plaintext_hex".into(), json!(null));
+                obj.insert("decrypt_error".into(), json!(reason));
+            }
+        }
+    }
+
+    // The conversation_id is only recorded in the payload so a consumer can
+    // route the event; it plays no role in decryption.
+    let _ = conversation_id;
+
+    let text = match serde_json::to_string(&payload) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!(error = %e, "failed to serialize envelope");
+            return;
+        }
+    };
+
+    let id = match pending_events::push(&state.db, "envelope_received", &text).await {
+        Ok(id) => id,
+        Err(e) => {
+            tracing::warn!(error = ?e, "failed to persist pending envelope");
+            return;
+        }
+    };
+
+    state.events.push(Event {
+        id: Some(id as u64),
+        kind: "envelope_received".to_string(),
+        payload,
+    });
+}
+
+enum EnvelopeOutcome {
+    Plaintext(String),
+    DistributionStored,
+    Failed(String),
 }
 
 fn envelope_to_json(e: &Envelope) -> serde_json::Value {

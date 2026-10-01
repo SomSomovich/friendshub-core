@@ -3,7 +3,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::api::common::bearer;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::runtime::ActorState;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -54,7 +54,6 @@ pub struct SdpResponse {
     pub sdp: String,
 }
 
-/// Creates a peer connection and returns an SDP offer.
 pub async fn create_offer(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
     let req: CreateCallRequest = serde_json::from_slice(&payload)?;
     let ice = fetch_ice(state).await?;
@@ -71,7 +70,6 @@ pub struct AcceptCallRequest {
     pub remote_sdp: String,
 }
 
-/// Accepts a remote SDP offer and returns an SDP answer.
 pub async fn accept_offer(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
     let req: AcceptCallRequest = serde_json::from_slice(&payload)?;
     let ice = fetch_ice(state).await?;
@@ -93,10 +91,7 @@ pub struct ApplyAnswerRequest {
 
 pub async fn apply_answer(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
     let req: ApplyAnswerRequest = serde_json::from_slice(&payload)?;
-    state
-        .webrtc
-        .apply_answer(&req.call_id, &req.remote_sdp)
-        .await?;
+    state.webrtc.apply_answer(&req.call_id, &req.remote_sdp).await?;
     Ok(br#"{"ok":true}"#.to_vec())
 }
 
@@ -146,5 +141,127 @@ pub async fn list_active(state: &Arc<ActorState>, _payload: Vec<u8>) -> Result<V
     Ok(serde_json::to_vec(&rows)?)
 }
 
-#[allow(dead_code)]
-fn _unused(_: Error, _: SdpResponse) {}
+// ---------------------------------------------------------------
+// End-to-end call signaling: create or accept a peer connection and
+// send the SDP through the Signal-encrypted envelope channel in one call.
+// ---------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct InitiateCallRequest {
+    pub recipient_account_id: String,
+    pub call_id: String,
+}
+
+pub async fn initiate_call(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
+    let req: InitiateCallRequest = serde_json::from_slice(&payload)?;
+    let ice = fetch_ice(state).await?;
+    let sdp = state.webrtc.create_offer(&req.call_id, ice).await?;
+    let sent = crate::webrtc::signal::send_call_offer(
+        state,
+        &req.recipient_account_id,
+        &req.call_id,
+        &sdp,
+)
+    .await?;
+    Ok(serde_json::to_vec(&serde_json::json!({
+        "call_id": req.call_id,
+        "sdp": sdp,
+        "envelopes_sent": sent.len(),
+    }))?)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct AcceptIncomingCallRequest {
+    pub recipient_account_id: String,
+    pub call_id: String,
+    pub remote_sdp: String,
+}
+
+pub async fn accept_call(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
+    let req: AcceptIncomingCallRequest = serde_json::from_slice(&payload)?;
+    let ice = fetch_ice(state).await?;
+    let sdp = state
+        .webrtc
+        .accept_offer(&req.call_id, &req.remote_sdp, ice)
+        .await?;
+    let sent = crate::webrtc::signal::send_call_answer(
+        state,
+        &req.recipient_account_id,
+        &req.call_id,
+        &sdp,
+)
+    .await?;
+    Ok(serde_json::to_vec(&serde_json::json!({
+        "call_id": req.call_id,
+        "sdp": sdp,
+        "envelopes_sent": sent.len(),
+    }))?)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct SendIceRequest {
+    pub recipient_account_id: String,
+    pub call_id: String,
+    pub candidate: serde_json::Value,
+}
+
+pub async fn send_ice(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
+    let req: SendIceRequest = serde_json::from_slice(&payload)?;
+    state
+        .webrtc
+        .add_ice_candidate(&req.call_id, req.candidate.clone())
+        .await?;
+    let sent = crate::webrtc::signal::send_call_ice(
+        state,
+        &req.recipient_account_id,
+        &req.call_id,
+        req.candidate,
+)
+    .await?;
+    Ok(serde_json::to_vec(&serde_json::json!({
+        "envelopes_sent": sent.len(),
+    }))?)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct HangupRequest {
+    pub recipient_account_id: String,
+    pub call_id: String,
+    pub reason: Option<String>,
+}
+
+pub async fn hangup(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
+    let req: HangupRequest = serde_json::from_slice(&payload)?;
+    let _ = state.webrtc.close(&req.call_id).await;
+    let sent = crate::webrtc::signal::send_call_hangup(
+        state,
+        &req.recipient_account_id,
+        &req.call_id,
+        req.reason.as_deref(),
+)
+    .await?;
+    Ok(serde_json::to_vec(&serde_json::json!({
+        "envelopes_sent": sent.len(),
+    }))?)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct RejectRequest {
+    pub recipient_account_id: String,
+    pub call_id: String,
+    pub reason: Option<String>,
+}
+
+pub async fn reject(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
+    let req: RejectRequest = serde_json::from_slice(&payload)?;
+    let sent = crate::webrtc::signal::send_call_reject(
+        state,
+        &req.recipient_account_id,
+        &req.call_id,
+        req.reason.as_deref(),
+)
+    .await?;
+    Ok(serde_json::to_vec(&serde_json::json!({
+        "envelopes_sent": sent.len(),
+    }))?)
+}

@@ -65,6 +65,7 @@ parking_lot = "0.12.5"
 crossbeam-channel = "0.5.16"
 once_cell = "1.21.4"
 zeroize = { version = "1.9.0", features = ["derive"] }
+chacha20poly1305 = { version = "0.10", features = ["std"] }
 
 # keyring 4.x is deprecated and split. Do not enable until we decide on a
 # secure storage approach. See docs/ for notes.

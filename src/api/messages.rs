@@ -4,14 +4,16 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::common::bearer;
 use crate::crypto::device_cache;
-use crate::crypto::manager::{
-    decrypt_envelope, encrypt_for_device, establish_outbound_session, has_session,
-};
+use crate::crypto::manager::{decrypt_envelope, encrypt_for_device, establish_outbound_session};
+use crate::crypto::send::{send_one, SentEnvelope};
 use crate::db::auth as db_auth;
 use crate::error::{Error, Result};
 use crate::runtime::ActorState;
-use crate::transport::ws::upload_envelope;
-use crate::util::time::now_unix;
+
+/// ENVELOPE_TYPE_MESSAGE from friendshub.proto.
+pub const ENVELOPE_TYPE_MESSAGE: i32 = 1;
+/// ENVELOPE_TYPE_SYNC from friendshub.proto.
+pub const ENVELOPE_TYPE_SYNC: i32 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EstablishSessionRequest {
@@ -22,14 +24,9 @@ pub struct EstablishSessionRequest {
 
 pub async fn establish_session(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
     let req: EstablishSessionRequest = serde_json::from_slice(&payload)?;
-    establish_outbound_session(
-        state,
-        &req.recipient_account_id,
-        req.device_number,
-        &req.bundle,
-    )
-    .await
-    .map_err(Error::from)?;
+    establish_outbound_session(state, &req.recipient_account_id, req.device_number, &req.bundle)
+        .await
+        .map_err(Error::from)?;
     Ok(br#"{"ok":true}"#.to_vec())
 }
 
@@ -49,8 +46,6 @@ pub struct SendResponse {
     pub envelope_type: i32,
 }
 
-/// Low-level single-device encrypt. Use `send_message` unless you need to
-/// drive session management yourself.
 pub async fn send(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
     let req: SendRequest = serde_json::from_slice(&payload)?;
     let plaintext = hex::decode(&req.plaintext_hex)
@@ -68,7 +63,7 @@ pub async fn send(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> 
     Ok(serde_json::to_vec(&SendResponse {
         ciphertext_hex: hex::encode(&ciphertext),
         is_prekey_message: is_prekey,
-        envelope_type: 1,
+        envelope_type: ENVELOPE_TYPE_MESSAGE,
     })?)
 }
 
@@ -86,37 +81,34 @@ pub async fn decrypt(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8
 }
 
 // ---------------------------------------------------------------
-// High-level send: fetch device list, bundle, session, encrypt, upload.
+// High-level send: recipients + own devices, in one call.
 // ---------------------------------------------------------------
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SendMessageRequest {
     pub recipient_account_id: String,
-    /// Plaintext as hex: the same encoding that crosses the wire, so the JSON
-    /// payload stays a single string and cannot trip over text encoding.
     pub plaintext_hex: String,
 
-    /// Optional. When absent, the message goes to every active device of the
-    /// recipient. When present, only that device receives a copy -- useful for
-    /// retrying a device that failed on a previous attempt.
+    /// When absent, the message goes to every active device of the recipient.
     #[serde(default)]
     pub device_number: Option<i64>,
 
     #[serde(default)]
     pub conversation_id: Option<String>,
 
-    /// When true, the cached device list is discarded and refetched before
-    /// sending. Use after learning that the recipient added a device.
+    /// When true, the cached device list is refetched first.
     #[serde(default)]
     pub refresh_devices: bool,
+
+    /// When true (default), a copy of the outgoing message is sent to the
+    /// caller's other devices, so their local conversation state stays in
+    /// step with the one that sent it.
+    #[serde(default = "default_true")]
+    pub sync: bool,
 }
 
-#[derive(Debug, Clone, Serialize)]
-pub struct SentEnvelope {
-    pub device_number: i64,
-    pub envelope_id: String,
-    pub is_prekey_message: bool,
-    pub ciphertext_len: usize,
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -129,23 +121,16 @@ pub struct DeviceError {
 pub struct SendMessageResponse {
     pub envelopes: Vec<SentEnvelope>,
     pub device_errors: Vec<DeviceError>,
+    pub sync_envelopes: Vec<SentEnvelope>,
+    pub sync_errors: Vec<DeviceError>,
 }
 
-/// The whole send path in one call.
+/// Full send path: recipient devices, then own devices for sync.
 ///
-/// 1. Loads the local auth state.
-/// 2. Resolves the target devices: either the single one in the request, or
-///    every active device of the recipient (from cache, or freshly fetched).
-/// 3. For each device: establishes a session when none exists, encrypts,
-///    uploads the envelope.
-///
-/// A device that fails does not abort the whole send. The response carries
-/// one entry per successful device and one error per failed device. The
-/// caller decides what to do with partial success -- retry the failed
-/// devices, surface the error to the user, or ignore it.
-///
-/// Device list TTL is `device_cache::CACHE_TTL_SECS`; pass
-/// `refresh_devices: true` to bypass it.
+/// A device that fails does not abort the batch. Per-device detail is more
+/// useful to the caller than a single boolean. If every device fails on the
+/// recipient side the response still returns, with an empty `envelopes` and
+/// a populated `device_errors`; the caller decides whether to retry.
 pub async fn send_message(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
     let req: SendMessageRequest = serde_json::from_slice(&payload)?;
     let plaintext = hex::decode(&req.plaintext_hex)
@@ -181,96 +166,109 @@ pub async fn send_message(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<V
     let mut envelopes = Vec::with_capacity(target_devices.len());
     let mut device_errors = Vec::new();
 
-    for device_number in target_devices {
-        match send_to_one_device(
+    for device_number in &target_devices {
+        match send_one(
             state,
             &token,
             &sender_account_id,
             sender_device_number,
-            &req,
+            &req.recipient_account_id,
+            *device_number,
             &plaintext,
-            device_number,
-        )
+            ENVELOPE_TYPE_MESSAGE,
+            req.conversation_id.as_deref(),
+)
         .await
         {
             Ok(info) => envelopes.push(info),
             Err(e) => device_errors.push(DeviceError {
-                device_number,
+                device_number: *device_number,
                 error: e.to_string(),
             }),
+        }
+    }
+
+    let mut sync_envelopes = Vec::new();
+    let mut sync_errors = Vec::new();
+
+    if req.sync && !envelopes.is_empty() {
+        let sync_payload = serde_json::json!({
+            "kind": "sync_sent",
+            "to_account": req.recipient_account_id,
+            "to_devices": target_devices,
+            "conversation_id": req.conversation_id,
+            "plaintext_hex": req.plaintext_hex,
+            "envelope_ids": envelopes.iter().map(|e| e.envelope_id.clone()).collect::<Vec<_>>(),
+        });
+        let sync_bytes = serde_json::to_vec(&sync_payload)?;
+
+        match sync_to_own_devices(
+            state,
+            &token,
+            &sender_account_id,
+            sender_device_number,
+            &sync_bytes,
+            req.conversation_id.as_deref(),
+)
+        .await
+        {
+            Ok((envs, errs)) => {
+                sync_envelopes = envs;
+                sync_errors = errs;
+            }
+            Err(e) => {
+                sync_errors.push(DeviceError {
+                    device_number: 0,
+                    error: format!("sync fanout failed: {e}"),
+                });
+            }
         }
     }
 
     Ok(serde_json::to_vec(&SendMessageResponse {
         envelopes,
         device_errors,
+        sync_envelopes,
+        sync_errors,
     })?)
 }
 
-#[allow(clippy::too_many_arguments)]
-async fn send_to_one_device(
+async fn sync_to_own_devices(
     state: &Arc<ActorState>,
     token: &str,
     sender_account_id: &str,
     sender_device_number: i64,
-    req: &SendMessageRequest,
-    plaintext: &[u8],
-    device_number: i64,
-) -> Result<SentEnvelope> {
-    // Establish a session only when one is missing. The local query is cheap;
-    // the bundle fetch is a network round trip and is skipped entirely once a
-    // session exists.
-    let have = has_session(state, &req.recipient_account_id, device_number)
-        .await
-        .map_err(Error::from)?;
+    payload: &[u8],
+    conversation_id: Option<&str>,
+) -> Result<(Vec<SentEnvelope>, Vec<DeviceError>)> {
+    let devices = device_cache::get(state, sender_account_id).await?;
+    let mut envelopes = Vec::new();
+    let mut errors = Vec::new();
 
-    if !have {
-        let path = format!(
-            "/api/v1/accounts/{}/devices/{}/bundle",
-            req.recipient_account_id, device_number
-        );
-        let bundle: serde_json::Value = state.http.get(&path, Some(token)).await?;
-        establish_outbound_session(
+    for d in devices {
+        if d.device_number == sender_device_number {
+            continue;
+        }
+        match send_one(
             state,
-            &req.recipient_account_id,
-            device_number,
-            &bundle,
-        )
+            token,
+            sender_account_id,
+            sender_device_number,
+            sender_account_id,
+            d.device_number,
+            payload,
+            ENVELOPE_TYPE_SYNC,
+            conversation_id,
+)
         .await
-        .map_err(Error::from)?;
+        {
+            Ok(info) => envelopes.push(info),
+            Err(e) => errors.push(DeviceError {
+                device_number: d.device_number,
+                error: e.to_string(),
+            }),
+        }
     }
 
-    let (ciphertext, is_prekey) = encrypt_for_device(
-        state,
-        &req.recipient_account_id,
-        device_number,
-        plaintext,
-    )
-    .await
-    .map_err(Error::from)?;
-
-    let envelope_id = uuid::Uuid::now_v7().to_string();
-
-    let envelope = serde_json::json!({
-        "envelope_id": envelope_id,
-        "sender_account_id": sender_account_id,
-        "sender_device_number": sender_device_number,
-        "recipient_account_id": req.recipient_account_id,
-        "recipient_device_number": device_number,
-        "envelope_type": 1, // ENVELOPE_TYPE_MESSAGE
-        "is_prekey_message": is_prekey,
-        "ciphertext": hex::encode(&ciphertext),
-        "client_timestamp": now_unix(),
-        "conversation_id": req.conversation_id,
-        "sender_is_bot": false,
-    });
-
-    upload_envelope(state, envelope).await?;
-
-    Ok(SentEnvelope {
-        device_number,
-        envelope_id,
-        is_prekey_message: is_prekey,
-        ciphertext_len: ciphertext.len(),
-    })
+    Ok((envelopes, errors))
 }

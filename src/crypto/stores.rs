@@ -15,7 +15,8 @@ use libsignal_protocol::{
     SessionRecord, SignalProtocolError, SignedPreKeyId, SignedPreKeyRecord,
 };
 use libsignal_protocol::{
-    IdentityKeyStore, KyberPreKeyStore, PreKeyStore, SessionStore, SignedPreKeyStore,
+    IdentityKeyStore, KyberPreKeyStore, PreKeyStore, SenderKeyStore, SessionStore,
+    SignedPreKeyStore,
 };
 
 use crate::util::time::now_unix;
@@ -396,5 +397,65 @@ impl SessionStore for Store {
         .await
         .map_err(store_err)?;
         Ok(())
+    }
+}
+
+// ---------------------------------------------------------------
+// SenderKeyStore
+// ---------------------------------------------------------------
+
+#[async_trait(?Send)]
+impl SenderKeyStore for Store {
+    async fn store_sender_key(
+        &mut self,
+        sender: &ProtocolAddress,
+        distribution_id: uuid::Uuid,
+        record: &libsignal_protocol::SenderKeyRecord,
+    ) -> std::result::Result<(), SignalProtocolError> {
+        let account_id = addr_name(sender).to_string();
+        let device_number = addr_dev(sender);
+        let dist_bytes = distribution_id.as_bytes().to_vec();
+        let blob = record.serialize().map_err(store_err)?;
+        let now = now_unix();
+
+        sqlx::query(
+            "INSERT INTO sender_keys (sender_account_id, sender_device_number, distribution_id, record, updated_at) VALUES (?, ?, ?, ?, ?) ON CONFLICT(sender_account_id, sender_device_number, distribution_id) DO UPDATE SET record = excluded.record, updated_at = excluded.updated_at",
+        )
+        .bind(&account_id)
+        .bind(device_number)
+        .bind(&dist_bytes)
+        .bind(&blob)
+        .bind(now)
+        .execute(&self.db)
+        .await
+        .map_err(store_err)?;
+        Ok(())
+    }
+
+    async fn load_sender_key(
+        &mut self,
+        sender: &ProtocolAddress,
+        distribution_id: uuid::Uuid,
+    ) -> std::result::Result<Option<libsignal_protocol::SenderKeyRecord>, SignalProtocolError> {
+        let account_id = addr_name(sender).to_string();
+        let device_number = addr_dev(sender);
+        let dist_bytes = distribution_id.as_bytes().to_vec();
+
+        let row: Option<(Vec<u8>,)> = sqlx::query_as(
+            "SELECT record FROM sender_keys WHERE sender_account_id = ? AND sender_device_number = ? AND distribution_id = ?",
+        )
+        .bind(&account_id)
+        .bind(device_number)
+        .bind(&dist_bytes)
+        .fetch_optional(&self.db)
+        .await
+        .map_err(store_err)?;
+
+        match row {
+            Some((blob,)) => Ok(Some(
+                libsignal_protocol::SenderKeyRecord::deserialize(&blob).map_err(store_err)?,
+            )),
+            None => Ok(None),
+        }
     }
 }

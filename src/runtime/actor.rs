@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::thread;
+use std::time::Duration;
 
 use futures::future::BoxFuture;
 use tokio::sync::mpsc;
@@ -12,14 +13,22 @@ use crate::events::EventQueue;
 use crate::transport::{HttpClient, WsClient};
 use crate::webrtc::WebRtcManager;
 
-pub struct Actor {
-    tx: mpsc::UnboundedSender<Request>,
+/// Messages the actor thread understands. `Shutdown` exists so `fh_destroy`
+/// can ask the websocket to close and the loop to stop, instead of dropping
+/// the sender and letting the socket die with the process.
+pub enum ActorMessage {
+    Call(Request),
+    Shutdown(crossbeam_channel::Sender<()>),
 }
 
 pub struct Request {
     pub method: u32,
     pub payload: Vec<u8>,
     pub reply: crossbeam_channel::Sender<Result<Vec<u8>>>,
+}
+
+pub struct Actor {
+    tx: mpsc::UnboundedSender<ActorMessage>,
 }
 
 pub struct ActorState {
@@ -49,17 +58,12 @@ impl Actor {
     where
         F: FnOnce() -> BoxFuture<'static, Result<ActorState>> + Send + 'static,
     {
-        let (tx, rx) = mpsc::unbounded_channel::<Request>();
+        let (tx, rx) = mpsc::unbounded_channel::<ActorMessage>();
         let (init_tx, init_rx) = crossbeam_channel::bounded::<Result<()>>(1);
 
         thread::Builder::new()
             .name("friendshub-core".into())
             .spawn(move || {
-                // libsignal declares its store traits with `#[async_trait(?Send)]`,
-                // which makes every future awaiting them `!Send`. A multi-threaded
-                // runtime will not schedule such a future at all, so the actor runs
-                // on a single-threaded runtime with a LocalSet and request handlers
-                // are dispatched through spawn_local.
                 let rt = match tokio::runtime::Builder::new_current_thread()
                     .enable_all()
                     .build()
@@ -72,7 +76,6 @@ impl Actor {
                 };
 
                 let local = LocalSet::new();
-
                 rt.block_on(local.run_until(async move {
                     let state = match init().await {
                         Ok(s) => s,
@@ -81,10 +84,8 @@ impl Actor {
                             return;
                         }
                     };
-
                     let state = Arc::new(state);
 
-                    // WebRTC event forwarder. Runs for the lifetime of the actor.
                     {
                         let state_for_loop = state.clone();
                         let manager = state.webrtc.clone();
@@ -113,17 +114,40 @@ impl Actor {
     pub fn call(&self, method: u32, payload: Vec<u8>) -> Result<Vec<u8>> {
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         let req = Request { method, payload, reply: reply_tx };
-        self.tx.send(req).map_err(|_| Error::ActorClosed)?;
+        self.tx
+            .send(ActorMessage::Call(req))
+            .map_err(|_| Error::ActorClosed)?;
         reply_rx.recv().map_err(|_| Error::ActorClosed)?
     }
 }
 
-async fn run(mut rx: mpsc::UnboundedReceiver<Request>, state: Arc<ActorState>) {
-    while let Some(req) = rx.recv().await {
-        let state = state.clone();
-        tokio::task::spawn_local(async move {
-            let result = crate::api::dispatch(state, req.method, req.payload).await;
-            let _ = req.reply.send(result);
-        });
+impl Drop for Actor {
+    fn drop(&mut self) {
+        // Ask the actor thread to close the websocket and stop. The wait is
+        // bounded: if the thread is stuck on a request, do not hold the
+        // process open for it.
+        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
+        if self.tx.send(ActorMessage::Shutdown(done_tx)).is_ok() {
+            let _ = done_rx.recv_timeout(Duration::from_secs(2));
+        }
+    }
+}
+
+async fn run(mut rx: mpsc::UnboundedReceiver<ActorMessage>, state: Arc<ActorState>) {
+    while let Some(msg) = rx.recv().await {
+        match msg {
+            ActorMessage::Call(req) => {
+                let state = state.clone();
+                tokio::task::spawn_local(async move {
+                    let result = crate::api::dispatch(state, req.method, req.payload).await;
+                    let _ = req.reply.send(result);
+                });
+            }
+            ActorMessage::Shutdown(done) => {
+                let _ = state.ws.stop().await;
+                let _ = done.send(());
+                break;
+            }
+        }
     }
 }

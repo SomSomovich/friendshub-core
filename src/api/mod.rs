@@ -19,11 +19,14 @@ pub mod conversations;
 pub mod device_init;
 pub mod devices;
 pub mod groups;
+pub mod groups_send;
 pub mod invites;
+pub mod message_actions;
 pub mod messages;
 pub mod prekeys;
 pub mod profile;
 pub mod sessions;
+pub mod twofa;
 pub mod user_profiles;
 pub mod webrtc;
 pub mod ws;
@@ -45,6 +48,9 @@ pub async fn dispatch(state: Arc<ActorState>, method: u32, payload: Vec<u8>) -> 
         0x0001_0003 => auth::login_2fa(&state, payload).await,
         0x0001_0004 => auth::logout(&state).await,
         0x0001_0005 => auth::me(&state).await,
+        0x0001_0006 => twofa::enroll(&state, payload).await,
+        0x0001_0007 => twofa::enroll_verify(&state, payload).await,
+        0x0001_0008 => twofa::disable(&state, payload).await,
 
         // contacts / blocks
         0x0002_0001 => contacts::list(&state, payload).await,
@@ -69,6 +75,9 @@ pub async fn dispatch(state: Arc<ActorState>, method: u32, payload: Vec<u8>) -> 
         0x0004_0002 => messages::send(&state, payload).await,
         0x0004_0003 => messages::decrypt(&state, payload).await,
         0x0004_0004 => messages::send_message(&state, payload).await,
+        0x0004_0010 => message_actions::send_edit(&state, payload).await,
+        0x0004_0011 => message_actions::send_delete(&state, payload).await,
+        0x0004_0012 => message_actions::send_reaction(&state, payload).await,
 
         // devices
         0x0005_0001 => devices::list(&state, payload).await,
@@ -89,6 +98,7 @@ pub async fn dispatch(state: Arc<ActorState>, method: u32, payload: Vec<u8>) -> 
         0x0006_0003 => attachments::claim(&state, payload).await,
         0x0006_0004 => attachments::release(&state, payload).await,
         0x0006_0005 => attachments::recommend(&state, payload).await,
+        0x0006_0006 => attachments::send_key(&state, payload).await,
 
         // avatars
         0x0007_0001 => avatars::upload(&state, payload).await,
@@ -139,6 +149,8 @@ pub async fn dispatch(state: Arc<ActorState>, method: u32, payload: Vec<u8>) -> 
         0x000A_0006 => groups::set_role(&state, payload).await,
         0x000A_0007 => groups::mute_member(&state, payload).await,
         0x000A_0008 => groups::set_user_profile(&state, payload).await,
+        0x000A_0020 => groups_send::create_distribution(&state, payload).await,
+        0x000A_0021 => groups_send::send_group_message(&state, payload).await,
 
         // invites
         0x000B_0001 => invites::create(&state, payload).await,
@@ -188,6 +200,11 @@ pub async fn dispatch(state: Arc<ActorState>, method: u32, payload: Vec<u8>) -> 
         0x0012_0005 => webrtc::create_data_channel(&state, payload).await,
         0x0012_0006 => webrtc::close_call(&state, payload).await,
         0x0012_0007 => webrtc::list_active(&state, payload).await,
+        0x0012_0010 => webrtc::initiate_call(&state, payload).await,
+        0x0012_0011 => webrtc::accept_call(&state, payload).await,
+        0x0012_0012 => webrtc::send_ice(&state, payload).await,
+        0x0012_0013 => webrtc::hangup(&state, payload).await,
+        0x0012_0014 => webrtc::reject(&state, payload).await,
 
         // websocket lifecycle
         0x00FF_0001 => ws::start(&state).await,

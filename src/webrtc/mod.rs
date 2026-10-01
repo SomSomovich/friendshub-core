@@ -21,6 +21,8 @@ use webrtc::peer_connection::{
 
 use crate::error::{Error, Result};
 
+pub mod signal;
+
 /// Events emitted by a peer connection.
 #[derive(Debug, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
@@ -190,9 +192,6 @@ impl WebRtcManager {
         }
     }
 
-    /// Called from the actor loop once. Reads internal events and translates
-    /// them into the public event queue, spawning a DataChannel poller when
-    /// a channel opens.
     pub async fn run_event_loop(self: Arc<Self>, state: Arc<crate::runtime::ActorState>) {
         loop {
             let ev = {
@@ -439,8 +438,6 @@ fn base64_standard(data: &[u8]) -> String {
     base64::engine::general_purpose::STANDARD.encode(data)
 }
 
-/// Wrapper so a JSON-driven API can send raw bytes on a data channel
-/// without the caller ever holding a `DataChannel` handle.
 #[derive(Debug, Deserialize)]
 pub struct DataChannelSendParams {
     pub call_id: String,

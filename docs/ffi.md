@@ -1,4 +1,4 @@
-# FriendsHub Core — C ABI reference
+# FriendsHub Core - C ABI reference
 
 Everything a consumer needs: the eight entry points, the JSON shape of a
 configuration, the full method id table, and worked examples.
@@ -29,10 +29,10 @@ void fh_buffer_free(FhBuffer* buf);
 
 Every function returns `int32_t`: 0 on success, non-zero on failure. On
 failure the out buffer carries a JSON `{ "code": "...", "message": "..." }`.
-On success, it carries the method-specific JSON response.
+On success it carries the method-specific JSON response.
 
-**Every successful call that fills an out buffer must be followed by
-`fh_buffer_free`.** Forgetting this leaks one Vec per call.
+Every successful call that fills an out buffer must be followed by
+`fh_buffer_free`. Forgetting this leaks one Vec per call.
 
 ## Configuration
 
@@ -52,8 +52,8 @@ owns one account: separate accounts get separate handles and separate DBs.
 
 ## Method ID table
 
-IDs are grouped by namespace. New methods are added at the end of a range, so
-existing IDs never move.
+IDs are grouped by namespace. New methods are added at the end of a range,
+so existing IDs never move.
 
 | Range | Area |
 |---|---|
@@ -67,7 +67,7 @@ existing IDs never move.
 | `0x0007_xxxx` | avatars |
 | `0x0008_xxxx` | bots |
 | `0x0009_xxxx` | channels and channel posts |
-| `0x000A_xxxx` | groups |
+| `0x000A_xxxx` | groups and group messaging |
 | `0x000B_xxxx` | invites |
 | `0x000C_xxxx` | call history |
 | `0x000D_xxxx` | profile, presence |
@@ -97,23 +97,6 @@ existing IDs never move.
 | `0x0001_0004` | (empty) | logout, clears local auth |
 | `0x0001_0005` | (empty) | current profile |
 
-Login response:
-
-```json
-{
-  "kind": "session",
-  "session_token": "...",
-  "expires_at": 1234567890,
-  "account": { "id": "...", "user_id": 1, "fh_number": "FH1234567", "username": "..." }
-}
-```
-
-or, when 2FA is enabled:
-
-```json
-{ "kind": "totp_required", "challenge_token": "...", "expires_in_seconds": 300 }
-```
-
 ### Device initialization (required once after first login)
 
 | ID | Request | Notes |
@@ -121,18 +104,6 @@ or, when 2FA is enabled:
 | `0x0005_0004` | `{"name":"Desktop"}` | generate identity, register device, upload 100 prekeys |
 | `0x0005_0005` | (empty) | status: initialized?, prekey counts |
 | `0x0005_0015` | (empty) | top up prekeys if the pool is low |
-
-`initialize` response:
-
-```json
-{
-  "device_id": "uuid",
-  "device_number": 1,
-  "registration_id": 12345,
-  "one_time_prekeys": 100,
-  "kyber_one_time_prekeys": 100
-}
-```
 
 ### Websocket
 
@@ -142,96 +113,96 @@ or, when 2FA is enabled:
 | `0x00FF_0002` | (empty) | stop the loop |
 | `0x00FF_0003` | envelope JSON | send one envelope |
 
-The websocket runs in the background after start. Inbound traffic is pushed
-into the event queue and picked up via `fh_poll_event`.
-
 ### Messages (Signal Protocol)
 
-| ID | Request | Response |
+| ID | Request | Notes |
 |---|---|---|
-| `0x0004_0001` | `{"recipient_account_id":"...","device_number":N,"bundle":{...}}` | `{"ok":true}` |
-| `0x0004_0002` | `{"recipient_account_id":"...","device_number":N,"plaintext_hex":"..."}` | `{"ciphertext_hex":"...","is_prekey_message":bool,"envelope_type":1}` |
-| `0x0004_0003` | envelope JSON | `{"plaintext_hex":"..."}` |
-| `0x0004_0004` | see below | see below |
+| `0x0004_0001` | `{"recipient_account_id":"...","device_number":N,"bundle":{...}}` | establish a session explicitly |
+| `0x0004_0002` | `{"recipient_account_id":"...","device_number":N,"plaintext_hex":"..."}` | low-level single-device encrypt |
+| `0x0004_0003` | envelope JSON | decrypt a raw envelope |
+| `0x0004_0004` | see below | high-level send (multi-device + sync) |
 
-`0x0004_0004` is the high-level send. Use it unless you need to drive
-session management yourself through `0x0004_0001` and `0x0004_0002`.
-
-Request:
+`0x0004_0004` request:
 
 ```json
 {
   "recipient_account_id": "uuid",
   "plaintext_hex": "68656c6c6f",
-  "conversation_id": "uuid",      // optional
-  "device_number": 1,              // optional; omit to send to all devices
-  "refresh_devices": false         // optional; bypass the device cache
+  "conversation_id": "uuid",
+  "device_number": 1,
+  "refresh_devices": false,
+  "sync": true
 }
 ```
 
-When `device_number` is present, the message goes only to that device.
-When it is absent, it goes to **every active device** of the recipient,
-each encrypted separately for that device. Device lists are cached for
-`CACHE_TTL_SECS` (five minutes); set `refresh_devices: true` to bypass the
-cache, for example right after learning that the recipient added a device.
+When `device_number` is present the message goes only to that device. When
+absent it goes to every active device of the recipient. When `sync` is true
+(default) a copy is also sent to the caller's other devices under
+`ENVELOPE_TYPE_SYNC`, so the conversation stays in step across devices.
 
 Response:
 
 ```json
 {
   "envelopes": [
-    { "device_number": 1, "envelope_id": "uuid", "is_prekey_message": true, "ciphertext_len": 248 },
+    { "device_number": 1, "envelope_id": "uuid", "is_prekey_message": true, "ciphertext_len": 248 }
+  ],
+  "device_errors": [],
+  "sync_envelopes": [
     { "device_number": 2, "envelope_id": "uuid", "is_prekey_message": true, "ciphertext_len": 251 }
   ],
-  "device_errors": [
-    { "device_number": 3, "error": "bundle fetch failed: 404" }
-  ]
+  "sync_errors": []
 }
 ```
 
-A device that fails does not abort the whole send. The caller decides what
-to do with the partial result. To retry only the failed devices, call again
-with `device_number` set to one of them and the same `plaintext_hex`.
+### Group messaging
 
-A response with an empty `envelopes` array and a non-empty `device_errors`
-array means nothing was sent. This is not an error return: the per-device
-detail is more useful than a single string.
-
-### Attachments
+Group messages use Sender Keys: one encryption per outgoing message, and the
+same ciphertext is broadcast to every member device. That is what makes a
+group message cost O(1) in encryption, not O(members).
 
 | ID | Request | Notes |
 |---|---|---|
-| `0x0006_0001` | `{"file_path":"/abs/path","conversation_id":"uuid","kind":"attachment"}` | full upload: read file, allocate, PUT to S3, finalize |
-| `0x0006_0002` | `{"attachment_id":"uuid","output_path":"/abs/path"}` | download, write to disk |
+| `0x000A_0020` | `{"conversation_id":"uuid","rotate":false}` | generate or rotate this device's sender key, distribute to all members |
+| `0x000A_0021` | `{"conversation_id":"uuid","plaintext_hex":"..."}` | encrypt once for the group, fan out |
+
+Both return `{ "envelopes": [...], "device_errors": [...] }` (or with
+`distribution_id` / `ciphertext_len` prefixes). Per-device failures do not
+abort the batch.
+
+See `group-calls.md` for the flow in context.
+
+### Attachments (encrypted)
+
+Files are sealed locally with ChaCha20-Poly1305 before upload. The server
+stores opaque ciphertext; the key travels to the recipient through a Signal
+envelope with `envelope_type = 9` (`ENVELOPE_TYPE_ATTACHMENT_KEY`).
+
+| ID | Request | Notes |
+|---|---|---|
+| `0x0006_0001` | `{"file_path":"/abs/path","conversation_id":"uuid"}` | seal locally, upload sealed chunks, return `key_hex` + `base_nonce_hex` |
+| `0x0006_0002` | `{"attachment_id":"...","output_path":"...","key_hex":"...","base_nonce_hex":"..."}` | download sealed chunks, open, write plaintext |
 | `0x0006_0003` | `{"id":"uuid"}` | take a reference |
-| `0x0006_0004` | `{"id":"uuid"}` | drop a reference; deletes the blob when the last is gone |
+| `0x0006_0004` | `{"id":"uuid"}` | drop a reference; blob deleted when last claim goes |
 | `0x0006_0005` | `{"total_size":123456}` | chunk layout recommendation |
-
-### Avatars
-
-| ID | Request | Notes |
-|---|---|---|
-| `0x0007_0001` | `{"file_path":"/abs/path.webp"}` | WebP only; server checks magic bytes |
-| `0x0007_0002` | (empty) | delete own avatar |
-| `0x0007_0003` | `{"account_id":"uuid"}` | public fetch, base64 in response |
+| `0x0006_0006` | `{"recipient_account_id":"...","attachment_id":"...","key_hex":"...","base_nonce_hex":"..."}` | forward the key to every device of the recipient |
 
 ### WebRTC calls
 
-| ID | Request | Response |
+| ID | Request | Notes |
 |---|---|---|
-| `0x0012_0001` | `{"call_id":"..."}` | `{"call_id":"...","sdp":"..."}` |
-| `0x0012_0002` | `{"call_id":"...","remote_sdp":"..."}` | `{"call_id":"...","sdp":"..."}` |
-| `0x0012_0003` | `{"call_id":"...","remote_sdp":"..."}` | `{"ok":true}` |
-| `0x0012_0004` | `{"call_id":"...","candidate":{...}}` | `{"ok":true}` |
-| `0x0012_0005` | `{"call_id":"...","label":"data"}` | `{"ok":true}` |
-| `0x0012_0006` | `{"call_id":"..."}` | `{"ok":true}` |
-| `0x0012_0007` | (empty) | list of active call ids |
+| `0x0011_0001` | (empty) | TURN credentials from the server |
+| `0x0012_0001..0007` | see below | low-level: create/accept, apply answer, ICE, channels, close, list |
+| `0x0012_0010` | `{"recipient_account_id":"...","call_id":"..."}` | create an offer and send it as a call envelope |
+| `0x0012_0011` | `{"recipient_account_id":"...","call_id":"...","remote_sdp":"..."}` | accept a remote offer and send the answer |
+| `0x0012_0012` | `{"recipient_account_id":"...","call_id":"...","candidate":{...}}` | add a remote candidate locally, forward to the peer |
+| `0x0012_0013` | `{"recipient_account_id":"...","call_id":"..."}` | close locally and send a hangup |
+| `0x0012_0014` | `{"recipient_account_id":"...","call_id":"..."}` | send a reject (the callee declined) |
 
-Signaling goes through the websocket as envelopes; use envelope_type 10..14
-for offer, answer, ICE, hangup, reject respectively. See the enum in the
-proto file for the exact numbering.
+The low-level 0x0012_0001..0007 variants exist for callers that want to
+drive signaling themselves. New code should use the 0x0012_0010..0014
+variants, which package the SDP into a Signal-encrypted envelope and send it
+through the websocket without the caller having to touch envelope bytes.
 
-## Events
-
-See `docs/events.md`.
+See `group-calls.md` for a worked call flow.
 

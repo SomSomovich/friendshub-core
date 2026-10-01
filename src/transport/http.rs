@@ -8,6 +8,11 @@ use serde::Serialize;
 use crate::config::Config;
 use crate::error::{Error, Result};
 
+/// Upper bound on a server-requested wait, in seconds. A misconfigured or
+/// hostile server sending `retry-after: 999999` must not park a call for
+/// hours; past this the caller gets the 429 back and decides.
+const MAX_RETRY_AFTER_SECS: u64 = 30;
+
 #[derive(Clone)]
 pub struct HttpClient {
     base: String,
@@ -72,7 +77,6 @@ impl HttpClient {
         Ok(())
     }
 
-    /// POSTs raw bytes with an explicit Content-Type. Used for avatar upload.
     pub async fn post_raw<R: DeserializeOwned>(
         &self,
         path: &str,
@@ -86,18 +90,15 @@ impl HttpClient {
             .post(&url)
             .header(CONTENT_TYPE, content_type)
             .body(data);
-
         if let Some(t) = bearer {
             req = req.bearer_auth(t);
         }
-
         let resp = req.send().await.map_err(|e| Error::Network(e.to_string()))?;
         let status = resp.status();
         if !status.is_success() {
             let body = resp.text().await.unwrap_or_default();
             return Err(Error::Server { status: status.as_u16(), body });
         }
-
         let bytes = resp.bytes().await.map_err(|e| Error::Network(e.to_string()))?;
         if bytes.is_empty() {
             return serde_json::from_slice(b"null")
@@ -106,7 +107,6 @@ impl HttpClient {
         serde_json::from_slice(&bytes).map_err(|e| Error::InvalidPayload(e.to_string()))
     }
 
-    /// PUTs bytes to an absolute URL (presigned S3) with no auth.
     pub async fn put_absolute(&self, url: &str, data: Vec<u8>) -> Result<()> {
         let resp = self
             .client
@@ -116,7 +116,6 @@ impl HttpClient {
             .send()
             .await
             .map_err(|e| Error::Network(e.to_string()))?;
-
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
@@ -125,7 +124,6 @@ impl HttpClient {
         Ok(())
     }
 
-    /// GETs bytes from an absolute URL (presigned S3) with no auth.
     pub async fn get_absolute(&self, url: &str) -> Result<Vec<u8>> {
         let resp = self
             .client
@@ -133,24 +131,26 @@ impl HttpClient {
             .send()
             .await
             .map_err(|e| Error::Network(e.to_string()))?;
-
         if !resp.status().is_success() {
             let status = resp.status().as_u16();
             let body = resp.text().await.unwrap_or_default();
             return Err(Error::Server { status, body });
         }
-
         let bytes = resp.bytes().await.map_err(|e| Error::Network(e.to_string()))?;
         Ok(bytes.to_vec())
     }
 
-    /// GETs raw bytes from the configured API base with no authentication.
-    /// Used for public resources such as other accounts' avatars.
     pub async fn get_absolute_relative(&self, path: &str) -> Result<Vec<u8>> {
         let url = format!("{}{}", self.base, path);
         self.get_absolute(&url).await
     }
 
+    /// Sends a request, retrying once when the server answers 429.
+    ///
+    /// The wait is taken from `Retry-After` (seconds) and clamped to
+    /// `MAX_RETRY_AFTER_SECS`. One retry: more would mask a server that is
+    /// persistently refusing the caller, and the caller is the right place to
+    /// decide whether to keep trying.
     async fn send<B: Serialize, R: DeserializeOwned>(
         &self,
         method: Method,
@@ -159,29 +159,46 @@ impl HttpClient {
         bearer: Option<&str>,
 ) -> Result<R> {
         let url = format!("{}{}", self.base, path);
-        let mut req = self.client.request(method, &url);
+        let mut attempt: u32 = 0;
 
-        if let Some(token) = bearer {
-            req = req.bearer_auth(token);
-        }
-        if let Some(b) = body {
-            req = req.json(b);
-        }
+        loop {
+            let mut req = self.client.request(method.clone(), &url);
+            if let Some(token) = bearer {
+                req = req.bearer_auth(token);
+            }
+            if let Some(b) = body {
+                req = req.json(b);
+            }
 
-        let resp = req.send().await.map_err(|e| Error::Network(e.to_string()))?;
-        let status = resp.status();
+            let resp = req.send().await.map_err(|e| Error::Network(e.to_string()))?;
+            let status = resp.status();
 
-        if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
-            return Err(Error::Server { status: status.as_u16(), body });
-        }
+            if status.as_u16() == 429 && attempt == 0 {
+                let wait = resp
+                    .headers()
+                    .get("retry-after")
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.parse::<u64>().ok())
+                    .unwrap_or(5)
+                    .min(MAX_RETRY_AFTER_SECS);
+                tracing::info!(wait_secs = wait, path, "rate limited; retrying once");
+                tokio::time::sleep(Duration::from_secs(wait)).await;
+                attempt += 1;
+                continue;
+            }
 
-        let bytes = resp.bytes().await.map_err(|e| Error::Network(e.to_string()))?;
-        if bytes.is_empty() {
-            return serde_json::from_slice(b"null")
+            if !status.is_success() {
+                let body = resp.text().await.unwrap_or_default();
+                return Err(Error::Server { status: status.as_u16(), body });
+            }
+
+            let bytes = resp.bytes().await.map_err(|e| Error::Network(e.to_string()))?;
+            if bytes.is_empty() {
+                return serde_json::from_slice(b"null")
+                    .map_err(|e| Error::InvalidPayload(e.to_string()));
+            }
+            return serde_json::from_slice(&bytes)
                 .map_err(|e| Error::InvalidPayload(e.to_string()));
         }
-
-        serde_json::from_slice(&bytes).map_err(|e| Error::InvalidPayload(e.to_string()))
     }
 }
