@@ -23,8 +23,10 @@ use webrtc::peer_connection::{
 };
 
 use crate::error::{Error, Result};
+use crate::webrtc::audio::AudioTracks;
 use crate::webrtc::video::VideoTracks;
 
+pub mod audio;
 pub mod signal;
 pub mod video;
 pub mod vp8;
@@ -49,7 +51,7 @@ enum InternalEvent {
     User(WebRtcEvent),
     ChannelOpened { call_id: String, label: String, channel: Arc<dyn DataChannel> },
     ChannelClosed { call_id: String, label: String },
-    TrackOpened { call_id: String, track_id: String, track: Arc<dyn webrtc::media_stream::track_remote::TrackRemote> },
+    TrackOpened { call_id: String, track_id: String, kind: String, track: Arc<dyn webrtc::media_stream::track_remote::TrackRemote> },
 }
 
 #[derive(Clone)]
@@ -131,6 +133,7 @@ impl PeerConnectionEventHandler for Handler {
         let _ = self.tx.send(InternalEvent::TrackOpened {
             call_id: self.call_id.clone(),
             track_id: track_id.clone(),
+            kind: kind.clone(),
             track: track.clone(),
         });
         let _ = self.tx.send(InternalEvent::User(WebRtcEvent::TrackReceived {
@@ -145,6 +148,7 @@ pub struct WebRtcManager {
     peers: Mutex<HashMap<String, Arc<dyn PeerConnection>>>,
     channels: Mutex<HashMap<(String, String), Arc<dyn DataChannel>>>,
     pub video: Arc<VideoTracks>,
+    pub audio: Arc<AudioTracks>,
     event_tx: mpsc::UnboundedSender<InternalEvent>,
     event_rx: Mutex<mpsc::UnboundedReceiver<InternalEvent>>,
 }
@@ -156,6 +160,7 @@ impl WebRtcManager {
             peers: Mutex::new(HashMap::new()),
             channels: Mutex::new(HashMap::new()),
             video: Arc::new(VideoTracks::new()),
+            audio: Arc::new(AudioTracks::new()),
             event_tx: tx,
             event_rx: Mutex::new(rx),
         }
@@ -200,8 +205,15 @@ impl WebRtcManager {
                 InternalEvent::ChannelClosed { call_id, label } => {
                     self.channels.lock().await.remove(&(call_id, label));
                 }
-                InternalEvent::TrackOpened { call_id, track_id, track } => {
-                    self.video.register_remote(&call_id, track_id, track).await;
+                InternalEvent::TrackOpened { call_id, track_id, kind, track } => {
+                    // Video and audio arrive on the same callback. Route by the
+                    // codec kind so each ends up in its own frame queue; a
+                    // consumer then reads whichever stream it cares about.
+                    if kind.to_ascii_lowercase().contains("audio") {
+                        self.audio.register_remote(&call_id, track_id, track).await;
+                    } else {
+                        self.video.register_remote(&call_id, track_id, track).await;
+                    }
                 }
             }
         }
@@ -234,6 +246,21 @@ impl WebRtcManager {
         pc.add_track(track).await
             .map_err(|e| Error::Internal(format!("add_track: {e}")))?;
         Ok(())
+    }
+
+/// Adds an Opus audio track to a call. The caller produces encoded Opus
+    /// frames and hands them to `write_audio_frame`; the library only routes
+    /// them through RTP.
+    pub async fn add_audio_track(&self, call_id: &str, label: &str) -> Result<()> {
+        let pc = self.get(call_id).await?;
+        let track = self.audio.register_local(call_id, label).await?;
+        pc.add_track(track).await
+            .map_err(|e| Error::Internal(format!("add_track: {e}")))?;
+        Ok(())
+    }
+
+    pub async fn write_audio_frame(&self, call_id: &str, data: Vec<u8>, duration_ms: u64) -> Result<()> {
+        self.audio.write_frame(call_id, data, duration_ms).await
     }
 
     pub async fn write_video_frame(&self, call_id: &str, data: Vec<u8>, duration_ms: u64) -> Result<()> {
@@ -308,6 +335,7 @@ impl WebRtcManager {
             channels.retain(|(cid, _), _| cid != call_id);
         }
         self.video.drop_call(call_id).await;
+        self.audio.drop_call(call_id).await;
         if let Some(pc) = pc {
             let _ = pc.close().await;
         }

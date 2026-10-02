@@ -106,3 +106,80 @@ pub async fn read_video_frame(state: &Arc<ActorState>, payload: Vec<u8>) -> Resu
         None => Ok(serde_json::to_vec(&serde_json::json!({ "timeout": true }))?),
     }
 }
+
+// ---------------------------------------------------------------
+// Audio: same shape as the video block above, different track kind.
+// ---------------------------------------------------------------
+
+#[derive(Debug, Deserialize)]
+pub struct AddAudioRequest {
+    pub call_id: String,
+    #[serde(default = "default_audio_label")]
+    pub label: String,
+}
+
+fn default_audio_label() -> String { "audio".to_string() }
+
+/// Adds an outgoing Opus audio track to an active call.
+pub async fn add_audio_track(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
+    let req: AddAudioRequest = serde_json::from_slice(&payload)?;
+    state
+        .webrtc
+        .add_audio_track(&req.call_id, &req.label)
+        .await?;
+    Ok(serde_json::to_vec(&serde_json::json!({
+        "added": true,
+        "mime": crate::webrtc::audio::AudioTracks::outgoing_mime(),
+    }))?)
+}
+
+#[derive(Debug, Deserialize)]
+pub struct WriteAudioRequest {
+    pub call_id: String,
+    /// Base64-encoded Opus frame.
+    pub data_base64: String,
+    /// Frame duration in milliseconds. 20 is the standard for Opus.
+    #[serde(default = "default_audio_duration_ms")]
+    pub duration_ms: u64,
+}
+
+fn default_audio_duration_ms() -> u64 { 20 }
+
+pub async fn write_audio_frame(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
+    use base64::Engine;
+    let req: WriteAudioRequest = serde_json::from_slice(&payload)?;
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(req.data_base64.as_bytes())
+        .map_err(|e| Error::InvalidPayload(format!("data_base64: {e}")))?;
+    state
+        .webrtc
+        .write_audio_frame(&req.call_id, bytes, req.duration_ms)
+        .await?;
+    Ok(br#"{"written":true}"#.to_vec())
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ReadAudioRequest {
+    pub call_id: String,
+    #[serde(default = "default_audio_read_timeout_ms")]
+    pub timeout_ms: u64,
+}
+
+fn default_audio_read_timeout_ms() -> u64 { 200 }
+
+pub async fn read_audio_frame(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
+    use base64::Engine;
+    let req: ReadAudioRequest = serde_json::from_slice(&payload)?;
+    let timeout = std::time::Duration::from_millis(req.timeout_ms);
+    match state.webrtc.audio.read_frame(&req.call_id, timeout).await {
+        Some(data) => {
+            let encoded = base64::engine::general_purpose::STANDARD.encode(&data);
+            Ok(serde_json::to_vec(&serde_json::json!({
+                "timeout": false,
+                "size": data.len(),
+                "data_base64": encoded,
+            }))?)
+        }
+        None => Ok(serde_json::to_vec(&serde_json::json!({ "timeout": true }))?),
+    }
+}
