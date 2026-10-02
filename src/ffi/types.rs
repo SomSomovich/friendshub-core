@@ -19,13 +19,22 @@ impl FhBuffer {
         FhBuffer { data: v.as_mut_ptr(), len: v.len(), cap: v.capacity() }
     }
 
-    /// Rebuilds the Vec and drops it. Safe to call twice: the second call
-    /// sees a null pointer and does nothing.
+    /// Rebuilds the Vec and drops it.
+    ///
+    /// # Safety
+    ///
+    /// The caller must pass a buffer that was produced by the library and
+    /// has not been released yet. After the call the buffer is reset to
+    /// `EMPTY`, so a second call on the same value is safe and does nothing.
+    ///
+    /// Passing a hand-constructed buffer whose `data`, `len` and `cap` did
+    /// not come from a single `Vec<u8>` is undefined behaviour: the function
+    /// rebuilds a `Vec` from those three fields and drops it.
     pub unsafe fn release(&mut self) {
         if !self.data.is_null() && self.cap > 0 {
-            // SAFETY: data, len and cap came from the same Vec via
-            // FhBuffer::from_vec, and this is the only place that consumes
-            // them. Nothing else has touched them between the two calls.
+            // SAFETY: the fields came from `from_vec`, which produced them
+            // from a single Vec, and this is the only place that consumes
+            // them.
             unsafe {
                 drop(Vec::from_raw_parts(self.data, self.len, self.cap));
             }

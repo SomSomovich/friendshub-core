@@ -126,11 +126,9 @@ pub async fn logout(state: &Arc<ActorState>) -> Result<Vec<u8>> {
         .http
         .post_void("/api/v1/logout", &serde_json::json!({}), Some(&token))
         .await
-    {
-        if status != 401 {
+        && status != 401 {
             return Err(Error::Server { status, body: "logout failed".into() });
         }
-    }
 
     db_auth::clear(&state.db).await?;
     Ok(br#"{"ok":true}"#.to_vec())

@@ -11,9 +11,9 @@ use crate::error::{Error, Result};
 use crate::runtime::ActorState;
 
 /// ENVELOPE_TYPE_MESSAGE from friendshub.proto.
-pub const ENVELOPE_TYPE_MESSAGE: i32 = 1;
+pub(crate) const ENVELOPE_TYPE_MESSAGE: i32 = 1;
 /// ENVELOPE_TYPE_SYNC from friendshub.proto.
-pub const ENVELOPE_TYPE_SYNC: i32 = 2;
+pub(crate) const ENVELOPE_TYPE_SYNC: i32 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EstablishSessionRequest {

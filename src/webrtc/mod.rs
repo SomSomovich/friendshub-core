@@ -359,7 +359,6 @@ fn parse_ice_servers(input: Vec<serde_json::Value>) -> Result<Vec<RTCIceServer>>
             urls,
             username: username.unwrap_or_default(),
             credential: credential.unwrap_or_default(),
-            ..Default::default()
         });
     }
     Ok(out)

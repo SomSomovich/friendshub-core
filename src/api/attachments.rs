@@ -187,7 +187,7 @@ pub async fn upload(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>
         )));
     }
 
-    for (upload, sealed) in uploads.iter().zip(sealed_chunks.into_iter()) {
+    for (upload, sealed) in uploads.iter().zip(sealed_chunks) {
         state.http.put_absolute(&upload.url, sealed).await?;
     }
 

@@ -35,13 +35,12 @@ pub async fn get(state: &ActorState, account_id: &str) -> Result<Vec<CachedDevic
     .fetch_optional(&state.db)
     .await?;
 
-    if let Some((json, fetched_at)) = row {
-        if now_unix() - fetched_at < CACHE_TTL_SECS {
+    if let Some((json, fetched_at)) = row
+        && now_unix() - fetched_at < CACHE_TTL_SECS {
             let devices: Vec<CachedDevice> = serde_json::from_str(&json)
                 .map_err(|e| Error::InvalidPayload(format!("cached devices: {e}")))?;
             return Ok(devices);
         }
-    }
 
     force_refresh(state, account_id).await
 }

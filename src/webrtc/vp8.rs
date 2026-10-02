@@ -37,18 +37,14 @@ impl Vp8Depacketizer {
         // Sequence gap: anything pending belongs to a frame that lost a
         // packet. Dropping it is correct: a VP8 decoder cannot use a partial
         // frame, and keeping it would make the next frame start with garbage.
-        if let Some(prev) = self.last_sequence {
-            if packet.header.sequence_number != prev.wrapping_add(1) {
+        if let Some(prev) = self.last_sequence
+            && packet.header.sequence_number != prev.wrapping_add(1) {
                 self.buffer.clear();
                 self.in_frame = false;
             }
-        }
         self.last_sequence = Some(packet.header.sequence_number);
 
-        let descriptor_len = match parse_descriptor_len(payload) {
-            Some(n) => n,
-            None => return None,
-        };
+        let descriptor_len = parse_descriptor_len(payload)?;
 
         let first = payload[0];
         let s_bit = (first & 0x10) != 0;
@@ -129,9 +125,11 @@ mod tests {
     use rtc::rtp::{Header, Packet};
 
     fn packet(seq: u16, marker: bool, payload: Vec<u8>) -> Packet {
-        let mut header = Header::default();
-        header.sequence_number = seq;
-        header.marker = marker;
+        let header = Header {
+            sequence_number: seq,
+            marker,
+            ..Default::default()
+        };
         Packet { header, payload: Bytes::from(payload) }
     }
 

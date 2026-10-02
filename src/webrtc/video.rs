@@ -37,6 +37,11 @@ pub const MIME_VP8: &str = "video/VP8";
 /// a backlog, it wants the newest frame.
 const FRAME_BUFFER_DEPTH: usize = 5;
 
+/// Inbound frame queue per call. A reader takes the Arc out of the map,
+/// releases the outer lock, and then waits on the inner one, so reads on
+/// different calls do not serialize on a single mutex.
+type FrameReceiverMap = Mutex<HashMap<String, Arc<Mutex<mpsc::Receiver<Vec<u8>>>>>>;
+
 pub struct InboundVideoTrack {
     pub call_id: String,
     pub track_id: String,
@@ -47,7 +52,7 @@ pub struct InboundVideoTrack {
 pub struct VideoTracks {
     pub local: Mutex<HashMap<String, Arc<TrackLocalStaticSample>>>,
     pub remote: Mutex<HashMap<String, Arc<InboundVideoTrack>>>,
-    frames: Mutex<HashMap<String, Arc<Mutex<mpsc::Receiver<Vec<u8>>>>>>,
+    frames: FrameReceiverMap,
 }
 
 impl VideoTracks {
@@ -94,11 +99,10 @@ impl VideoTracks {
             while let Some(event) = track.poll().await {
                 match event {
                     TrackRemoteEvent::OnRtpPacket(pkt) => {
-                        if let Some(frame) = depack.push(&pkt) {
-                            if tx.try_send(frame).is_err() {
+                        if let Some(frame) = depack.push(&pkt)
+                            && tx.try_send(frame).is_err() {
                                 tracing::trace!(call_id = %call, "video frame dropped: buffer full or closed");
                             }
-                        }
                     }
                     TrackRemoteEvent::OnEnding | TrackRemoteEvent::OnEnded => {
                         tracing::debug!(call_id = %call, "remote video track ended");

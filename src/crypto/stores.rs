@@ -146,8 +146,8 @@ impl IdentityKeyStore for Store {
         // stored either way -- rejecting it outright would make the client
         // unable to decrypt legitimate re-registrations -- but the user is
         // told, and can decide whether to trust the peer again.
-        if changed {
-            if let Some((old,)) = &existing {
+        if changed
+            && let Some((old,)) = &existing {
                 let _ = sqlx::query(
                     "INSERT INTO identity_changes (account_id, device_number, old_key, new_key, changed_at) VALUES (?, ?, ?, ?, ?)",
                 )
@@ -159,7 +159,6 @@ impl IdentityKeyStore for Store {
                 .execute(&self.db)
                 .await;
             }
-        }
 
         Ok(if changed {
             IdentityChange::ReplacedExisting

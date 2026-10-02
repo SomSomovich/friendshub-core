@@ -3,7 +3,7 @@ use std::sync::Arc;
 use serde::Deserialize;
 
 use crate::crypto::device_cache;
-use crate::error::{Error, Result};
+use crate::error::Result;
 use crate::runtime::ActorState;
 
 #[derive(Debug, Deserialize)]
@@ -19,8 +19,7 @@ pub struct RefreshRequest {
 pub async fn refresh(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
     let req: RefreshRequest = serde_json::from_slice(&payload)?;
     let devices = device_cache::force_refresh(state, &req.account_id)
-        .await
-        .map_err(Error::from)?;
+        .await?;
     Ok(serde_json::to_vec(&serde_json::json!({
         "count": devices.len(),
         "device_numbers": devices.iter().map(|d| d.device_number).collect::<Vec<_>>(),
@@ -37,7 +36,6 @@ pub struct InvalidateRequest {
 pub async fn invalidate(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
     let req: InvalidateRequest = serde_json::from_slice(&payload)?;
     device_cache::invalidate(state, &req.account_id)
-        .await
-        .map_err(Error::from)?;
+        .await?;
     Ok(br#"{"invalidated":true}"#.to_vec())
 }
