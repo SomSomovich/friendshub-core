@@ -41,3 +41,42 @@ pub fn i64_field(v: &serde_json::Value, key: &str) -> Result<i64> {
 pub fn id_from(v: &serde_json::Value) -> Result<String> {
     str_field(v, "id")
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn str_field_reads_strings() {
+        let v = json!({"name": "alice"});
+        assert_eq!(str_field(&v, "name").unwrap(), "alice");
+    }
+
+    #[test]
+    fn str_field_rejects_missing() {
+        let v = json!({});
+        assert!(str_field(&v, "name").is_err());
+        assert!(str_field(&json!({"name": 3}), "name").is_err());
+    }
+
+    #[test]
+    fn opt_str_skips_empty() {
+        assert_eq!(opt_str(&json!({"x": ""}), "x"), None);
+        assert_eq!(opt_str(&json!({"x": "y"}), "x").as_deref(), Some("y"));
+        assert_eq!(opt_str(&json!({}), "x"), None);
+    }
+
+    #[test]
+    fn i64_field_requires_number() {
+        assert_eq!(i64_field(&json!({"n": 7}), "n").unwrap(), 7);
+        assert!(i64_field(&json!({"n": "7"}), "n").is_err());
+        assert!(i64_field(&json!({}), "n").is_err());
+    }
+
+    #[test]
+    fn id_from_extracts_id() {
+        assert_eq!(id_from(&json!({"id": "x"})).unwrap(), "x");
+        assert!(id_from(&json!({})).is_err());
+    }
+}

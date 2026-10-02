@@ -14,6 +14,8 @@ use crate::runtime::ActorState;
 pub const ENVELOPE_TYPE_SENDER_KEY: i32 = 3;
 /// ENVELOPE_TYPE_MESSAGE from friendshub.proto.
 pub const ENVELOPE_TYPE_MESSAGE: i32 = 1;
+/// ENVELOPE_TYPE_SYNC from friendshub.proto.
+pub const ENVELOPE_TYPE_SYNC: i32 = 2;
 
 // ---------------------------------------------------------------
 // Create / rotate this device's sender key for a conversation
@@ -22,9 +24,6 @@ pub const ENVELOPE_TYPE_MESSAGE: i32 = 1;
 #[derive(Debug, Deserialize)]
 pub struct CreateDistributionRequest {
     pub conversation_id: String,
-    /// When true, a new distribution id is generated even if one exists.
-    /// This is what a member removal should trigger: it rekeys the group
-    /// and the removed device cannot read anything sent afterwards.
     #[serde(default)]
     pub rotate: bool,
 }
@@ -46,10 +45,6 @@ pub struct CreateDistributionResponse {
 
 /// Generates this device's sender key for a group (or rotates it), then
 /// distributes the public half to every device of every member.
-///
-/// The caller supplies the list of member account ids. The library fetches
-/// each member's devices, sends the distribution, and reports per-device
-/// success. Failures on individual devices do not abort the whole call.
 pub async fn create_distribution(
     state: &Arc<ActorState>,
     payload: Vec<u8>,
@@ -82,10 +77,6 @@ pub async fn create_distribution(
     let mut errors: Vec<serde_json::Value> = Vec::new();
 
     for member_account_id in &members {
-        // Skip our own account: `send_one` would create a session with our
-        // own device, which is not what distribution means. Our own other
-        // devices still need the distribution, and they get it through the
-        // same loop below, just as a separate `send_one` call.
         let devices = match device_cache::get(state, member_account_id).await {
             Ok(d) => d,
             Err(e) => {
@@ -98,14 +89,6 @@ pub async fn create_distribution(
         };
 
         for d in devices {
-            // Sending the distribution to our own device through the Signal
-            // session with ourselves is not supported by the protocol; that
-            // path is a no-op for now. Own-device distribution needs a
-            // dedicated mechanism, which is out of scope here.
-            if *member_account_id == sender_account_id {
-                continue;
-            }
-
             match send_one(
                 state,
                 &token,
@@ -142,13 +125,22 @@ pub async fn create_distribution(
 }
 
 // ---------------------------------------------------------------
-// Encrypt once, fan out to every member device
+// Encrypt once, fan out to every member device, sync to own devices
 // ---------------------------------------------------------------
 
 #[derive(Debug, Deserialize)]
 pub struct SendGroupRequest {
     pub conversation_id: String,
     pub plaintext_hex: String,
+    /// When true (default), a copy of the outgoing message is sent to the
+    /// caller's own other devices, under ENVELOPE_TYPE_SYNC. Their local
+    /// conversation state would otherwise not reflect what the caller sent.
+    #[serde(default = "default_true")]
+    pub sync: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 #[derive(Debug, Serialize)]
@@ -156,14 +148,18 @@ pub struct SendGroupResponse {
     pub ciphertext_len: usize,
     pub envelopes: Vec<DistributionEnvelope>,
     pub device_errors: Vec<serde_json::Value>,
+    pub sync_envelopes: Vec<DistributionEnvelope>,
+    pub sync_errors: Vec<serde_json::Value>,
 }
 
-/// Encrypts the plaintext once, then sends the same SenderKeyMessage to every
-/// device of every member of the conversation.
+/// Encrypts the plaintext once for the whole group, then sends the same
+/// SenderKeyMessage to every device of every member.
 ///
-/// The plaintext is sealed once for the whole group; every recipient device
-/// decrypts with the sender key it was given at distribution time. That is
-/// the whole point of group sending: one encryption, many recipients.
+/// When `sync` is true, the caller's own other devices get a separate copy
+/// through the pairwise session path. That copy is a small JSON payload that
+/// tells the device "the following was sent by one of your sibling devices",
+/// not the group ciphertext: a device cannot decrypt its own sender key
+/// output, and does not need to.
 pub async fn send_group_message(
     state: &Arc<ActorState>,
     payload: Vec<u8>,
@@ -189,11 +185,9 @@ pub async fn send_group_message(
     let mut errors: Vec<serde_json::Value> = Vec::new();
 
     for member_account_id in &members {
-        // Skip our own account for the same reason as in distribution: the
-        // protocol does not allow a session with yourself. Our own other
-        // devices receive the same ciphertext through the group fanout that
-        // includes them if they are listed as members.
         if *member_account_id == sender_account_id {
+            // A device cannot decrypt its own sender key output. Its sibling
+            // devices receive the sync copy below instead.
             continue;
         }
 
@@ -236,10 +230,55 @@ pub async fn send_group_message(
         }
     }
 
+    let mut sync_envelopes = Vec::new();
+    let mut sync_errors: Vec<serde_json::Value> = Vec::new();
+
+    if req.sync && !envelopes.is_empty() {
+        let sync_payload = serde_json::json!({
+            "kind": "group_sync_sent",
+            "conversation_id": req.conversation_id,
+            "plaintext_hex": req.plaintext_hex,
+            "recipient_envelope_ids": envelopes.iter().map(|e| e.envelope_id.clone()).collect::<Vec<_>>(),
+        });
+        let sync_bytes = serde_json::to_vec(&sync_payload)?;
+
+        let own_devices = device_cache::get(state, &sender_account_id).await?;
+        for d in own_devices {
+            if d.device_number == sender_device_number {
+                continue;
+            }
+            match send_one(
+                state,
+                &token,
+                &sender_account_id,
+                sender_device_number,
+                &sender_account_id,
+                d.device_number,
+                &sync_bytes,
+                ENVELOPE_TYPE_SYNC,
+                Some(&req.conversation_id),
+)
+            .await
+            {
+                Ok(info) => sync_envelopes.push(DistributionEnvelope {
+                    recipient_account_id: sender_account_id.clone(),
+                    device_number: d.device_number,
+                    envelope_id: info.envelope_id,
+                }),
+                Err(e) => sync_errors.push(serde_json::json!({
+                    "device_number": d.device_number,
+                    "error": e.to_string(),
+                })),
+            }
+        }
+    }
+
     Ok(serde_json::to_vec(&SendGroupResponse {
         ciphertext_len: skm.len(),
         envelopes,
         device_errors: errors,
+        sync_envelopes,
+        sync_errors,
     })?)
 }
 
@@ -253,10 +292,6 @@ async fn member_account_ids(
     state: &Arc<ActorState>,
     conversation_id: &str,
 ) -> Result<Vec<String>> {
-    // conversation_members holds direct and group members; channel_members
-    // holds channel subscribers. A group message is a group concern, so only
-    // the conversation_members side is read here. A channel that uses the
-    // group send path would first need to be a group.
     let rows: Vec<(String,)> = sqlx::query_as(
         "SELECT account_id FROM conversation_members WHERE conversation_id = ? AND left_at IS NULL",
     )

@@ -6,7 +6,7 @@ $ErrorActionPreference = 'Stop'
 
 $root = if ($PSScriptRoot) { $PSScriptRoot } else { (Get-Location).Path }
 $srcDir = Join-Path $root 'src'
-$migrationsDir = Join-Path $root 'migrations'
+$migrationsDir = Join-Path $root 'src/db/migrations'
 $outFile = Join-Path $root 'project_dump.txt'
 
 if (-not (Test-Path $srcDir)) {

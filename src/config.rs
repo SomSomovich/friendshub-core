@@ -12,10 +12,18 @@ pub struct Config {
 
     #[serde(default = "default_log_level")]
     pub log_level: String,
+
+    /// "text" (default) or "json". Unknown values fall back to "text".
+    #[serde(default = "default_log_format")]
+    pub log_format: String,
 }
 
 fn default_log_level() -> String {
     "info".to_string()
+}
+
+fn default_log_format() -> String {
+    "text".to_string()
 }
 
 impl Config {

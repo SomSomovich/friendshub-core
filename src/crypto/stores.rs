@@ -142,6 +142,25 @@ impl IdentityKeyStore for Store {
         .await
         .map_err(store_err)?;
 
+        // Record the change so poll_event can surface it. The new key is
+        // stored either way -- rejecting it outright would make the client
+        // unable to decrypt legitimate re-registrations -- but the user is
+        // told, and can decide whether to trust the peer again.
+        if changed {
+            if let Some((old,)) = &existing {
+                let _ = sqlx::query(
+                    "INSERT INTO identity_changes (account_id, device_number, old_key, new_key, changed_at) VALUES (?, ?, ?, ?, ?)",
+                )
+                .bind(&account_id)
+                .bind(device_number)
+                .bind(old)
+                .bind(&blob)
+                .bind(now)
+                .execute(&self.db)
+                .await;
+            }
+        }
+
         Ok(if changed {
             IdentityChange::ReplacedExisting
         } else {

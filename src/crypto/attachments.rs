@@ -121,3 +121,64 @@ pub fn decode_key_and_base(
     base.copy_from_slice(&base_bytes);
     Ok((key, base))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn seal_and_open_roundtrip() {
+        let (key, base) = new_key_and_base();
+        let plaintext = b"hello, world";
+        let sealed = seal_chunk(&key, &base, 0, plaintext).unwrap();
+        assert_eq!(sealed.len(), plaintext.len() + TAG_LEN);
+        let opened = open_chunk(&key, &base, 0, &sealed).unwrap();
+        assert_eq!(opened, plaintext);
+    }
+
+    #[test]
+    fn wrong_key_fails() {
+        let (key, base) = new_key_and_base();
+        let (other_key, _) = new_key_and_base();
+        let sealed = seal_chunk(&key, &base, 0, b"secret").unwrap();
+        assert!(open_chunk(&other_key, &base, 0, &sealed).is_err());
+    }
+
+    #[test]
+    fn wrong_chunk_index_fails() {
+        let (key, base) = new_key_and_base();
+        let sealed = seal_chunk(&key, &base, 5, b"payload").unwrap();
+        assert!(open_chunk(&key, &base, 6, &sealed).is_err());
+    }
+
+    #[test]
+    fn tampered_ciphertext_fails() {
+        let (key, base) = new_key_and_base();
+        let mut sealed = seal_chunk(&key, &base, 0, b"payload").unwrap();
+        let last = sealed.len() - 1;
+        sealed[last] ^= 0x01;
+        assert!(open_chunk(&key, &base, 0, &sealed).is_err());
+    }
+
+    #[test]
+    fn distinct_chunks_of_one_file_use_distinct_nonces() {
+        let (key, base) = new_key_and_base();
+        let a = seal_chunk(&key, &base, 0, b"aaaa").unwrap();
+        let b = seal_chunk(&key, &base, 1, b"aaaa").unwrap();
+        assert_ne!(a, b);
+    }
+
+    #[test]
+    fn decode_key_and_base_roundtrip() {
+        let (key, base) = new_key_and_base();
+        let (k, b) = decode_key_and_base(&hex::encode(key), &hex::encode(base)).unwrap();
+        assert_eq!(k, key);
+        assert_eq!(b, base);
+    }
+
+    #[test]
+    fn decode_rejects_wrong_length() {
+        assert!(decode_key_and_base("00", "00000000").is_err());
+        assert!(decode_key_and_base(&hex::encode([0u8; 32]), "00").is_err());
+    }
+}

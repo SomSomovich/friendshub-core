@@ -73,7 +73,7 @@ pub unsafe extern "C" fn fh_init(
             Err(e) => return write_error(out, &e),
         };
 
-        crate::logging::init_once(&cfg.log_level);
+        crate::logging::init_once(&cfg.log_level, &cfg.log_format);
         let db_path = cfg.db_path.clone();
         let http = match HttpClient::new(&cfg) {
             Ok(h) => h,

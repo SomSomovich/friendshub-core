@@ -11,7 +11,7 @@ publish = false
 
 [lib]
 name = "friendshub_core"
-crate-type = ["cdylib", "staticlib"]
+crate-type = ["cdylib", "staticlib", "rlib"]
 
 [dependencies]
 # --- Async runtime ---
@@ -49,6 +49,18 @@ libsignal-protocol = { git = "https://github.com/signalapp/libsignal", tag = "v0
 # --- WebRTC ---
 # webrtc 0.21 is the 1.0 release candidate. API frozen until 1.0.0.
 webrtc = "0.21.0"
+# rtc-media is a sibling of rtc in the same workspace. Sample lives here,
+# not in rtc: the rtc crate re-exports it only when its media feature is
+# enabled, which the default feature set does not.
+rtc-media = "0.21.0"
+# rtc is the Sans-I/O core under webrtc. It is a transitive dependency, but
+# the track and sample types live in it and must be named directly. The
+# version is pinned to match the webrtc release, so both crates see the
+# same types.
+rtc = "0.21.0"
+# rtc-media is a sibling of rtc in the same workspace. Sample lives here,
+# not in rtc: the rtc crate re-exports it only when its media feature is
+# enabled, which the default feature set does not.
 
 # --- Utilities ---
 anyhow = "1.0.103"
@@ -66,6 +78,7 @@ crossbeam-channel = "0.5.16"
 once_cell = "1.21.4"
 zeroize = { version = "1.9.0", features = ["derive"] }
 chacha20poly1305 = { version = "0.10", features = ["std"] }
+bytes = "1"
 
 # keyring 4.x is deprecated and split. Do not enable until we decide on a
 # secure storage approach. See docs/ for notes.

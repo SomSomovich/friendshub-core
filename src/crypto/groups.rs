@@ -181,3 +181,21 @@ pub fn looks_like_sender_key_message(bytes: &[u8]) -> bool {
     // ASCII printable character, never with 0x03.
     bytes[0] == 3
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn detects_sender_key_version_byte() {
+        assert!(looks_like_sender_key_message(&[3]));
+        assert!(looks_like_sender_key_message(&[3, 0, 0, 0]));
+    }
+
+    #[test]
+    fn json_payloads_are_not_sender_key_messages() {
+        assert!(!looks_like_sender_key_message(b"{\"k\":1}"));
+        assert!(!looks_like_sender_key_message(b"68656c6c6f"));
+        assert!(!looks_like_sender_key_message(b""));
+    }
+}

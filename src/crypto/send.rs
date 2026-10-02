@@ -46,7 +46,20 @@ pub async fn send_one(
         let path = format!(
             "/api/v1/accounts/{recipient_account_id}/devices/{device_number}/bundle"
         );
-        let bundle: serde_json::Value = state.http.get(&path, Some(token)).await?;
+        let bundle_result: Result<serde_json::Value> = state.http.get(&path, Some(token)).await;
+        let bundle = match bundle_result {
+            Ok(b) => b,
+            Err(Error::Server { status: 404, .. }) => {
+                // The server says this device does not exist. Our cached
+                // device list for the recipient is stale; drop it so the
+                // next send sees the current devices.
+                let _ = crate::crypto::device_cache::invalidate(state, recipient_account_id).await;
+                return Err(Error::InvalidPayload(format!(
+                    "recipient device {device_number} does not exist; cache refreshed, retry"
+                )));
+            }
+            Err(e) => return Err(e),
+        };
         establish_outbound_session(state, recipient_account_id, device_number, &bundle)
             .await
             .map_err(Error::from)?;

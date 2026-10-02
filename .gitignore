@@ -18,3 +18,9 @@ Thumbs.db
 # Scratch
 /scratch
 /tmp
+project_dump.txt
+# Local library databases. The Python example and ad-hoc REPL runs create
+# these in whatever directory they were started from.
+*.db
+*.sqlite
+*.sqlite3

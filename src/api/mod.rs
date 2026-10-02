@@ -17,6 +17,7 @@ pub mod common;
 pub mod contacts;
 pub mod conversations;
 pub mod device_init;
+pub mod device_cache_api;
 pub mod devices;
 pub mod groups;
 pub mod groups_send;
@@ -29,6 +30,8 @@ pub mod sessions;
 pub mod twofa;
 pub mod user_profiles;
 pub mod webrtc;
+pub mod webrtc_video;
+pub mod webrtc_data;
 pub mod ws;
 
 pub struct DispatchMarker;
@@ -85,6 +88,8 @@ pub async fn dispatch(state: Arc<ActorState>, method: u32, payload: Vec<u8>) -> 
         0x0005_0003 => devices::revoke(&state, payload).await,
         0x0005_0004 => device_init::initialize(&state, payload).await,
         0x0005_0005 => device_init::status(&state, payload).await,
+        0x0005_0006 => device_cache_api::refresh(&state, payload).await,
+        0x0005_0007 => device_cache_api::invalidate(&state, payload).await,
         0x0005_0015 => device_init::ensure_prekeys(&state, payload).await,
 
         // prekeys
@@ -200,6 +205,10 @@ pub async fn dispatch(state: Arc<ActorState>, method: u32, payload: Vec<u8>) -> 
         0x0012_0005 => webrtc::create_data_channel(&state, payload).await,
         0x0012_0006 => webrtc::close_call(&state, payload).await,
         0x0012_0007 => webrtc::list_active(&state, payload).await,
+        0x0012_0015 => webrtc_data::send_channel_data(&state, payload).await,
+        0x0012_0020 => webrtc_video::add_video_track(&state, payload).await,
+        0x0012_0021 => webrtc_video::write_video_frame(&state, payload).await,
+        0x0012_0022 => webrtc_video::read_video_frame(&state, payload).await,
         0x0012_0010 => webrtc::initiate_call(&state, payload).await,
         0x0012_0011 => webrtc::accept_call(&state, payload).await,
         0x0012_0012 => webrtc::send_ice(&state, payload).await,
@@ -231,6 +240,11 @@ async fn version(state: &Arc<ActorState>) -> Result<Vec<u8>> {
 }
 
 async fn poll_event(state: &Arc<ActorState>, payload: &[u8]) -> Result<Vec<u8>> {
+    // Identity key changes are stored in a table by the crypto store, which
+    // has no access to the event queue. Move any waiting rows into the
+    // queue before polling so the consumer sees them in order.
+    emit_pending_identity_changes(state).await;
+
     let timeout_ms = if payload.len() >= 4 {
         u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as u64
     } else {
@@ -246,3 +260,58 @@ async fn poll_event(state: &Arc<ActorState>, payload: &[u8]) -> Result<Vec<u8>> 
 
 #[allow(dead_code)]
 fn _touch(_: Event) {}
+
+/// Moves un-notified identity changes into the event queue and marks them
+/// notified. The event is ephemeral: the consumer is expected to show it
+/// immediately and the durable copy is not replayed after a crash. If the
+/// UI is not running, the warning would arrive too late to matter anyway.
+async fn emit_pending_identity_changes(state: &Arc<ActorState>) {
+    #[derive(sqlx::FromRow)]
+    struct Row {
+        id: i64,
+        account_id: String,
+        device_number: i64,
+        old_key: Vec<u8>,
+        new_key: Vec<u8>,
+        changed_at: i64,
+    }
+
+    let rows: Vec<Row> = match sqlx::query_as::<_, Row>(
+        "SELECT id, account_id, device_number, old_key, new_key, changed_at FROM identity_changes WHERE notified = 0 ORDER BY id ASC LIMIT 64",
+    )
+    .fetch_all(&state.db)
+    .await
+    {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::warn!(error = ?e, "identity_changes query failed");
+            return;
+        }
+    };
+
+    if rows.is_empty() {
+        return;
+    }
+
+    let mut acked: Vec<i64> = Vec::with_capacity(rows.len());
+    for r in rows {
+        state.events.push(crate::events::types::Event::ephemeral(
+            "identity_changed",
+            serde_json::json!({
+                "account_id": r.account_id,
+                "device_number": r.device_number,
+                "old_key_hex": hex::encode(&r.old_key),
+                "new_key_hex": hex::encode(&r.new_key),
+                "changed_at": r.changed_at,
+            }),
+        ));
+        acked.push(r.id);
+    }
+
+    for id in acked {
+        let _ = sqlx::query("UPDATE identity_changes SET notified = 1 WHERE id = ?")
+            .bind(id)
+            .execute(&state.db)
+            .await;
+    }
+}

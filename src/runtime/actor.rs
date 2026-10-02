@@ -86,11 +86,21 @@ impl Actor {
                     };
                     let state = Arc::new(state);
 
+                    // WebRTC event forwarder. Runs for the lifetime of the actor.
                     {
                         let state_for_loop = state.clone();
                         let manager = state.webrtc.clone();
                         tokio::task::spawn_local(async move {
                             manager.run_event_loop(state_for_loop).await;
+                        });
+                    }
+
+                    // Periodic cleanup of tables that would otherwise grow
+                    // without bound. Runs for the lifetime of the actor.
+                    {
+                        let db = state.db.clone();
+                        tokio::task::spawn_local(async move {
+                            crate::db::cleanup::run(db).await;
                         });
                     }
 
