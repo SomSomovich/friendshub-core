@@ -11,6 +11,7 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   RUST_BACKTRACE: 1
+  PROTOC_VERSION: '29.3'
 
 jobs:
   linux:
@@ -41,6 +42,20 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.runner }}
+
+      - name: Install protoc
+        run: |
+          set -euo pipefail
+          arch=$(uname -m)
+          case "$arch" in
+            x86_64)  a=x86_64 ;;
+            aarch64) a=aarch_64 ;;
+            *)       echo "unsupported arch: $arch"; exit 1 ;;
+          esac
+          url="https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-${a}.zip"
+          curl -fsSL -o /tmp/protoc.zip "$url"
+          unzip -q -o /tmp/protoc.zip -d "$HOME/protoc"
+          echo "$HOME/protoc/bin" >> "$GITHUB_PATH"
 
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y cmake perl nasm
@@ -92,6 +107,14 @@ jobs:
         with:
           key: ${{ matrix.runner }}
 
+      - name: Install protoc
+        shell: pwsh
+        run: |
+          $url = "https://github.com/protocolbuffers/protobuf/releases/download/v$env:PROTOC_VERSION/protoc-$env:PROTOC_VERSION-win64.zip"
+          Invoke-WebRequest -Uri $url -OutFile "$env:TEMP\protoc.zip"
+          Expand-Archive -Path "$env:TEMP\protoc.zip" -DestinationPath "$env:USERPROFILE\protoc" -Force
+          "$env:USERPROFILE\protoc\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
+
       - name: Install cbindgen
         run: cargo install cbindgen --locked
 
@@ -139,11 +162,12 @@ jobs:
             suffix: ios-arm64-simulator
 
     env:
-      # aws-lc-sys references ___chkstk_darwin, which lives in the iOS 13+
-      # SDK. With the historical default of iOS 10 the symbol is undefined and
-      # the link fails. 13 is also the current App Store minimum, so there is
-      # no reason to go lower.
-      IPHONEOS_DEPLOYMENT_TARGET: '13.0'
+      # The cc builder ignores IPHONEOS_DEPLOYMENT_TARGET; cmake honours it,
+      # and aws-lc-sys needs a deployment target of at least 13.0 so that
+      # ___chkstk_darwin resolves against the SDK. The default the cc builder
+      # uses is 10.0, which is where the link failed.
+      AWS_LC_SYS_CMAKE_BUILDER: '1'
+      IPHONEOS_DEPLOYMENT_TARGET: '14.0'
       MACOSX_DEPLOYMENT_TARGET: '11.0'
 
     steps:
@@ -156,6 +180,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.suffix }}
+
+      - name: Install protoc
+        run: brew install protobuf
 
       - name: Install cbindgen
         run: cargo install cbindgen --locked
@@ -204,6 +231,14 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: android
+
+      - name: Install protoc
+        run: |
+          set -euo pipefail
+          url="https://github.com/protocolbuffers/protobuf/releases/download/v${PROTOC_VERSION}/protoc-${PROTOC_VERSION}-linux-x86_64.zip"
+          curl -fsSL -o /tmp/protoc.zip "$url"
+          unzip -q -o /tmp/protoc.zip -d "$HOME/protoc"
+          echo "$HOME/protoc/bin" >> "$GITHUB_PATH"
 
       - name: Install build tools
         run: sudo apt-get update && sudo apt-get install -y cmake perl nasm

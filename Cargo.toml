@@ -86,9 +86,6 @@ keyring = { version = "4.1.5", optional = true }
 
 [build-dependencies]
 prost-build = "0.14.4"
-# Vendored protoc: the build must not depend on the system one. Ubuntu
-# 22.04 ships protoc 3.12, which rejects proto3 optional fields.
-protoc-bin-vendored = "3"
 
 [features]
 default = []
