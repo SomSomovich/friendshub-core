@@ -63,9 +63,76 @@ typedef struct FH_FhBuffer {
     size_t cap;
 } FH_FhBuffer;
 
+/**
+ * Borrowed event payload supplied to an event callback. `event_json` is valid
+ * only until the callback returns. `event_id == 0` means ephemeral; otherwise
+ * acknowledge the durable event with fh_ack_event.
+ */
+typedef struct FH_FhEventView {
+    uint64_t event_id;
+    const uint8_t *event_json;
+    size_t event_json_len;
+} FH_FhEventView;
+
+/**
+ * Event callback. Do not retain the event view or its JSON pointer after
+ * returning, and do not unwind across the C ABI boundary.
+ */
+typedef void (*FH_FhEventCallback)(void *user_data, const struct FH_FhEventView *event);
+
+/** Separate callback slots for all event kinds emitted by the library. */
+typedef struct FH_FhEventCallbacks {
+    FH_FhEventCallback on_ws_connected;
+    FH_FhEventCallback on_ws_disconnected;
+    FH_FhEventCallback on_ws_stopped;
+    FH_FhEventCallback on_envelope_received;
+    FH_FhEventCallback on_receipt;
+    FH_FhEventCallback on_server_error;
+    FH_FhEventCallback on_fatal_error;
+    FH_FhEventCallback on_presence_updated;
+    FH_FhEventCallback on_bot_message;
+    FH_FhEventCallback on_channel_post;
+    FH_FhEventCallback on_typing;
+    FH_FhEventCallback on_read_receipt;
+    FH_FhEventCallback on_conversation_updated;
+    FH_FhEventCallback on_history_request;
+    FH_FhEventCallback on_nudge;
+    FH_FhEventCallback on_nudge_result;
+    FH_FhEventCallback on_conversation_expired;
+    FH_FhEventCallback on_scheduled_created;
+    FH_FhEventCallback on_scheduled_cancelled;
+    FH_FhEventCallback on_folders_updated;
+    FH_FhEventCallback on_bot_message_edited;
+    FH_FhEventCallback on_bot_message_deleted;
+    FH_FhEventCallback on_bot_callback_answered;
+    FH_FhEventCallback on_poll_updated;
+    FH_FhEventCallback on_poll_deleted;
+    FH_FhEventCallback on_call_signal;
+    FH_FhEventCallback on_identity_changed;
+    FH_FhEventCallback on_webrtc_ice_candidate;
+    FH_FhEventCallback on_webrtc_signaling_state_changed;
+    FH_FhEventCallback on_webrtc_ice_connection_state_changed;
+    FH_FhEventCallback on_webrtc_ice_gathering_state_changed;
+    FH_FhEventCallback on_webrtc_connection_state_changed;
+    FH_FhEventCallback on_webrtc_data_channel_opened;
+    FH_FhEventCallback on_webrtc_data_channel_closed;
+    FH_FhEventCallback on_webrtc_data_channel_message;
+    FH_FhEventCallback on_webrtc_track_received;
+    FH_FhEventCallback on_webrtc_closed;
+    FH_FhEventCallback on_unhandled;
+} FH_FhEventCallbacks;
+
 const char *fh_abi_string(void);
 
 uint32_t fh_abi_version(void);
+
+/**
+ * Installs per-event callbacks, or clears callbacks when `callbacks` is null.
+ * The event view and JSON bytes are owned by the library and borrowed only
+ * until the callback returns. `user_data` remains owned by the caller and
+ * must stay valid until callbacks are cleared or the handle is destroyed.
+ */
+int32_t fh_set_event_callbacks(struct FH_FhHandle *handle, const struct FH_FhEventCallbacks *callbacks, void *user_data);
 
 /**
  * Releases the database row for a durable event and, where the event is an

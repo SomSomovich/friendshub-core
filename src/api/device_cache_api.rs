@@ -18,8 +18,7 @@ pub struct RefreshRequest {
 /// device without waiting for the cache TTL to expire.
 pub async fn refresh(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
     let req: RefreshRequest = serde_json::from_slice(&payload)?;
-    let devices = device_cache::force_refresh(state, &req.account_id)
-        .await?;
+    let devices = device_cache::force_refresh(state, &req.account_id).await?;
     Ok(serde_json::to_vec(&serde_json::json!({
         "count": devices.len(),
         "device_numbers": devices.iter().map(|d| d.device_number).collect::<Vec<_>>(),
@@ -35,7 +34,6 @@ pub struct InvalidateRequest {
 /// `send_message` will fetch fresh.
 pub async fn invalidate(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
     let req: InvalidateRequest = serde_json::from_slice(&payload)?;
-    device_cache::invalidate(state, &req.account_id)
-        .await?;
+    device_cache::invalidate(state, &req.account_id).await?;
     Ok(br#"{"invalidated":true}"#.to_vec())
 }

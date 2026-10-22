@@ -41,18 +41,23 @@ async fn sweep(db: &SqlitePool) -> Result<(), sqlx::Error> {
         .execute(db)
         .await?;
     if pending.rows_affected() > 0 {
-        tracing::info!(count = pending.rows_affected(), "dropped stale pending events");
+        tracing::info!(
+            count = pending.rows_affected(),
+            "dropped stale pending events"
+        );
     }
 
     let cutoff = now - NOTIFIED_IDENTITY_TTL_SECS;
-    let identity = sqlx::query(
-        "DELETE FROM identity_changes WHERE notified = 1 AND changed_at < ?",
-    )
-    .bind(cutoff)
-    .execute(db)
-    .await?;
+    let identity =
+        sqlx::query("DELETE FROM identity_changes WHERE notified = 1 AND changed_at < ?")
+            .bind(cutoff)
+            .execute(db)
+            .await?;
     if identity.rows_affected() > 0 {
-        tracing::info!(count = identity.rows_affected(), "dropped old identity changes");
+        tracing::info!(
+            count = identity.rows_affected(),
+            "dropped old identity changes"
+        );
     }
 
     Ok(())

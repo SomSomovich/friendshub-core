@@ -23,7 +23,11 @@ pub struct Vp8Depacketizer {
 
 impl Vp8Depacketizer {
     pub fn new() -> Self {
-        Self { buffer: Vec::new(), in_frame: false, last_sequence: None }
+        Self {
+            buffer: Vec::new(),
+            in_frame: false,
+            last_sequence: None,
+        }
     }
 
     /// Feeds one RTP packet. Returns a complete frame when the packet
@@ -38,10 +42,11 @@ impl Vp8Depacketizer {
         // packet. Dropping it is correct: a VP8 decoder cannot use a partial
         // frame, and keeping it would make the next frame start with garbage.
         if let Some(prev) = self.last_sequence
-            && packet.header.sequence_number != prev.wrapping_add(1) {
-                self.buffer.clear();
-                self.in_frame = false;
-            }
+            && packet.header.sequence_number != prev.wrapping_add(1)
+        {
+            self.buffer.clear();
+            self.in_frame = false;
+        }
         self.last_sequence = Some(packet.header.sequence_number);
 
         let descriptor_len = parse_descriptor_len(payload)?;
@@ -74,7 +79,9 @@ impl Vp8Depacketizer {
 }
 
 impl Default for Vp8Depacketizer {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Returns the number of descriptor bytes before the actual VP8 payload,
@@ -130,7 +137,10 @@ mod tests {
             marker,
             ..Default::default()
         };
-        Packet { header, payload: Bytes::from(payload) }
+        Packet {
+            header,
+            payload: Bytes::from(payload),
+        }
     }
 
     #[test]

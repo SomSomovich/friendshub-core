@@ -10,7 +10,7 @@ use libsignal_protocol::{
     GenericSignedPreKey, IdentityKeyPair, KeyPair, KyberPreKeyId, KyberPreKeyRecord, PreKeyId,
     PreKeyRecord, SignedPreKeyId, SignedPreKeyRecord, Timestamp,
 };
-use rand::Rng;
+use rand::RngExt;
 
 use crate::api::common::bearer;
 use crate::crypto::error::{CryptoError, CryptoResult};
@@ -65,15 +65,15 @@ pub async fn initialize(state: &ActorState, name: &str) -> CryptoResult<InitResu
         return Err(CryptoError::Invalid("device is already initialized".into()));
     }
 
-    let mut rng = rand::rng();
+    let mut signal_rng = signal_rand::rng();
 
     // 1. Identity key pair.
-    let identity = IdentityKeyPair::generate(&mut rng);
+    let identity = IdentityKeyPair::generate(&mut signal_rng);
 
     // 2. Registration id. The server accepts the full 14-bit range; picking a
     //    random value here means two devices of the same account will almost
     //    never collide, and re-registration of the same device gets a fresh id.
-    let registration_id: u32 = rng.random_range(0..16384);
+    let registration_id: u32 = rand::rng().random_range(0..16384);
 
     // 3. Store identity locally before anything else: the server call below
     //    can fail, and re-running setup must be able to see that state.
@@ -89,7 +89,9 @@ pub async fn initialize(state: &ActorState, name: &str) -> CryptoResult<InitResu
 
     // 4. Register the device with the server.
     let identity_pub_hex = hex::encode(identity.identity_key().serialize());
-    let token = bearer(state).await.map_err(|e| CryptoError::Database(e.to_string()))?;
+    let token = bearer(state)
+        .await
+        .map_err(|e| CryptoError::Database(e.to_string()))?;
 
     let body = serde_json::json!({
         "name": name,
@@ -166,14 +168,13 @@ async fn generate_and_upload_prekeys(
     identity: &IdentityKeyPair,
     count: usize,
 ) -> CryptoResult<(usize, usize)> {
-    let mut rng = rand::rng();
+    let mut rng = signal_rand::rng();
 
-    let mut next_id: i64 = sqlx::query_scalar(
-        "SELECT next_prekey_id FROM identity_state WHERE id = 1",
-    )
-    .fetch_one(&state.db)
-    .await
-    .map_err(|e| CryptoError::Database(e.to_string()))?;
+    let mut next_id: i64 =
+        sqlx::query_scalar("SELECT next_prekey_id FROM identity_state WHERE id = 1")
+            .fetch_one(&state.db)
+            .await
+            .map_err(|e| CryptoError::Database(e.to_string()))?;
 
     let signed_prekey_id = next_id;
     next_id += 1;
@@ -196,9 +197,13 @@ async fn generate_and_upload_prekeys(
     );
     {
         let mut store = Store::new(state.db.clone());
-        libsignal_protocol::SignedPreKeyStore::save_signed_pre_key(&mut store, signed_id, &signed_record)
-            .await
-            .map_err(|e| CryptoError::Signal(e.to_string()))?;
+        libsignal_protocol::SignedPreKeyStore::save_signed_pre_key(
+            &mut store,
+            signed_id,
+            &signed_record,
+        )
+        .await
+        .map_err(|e| CryptoError::Signal(e.to_string()))?;
     }
 
     // ---- kyber last-resort ----
@@ -219,9 +224,13 @@ async fn generate_and_upload_prekeys(
         .map_err(|e| CryptoError::Signal(e.to_string()))?;
     {
         let mut store = Store::new(state.db.clone());
-        libsignal_protocol::KyberPreKeyStore::save_kyber_pre_key(&mut store, kyber_lr_id, &kyber_lr_record)
-            .await
-            .map_err(|e| CryptoError::Signal(e.to_string()))?;
+        libsignal_protocol::KyberPreKeyStore::save_kyber_pre_key(
+            &mut store,
+            kyber_lr_id,
+            &kyber_lr_record,
+        )
+        .await
+        .map_err(|e| CryptoError::Signal(e.to_string()))?;
     }
 
     // ---- one-time prekeys (X25519) ----
@@ -251,7 +260,9 @@ async fn generate_and_upload_prekeys(
         )
         .map_err(|e| CryptoError::Signal(e.to_string()))?;
         let pub_bytes = {
-            let pk = record.public_key().map_err(|e| CryptoError::Signal(e.to_string()))?;
+            let pk = record
+                .public_key()
+                .map_err(|e| CryptoError::Signal(e.to_string()))?;
             pk.serialize()
         };
         {
@@ -301,7 +312,9 @@ async fn generate_and_upload_prekeys(
         "kyber_one_time_prekeys": kyber_otk_json,
     });
 
-    let token = bearer(state).await.map_err(|e| CryptoError::Database(e.to_string()))?;
+    let token = bearer(state)
+        .await
+        .map_err(|e| CryptoError::Database(e.to_string()))?;
     let _: serde_json::Value = state
         .http
         .post("/api/v1/devices/me/prekeys", &body, Some(&token))

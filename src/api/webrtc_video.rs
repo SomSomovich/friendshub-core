@@ -14,7 +14,9 @@ pub struct AddVideoRequest {
     pub label: String,
 }
 
-fn default_label() -> String { "video".to_string() }
+fn default_label() -> String {
+    "video".to_string()
+}
 
 /// Adds an outgoing VP8 video track to an active call.
 ///
@@ -44,7 +46,9 @@ pub struct WriteFrameRequest {
     pub duration_ms: u64,
 }
 
-fn default_duration_ms() -> u64 { 33 }
+fn default_duration_ms() -> u64 {
+    33
+}
 
 /// Writes one encoded frame to the outgoing video track.
 ///
@@ -76,7 +80,9 @@ pub struct ReadFrameRequest {
     pub timeout_ms: u64,
 }
 
-fn default_read_timeout_ms() -> u64 { 1000 }
+fn default_read_timeout_ms() -> u64 {
+    1000
+}
 
 /// Reads the next complete video frame from the remote track on a call.
 ///
@@ -118,7 +124,9 @@ pub struct AddAudioRequest {
     pub label: String,
 }
 
-fn default_audio_label() -> String { "audio".to_string() }
+fn default_audio_label() -> String {
+    "audio".to_string()
+}
 
 /// Adds an outgoing Opus audio track to an active call.
 pub async fn add_audio_track(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
@@ -143,7 +151,9 @@ pub struct WriteAudioRequest {
     pub duration_ms: u64,
 }
 
-fn default_audio_duration_ms() -> u64 { 20 }
+fn default_audio_duration_ms() -> u64 {
+    20
+}
 
 pub async fn write_audio_frame(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
     use base64::Engine;
@@ -165,7 +175,9 @@ pub struct ReadAudioRequest {
     pub timeout_ms: u64,
 }
 
-fn default_audio_read_timeout_ms() -> u64 { 200 }
+fn default_audio_read_timeout_ms() -> u64 {
+    200
+}
 
 pub async fn read_audio_frame(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
     use base64::Engine;

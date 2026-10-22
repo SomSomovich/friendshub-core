@@ -125,7 +125,10 @@ pub async fn pin(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
     let v: serde_json::Value = serde_json::from_slice(&payload)?;
     let post_id = id_from(&v)?;
     let path = format!("/api/v1/channel-posts/{post_id}/pin");
-    let _: serde_json::Value = state.http.post(&path, &serde_json::json!({}), Some(&token)).await?;
+    let _: serde_json::Value = state
+        .http
+        .post(&path, &serde_json::json!({}), Some(&token))
+        .await?;
     Ok(br#"{"pinned":true}"#.to_vec())
 }
 

@@ -33,7 +33,10 @@ pub struct RegisterDeviceRequest {
 pub async fn register(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
     let token = bearer(state).await?;
     let req: RegisterDeviceRequest = serde_json::from_slice(&payload)?;
-    let item: DeviceItem = state.http.post("/api/v1/devices", &req, Some(&token)).await?;
+    let item: DeviceItem = state
+        .http
+        .post("/api/v1/devices", &req, Some(&token))
+        .await?;
     Ok(serde_json::to_vec(&item)?)
 }
 

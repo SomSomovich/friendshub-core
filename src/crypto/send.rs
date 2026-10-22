@@ -43,9 +43,8 @@ pub async fn send_one(
         .map_err(Error::from)?;
 
     if !have {
-        let path = format!(
-            "/api/v1/accounts/{recipient_account_id}/devices/{device_number}/bundle"
-        );
+        let path =
+            format!("/api/v1/accounts/{recipient_account_id}/devices/{device_number}/bundle");
         let bundle_result: Result<serde_json::Value> = state.http.get(&path, Some(token)).await;
         let bundle = match bundle_result {
             Ok(b) => b,
@@ -65,14 +64,10 @@ pub async fn send_one(
             .map_err(Error::from)?;
     }
 
-    let (ciphertext, is_prekey) = encrypt_for_device(
-        state,
-        recipient_account_id,
-        device_number,
-        plaintext,
-    )
-    .await
-    .map_err(Error::from)?;
+    let (ciphertext, is_prekey) =
+        encrypt_for_device(state, recipient_account_id, device_number, plaintext)
+            .await
+            .map_err(Error::from)?;
 
     let envelope_id = uuid::Uuid::now_v7().to_string();
 

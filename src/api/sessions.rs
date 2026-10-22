@@ -41,7 +41,11 @@ pub async fn revoke_all(state: &Arc<ActorState>, _payload: Vec<u8>) -> Result<Ve
     let token = bearer(state).await?;
     let resp: RevokeAllResponse = state
         .http
-        .post("/api/v1/sessions/revoke-all", &serde_json::json!({}), Some(&token))
+        .post(
+            "/api/v1/sessions/revoke-all",
+            &serde_json::json!({}),
+            Some(&token),
+        )
         .await?;
     Ok(serde_json::to_vec(&resp)?)
 }

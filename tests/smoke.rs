@@ -14,7 +14,7 @@ fn config_parses_minimal_json() {
 
 #[test]
 fn config_rejects_missing_required_fields() {
-    let raw = br#"{"api_base":"","ws_url":"wss://x/ws","db_path":"/tmp/x.db"}"#;
+    let raw = br#"{"api_base":"","ws_url":"wss://x/ws","db_path":"/tmp/x.db","discovery":{"enabled":false}}"#;
     assert!(Config::from_json(raw).is_err());
 }
 
@@ -26,6 +26,12 @@ fn config_rejects_invalid_json() {
 #[test]
 fn abi_version_is_one() {
     assert_eq!(friendshub_core::ffi::ABI_VERSION, 1);
+}
+
+#[test]
+fn abi_string_is_a_valid_nul_terminated_package_version() {
+    let version = unsafe { std::ffi::CStr::from_ptr(friendshub_core::ffi::fh_abi_string()) };
+    assert_eq!(version.to_str().unwrap(), env!("CARGO_PKG_VERSION"));
 }
 
 #[test]

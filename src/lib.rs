@@ -4,16 +4,20 @@
 //! C ABI in [`ffi`].
 
 pub mod api;
+pub mod client;
 pub mod config;
 pub mod crypto;
 pub mod db;
 pub mod discovery;
 pub mod error;
 pub mod events;
-pub mod logging;
 pub mod ffi;
+pub mod logging;
 pub mod proto;
 pub mod runtime;
 pub mod transport;
 pub mod util;
 pub mod webrtc;
+
+pub use client::Client;
+pub use events::EventHandler;

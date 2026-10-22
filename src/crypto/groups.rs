@@ -11,9 +11,9 @@
 //! per sender instead of O(members).
 
 use libsignal_protocol::{
+    DeviceId, ProtocolAddress, SenderKeyDistributionMessage,
     create_sender_key_distribution_message, group_decrypt, group_encrypt,
-    process_sender_key_distribution_message, DeviceId, ProtocolAddress,
-    SenderKeyDistributionMessage,
+    process_sender_key_distribution_message,
 };
 use uuid::Uuid;
 
@@ -23,16 +23,14 @@ use crate::db::auth as db_auth;
 use crate::runtime::ActorState;
 use crate::util::time::now_unix;
 
-const SQL_GET_DIST: &str = "SELECT distribution_id FROM group_sender_keys WHERE conversation_id = ?";
+const SQL_GET_DIST: &str =
+    "SELECT distribution_id FROM group_sender_keys WHERE conversation_id = ?";
 const SQL_INSERT_DIST: &str = "INSERT INTO group_sender_keys (conversation_id, distribution_id, created_at) VALUES (?, ?, ?) ON CONFLICT(conversation_id) DO NOTHING";
 const SQL_ROTATE_DIST: &str = "INSERT INTO group_sender_keys (conversation_id, distribution_id, created_at) VALUES (?, ?, ?) ON CONFLICT(conversation_id) DO UPDATE SET distribution_id = excluded.distribution_id, created_at = excluded.created_at";
 
 /// Returns the distribution id this device uses for the given conversation,
 /// creating one on first call.
-pub async fn distribution_id_for(
-    state: &ActorState,
-    conversation_id: &str,
-) -> CryptoResult<Uuid> {
+pub async fn distribution_id_for(state: &ActorState, conversation_id: &str) -> CryptoResult<Uuid> {
     let existing: Option<(Vec<u8>,)> = sqlx::query_as(SQL_GET_DIST)
         .bind(conversation_id)
         .fetch_optional(&state.db)
@@ -59,10 +57,7 @@ pub async fn distribution_id_for(
 /// Forces a new distribution id for a conversation. Used after a member is
 /// removed, so the remaining members rekey and the removed device cannot
 /// read anything sent afterwards.
-pub async fn rotate_distribution(
-    state: &ActorState,
-    conversation_id: &str,
-) -> CryptoResult<Uuid> {
+pub async fn rotate_distribution(state: &ActorState, conversation_id: &str) -> CryptoResult<Uuid> {
     let id = Uuid::new_v4();
     sqlx::query(SQL_ROTATE_DIST)
         .bind(conversation_id)
@@ -99,7 +94,7 @@ pub async fn create_distribution(
     let dist_id = distribution_id_for(state, conversation_id).await?;
     let local = local_address(state).await?;
     let mut store = Store::new(state.db.clone());
-    let mut rng = rand::rng();
+    let mut rng = signal_rand::rng();
 
     let skdm = create_sender_key_distribution_message(&local, dist_id, &mut store, &mut rng)
         .await
@@ -143,7 +138,7 @@ pub async fn encrypt_for_group(
     let dist_id = distribution_id_for(state, conversation_id).await?;
     let local = local_address(state).await?;
     let mut store = Store::new(state.db.clone());
-    let mut rng = rand::rng();
+    let mut rng = signal_rand::rng();
 
     let skm = group_encrypt(&mut store, &local, dist_id, plaintext, &mut rng)
         .await

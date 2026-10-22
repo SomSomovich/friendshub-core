@@ -14,7 +14,10 @@ pub struct UpdateUsernameRequest {
 pub async fn update_username(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
     let token = bearer(state).await?;
     let req: UpdateUsernameRequest = serde_json::from_slice(&payload)?;
-    let _: serde_json::Value = state.http.put("/api/v1/profile/username", &req, Some(&token)).await?;
+    let _: serde_json::Value = state
+        .http
+        .put("/api/v1/profile/username", &req, Some(&token))
+        .await?;
     Ok(br#"{"updated":true}"#.to_vec())
 }
 
@@ -28,13 +31,19 @@ pub struct UpdateStatusRequest {
 pub async fn update_custom_status(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
     let token = bearer(state).await?;
     let req: UpdateStatusRequest = serde_json::from_slice(&payload)?;
-    let _: serde_json::Value = state.http.put("/api/v1/profile/status", &req, Some(&token)).await?;
+    let _: serde_json::Value = state
+        .http
+        .put("/api/v1/profile/status", &req, Some(&token))
+        .await?;
     Ok(br#"{"updated":true}"#.to_vec())
 }
 
 pub async fn clear_custom_status(state: &Arc<ActorState>, _payload: Vec<u8>) -> Result<Vec<u8>> {
     let token = bearer(state).await?;
-    let _: serde_json::Value = state.http.delete("/api/v1/profile/status", Some(&token)).await?;
+    let _: serde_json::Value = state
+        .http
+        .delete("/api/v1/profile/status", Some(&token))
+        .await?;
     Ok(br#"{"cleared":true}"#.to_vec())
 }
 
@@ -46,7 +55,10 @@ pub struct InvisibleModeRequest {
 pub async fn set_invisible_mode(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
     let token = bearer(state).await?;
     let req: InvisibleModeRequest = serde_json::from_slice(&payload)?;
-    let _: serde_json::Value = state.http.put("/api/v1/profile/invisible", &req, Some(&token)).await?;
+    let _: serde_json::Value = state
+        .http
+        .put("/api/v1/profile/invisible", &req, Some(&token))
+        .await?;
     Ok(br#"{"updated":true}"#.to_vec())
 }
 
@@ -59,7 +71,10 @@ pub struct ExceptionItem {
 
 pub async fn list_exceptions(state: &Arc<ActorState>, _payload: Vec<u8>) -> Result<Vec<u8>> {
     let token = bearer(state).await?;
-    let rows: Vec<ExceptionItem> = state.http.get("/api/v1/profile/presence-exceptions", Some(&token)).await?;
+    let rows: Vec<ExceptionItem> = state
+        .http
+        .get("/api/v1/profile/presence-exceptions", Some(&token))
+        .await?;
     Ok(serde_json::to_vec(&rows)?)
 }
 
@@ -72,14 +87,24 @@ pub struct ExceptionRequest {
 pub async fn add_exception(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
     let token = bearer(state).await?;
     let req: ExceptionRequest = serde_json::from_slice(&payload)?;
-    let _: serde_json::Value = state.http.post("/api/v1/profile/presence-exceptions", &req, Some(&token)).await?;
+    let _: serde_json::Value = state
+        .http
+        .post("/api/v1/profile/presence-exceptions", &req, Some(&token))
+        .await?;
     Ok(br#"{"added":true}"#.to_vec())
 }
 
 pub async fn remove_exception(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
     let token = bearer(state).await?;
     let req: ExceptionRequest = serde_json::from_slice(&payload)?;
-    let _: serde_json::Value = state.http.post("/api/v1/profile/presence-exceptions/remove", &req, Some(&token)).await?;
+    let _: serde_json::Value = state
+        .http
+        .post(
+            "/api/v1/profile/presence-exceptions/remove",
+            &req,
+            Some(&token),
+        )
+        .await?;
     Ok(br#"{"removed":true}"#.to_vec())
 }
 
@@ -127,4 +152,5 @@ pub async fn get_presence(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<V
 }
 
 #[allow(dead_code)]
-fn _unused(_: PublicProfile, _: PresenceResponse, _: UpdateStatusRequest, _: InvisibleModeRequest) {}
+fn _unused(_: PublicProfile, _: PresenceResponse, _: UpdateStatusRequest, _: InvisibleModeRequest) {
+}

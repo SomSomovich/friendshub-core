@@ -79,7 +79,9 @@ pub fn decode_identity_key_pair(
 
 #[async_trait(?Send)]
 impl IdentityKeyStore for Store {
-    async fn get_identity_key_pair(&self) -> std::result::Result<IdentityKeyPair, SignalProtocolError> {
+    async fn get_identity_key_pair(
+        &self,
+    ) -> std::result::Result<IdentityKeyPair, SignalProtocolError> {
         let row: Option<(Vec<u8>,)> =
             sqlx::query_as("SELECT key_pair FROM identity_state WHERE id = 1")
                 .fetch_optional(&self.db)
@@ -146,9 +148,8 @@ impl IdentityKeyStore for Store {
         // stored either way -- rejecting it outright would make the client
         // unable to decrypt legitimate re-registrations -- but the user is
         // told, and can decide whether to trust the peer again.
-        if changed
-            && let Some((old,)) = &existing {
-                let _ = sqlx::query(
+        if changed && let Some((old,)) = &existing {
+            let _ = sqlx::query(
                     "INSERT INTO identity_changes (account_id, device_number, old_key, new_key, changed_at) VALUES (?, ?, ?, ?, ?)",
                 )
                 .bind(&account_id)
@@ -158,7 +159,7 @@ impl IdentityKeyStore for Store {
                 .bind(now)
                 .execute(&self.db)
                 .await;
-            }
+        }
 
         Ok(if changed {
             IdentityChange::ReplacedExisting
@@ -219,9 +220,7 @@ impl PreKeyStore for Store {
                 .await
                 .map_err(store_err)?;
         let blob = row
-            .ok_or_else(|| {
-                SignalProtocolError::InvalidArgument(format!("prekey {id} not found"))
-            })?
+            .ok_or_else(|| SignalProtocolError::InvalidArgument(format!("prekey {id} not found")))?
             .0;
         PreKeyRecord::deserialize(&blob)
     }

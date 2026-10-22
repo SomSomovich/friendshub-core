@@ -29,7 +29,10 @@ pub struct GroupResponse {
 pub async fn create(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
     let token = bearer(state).await?;
     let req: CreateGroupRequest = serde_json::from_slice(&payload)?;
-    let resp: GroupResponse = state.http.post("/api/v1/groups", &req, Some(&token)).await?;
+    let resp: GroupResponse = state
+        .http
+        .post("/api/v1/groups", &req, Some(&token))
+        .await?;
     Ok(serde_json::to_vec(&resp)?)
 }
 
@@ -133,7 +136,10 @@ pub async fn join_public(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Ve
     let v: serde_json::Value = serde_json::from_slice(&payload)?;
     let id = id_from(&v)?;
     let path = format!("/api/v1/groups/{id}/join");
-    let _: serde_json::Value = state.http.post(&path, &serde_json::json!({}), Some(&token)).await?;
+    let _: serde_json::Value = state
+        .http
+        .post(&path, &serde_json::json!({}), Some(&token))
+        .await?;
     Ok(br#"{"joined":true}"#.to_vec())
 }
 

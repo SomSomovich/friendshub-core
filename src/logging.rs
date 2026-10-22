@@ -15,8 +15,7 @@ static INIT: Once = Once::new();
 /// `"json"`. Anything else is treated as `"text"`.
 pub fn init_once(level: &str, format: &str) {
     INIT.call_once(|| {
-        let filter = EnvFilter::try_from_default_env()
-            .unwrap_or_else(|_| EnvFilter::new(level));
+        let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(level));
 
         if format.eq_ignore_ascii_case("json") {
             let _ = tracing_subscriber::fmt()

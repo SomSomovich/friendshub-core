@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use crate::api::common::bearer;
 use crate::crypto::device_cache;
 use crate::crypto::manager::{decrypt_envelope, encrypt_for_device, establish_outbound_session};
-use crate::crypto::send::{send_one, SentEnvelope};
+use crate::crypto::send::{SentEnvelope, send_one};
 use crate::db::auth as db_auth;
 use crate::error::{Error, Result};
 use crate::runtime::ActorState;
@@ -24,9 +24,14 @@ pub struct EstablishSessionRequest {
 
 pub async fn establish_session(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
     let req: EstablishSessionRequest = serde_json::from_slice(&payload)?;
-    establish_outbound_session(state, &req.recipient_account_id, req.device_number, &req.bundle)
-        .await
-        .map_err(Error::from)?;
+    establish_outbound_session(
+        state,
+        &req.recipient_account_id,
+        req.device_number,
+        &req.bundle,
+    )
+    .await
+    .map_err(Error::from)?;
     Ok(br#"{"ok":true}"#.to_vec())
 }
 
@@ -74,7 +79,9 @@ pub struct DecryptResponse {
 
 pub async fn decrypt(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
     let envelope: serde_json::Value = serde_json::from_slice(&payload)?;
-    let plaintext = decrypt_envelope(state, &envelope).await.map_err(Error::from)?;
+    let plaintext = decrypt_envelope(state, &envelope)
+        .await
+        .map_err(Error::from)?;
     Ok(serde_json::to_vec(&DecryptResponse {
         plaintext_hex: hex::encode(&plaintext),
     })?)
@@ -177,7 +184,7 @@ pub async fn send_message(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<V
             &plaintext,
             ENVELOPE_TYPE_MESSAGE,
             req.conversation_id.as_deref(),
-)
+        )
         .await
         {
             Ok(info) => envelopes.push(info),
@@ -209,7 +216,7 @@ pub async fn send_message(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<V
             sender_device_number,
             &sync_bytes,
             req.conversation_id.as_deref(),
-)
+        )
         .await
         {
             Ok((envs, errs)) => {
@@ -259,7 +266,7 @@ async fn sync_to_own_devices(
             payload,
             ENVELOPE_TYPE_SYNC,
             conversation_id,
-)
+        )
         .await
         {
             Ok(info) => envelopes.push(info),

@@ -1,22 +1,27 @@
-//! C ABI surface. Kept deliberately small: eight functions total, so a
-//! consumer written against one language trivially translates to another.
+//! C ABI surface. Each raw-pointer boundary has an explicit safety contract.
 //!
 //! Every function that touches raw pointers is `unsafe extern "C"` and
 //! carries a `# Safety` section spelling out what the caller must guarantee.
 
+use std::ffi::c_void;
 use std::os::raw::c_char;
+use std::sync::Arc;
+use std::time::Duration;
 
 use crate::api;
 use crate::config::Config;
 use crate::db;
 use crate::error::{Error, Result};
+use crate::events::EventQueue;
 use crate::runtime::{Actor, ActorState};
 use crate::transport::HttpClient;
 
+pub mod events;
 pub mod handle;
 pub mod panic;
 pub mod types;
 
+pub use events::{FhEventCallback, FhEventCallbacks, FhEventView};
 pub use types::FhBuffer;
 
 use handle::FhHandle;
@@ -24,9 +29,8 @@ use panic::guard;
 
 pub const ABI_VERSION: u32 = 1;
 
-const ABI_STRING: &[u8] = b"0.1.0\\0";
+const ABI_STRING: &[u8] = b"0.1.1\0";
 
-const METHOD_POLL_EVENT: u32 = 0x0000_0003;
 const METHOD_ACK_EVENT: u32 = 0x0000_0004;
 
 #[unsafe(no_mangle)]
@@ -55,7 +59,9 @@ pub unsafe extern "C" fn fh_buffer_free(buf: *mut FhBuffer) {
         }
         // SAFETY: the caller promises `buf` is a valid pointer to a buffer
         // this library produced.
-        unsafe { (*buf).release(); }
+        unsafe {
+            (*buf).release();
+        }
     });
 }
 
@@ -101,6 +107,9 @@ pub unsafe extern "C" fn fh_init(
 
         crate::logging::init_once(&cfg.log_level, &cfg.log_format);
 
+        let events = Arc::new(EventQueue::new());
+        let actor_events = events.clone();
+
         let actor = match Actor::spawn(move || {
             Box::pin(async move {
                 // Resolve the backend URLs before anything touches the network.
@@ -117,16 +126,18 @@ pub unsafe extern "C" fn fh_init(
                     .run(&db)
                     .await
                     .map_err(|e| Error::Database(format!("migrations failed: {e}")))?;
-                Ok(ActorState::new(config, db, http))
+                Ok(ActorState::new_with_events(config, db, http, actor_events))
             })
         }) {
             Ok(a) => a,
             Err(e) => return write_error(out, &e),
         };
 
-        let handle = Box::new(FhHandle::new(actor));
+        let handle = Box::new(FhHandle::new(actor, events));
         // SAFETY: `out_handle` was checked non-null.
-        unsafe { *out_handle = Box::into_raw(handle); }
+        unsafe {
+            *out_handle = Box::into_raw(handle);
+        }
         0
     })
 }
@@ -146,8 +157,62 @@ pub unsafe extern "C" fn fh_destroy(handle: *mut FhHandle) {
         }
         // SAFETY: the caller promises `handle` came from `fh_init` and has
         // not been destroyed.
-        unsafe { drop(Box::from_raw(handle)); }
+        unsafe {
+            (*handle).clear_event_callbacks();
+            drop(Box::from_raw(handle));
+        }
     });
+}
+
+/// Installs or clears the per-event callback table.
+///
+/// Passing a null `callbacks` pointer clears the current handler and returns
+/// future events to `fh_poll_event`. Each non-null slot is called on the
+/// library's dedicated callback worker thread. The event view and its JSON
+/// bytes are borrowed only for the duration of the callback; the library
+/// allocates and releases that memory.
+///
+/// `user_data` must remain valid until this function returns after replacing
+/// or clearing a handler, or until `fh_destroy` returns. When clear/destroy is
+/// called reentrantly from a callback, the currently executing callback must
+/// keep using its context only until that callback itself returns.
+///
+/// # Safety
+///
+/// - `handle` must be a live handle returned by `fh_init`.
+/// - `callbacks` must point to a readable `FhEventCallbacks` when non-null.
+/// - `user_data` must satisfy the lifetime rules above for every installed
+///   callback.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fh_set_event_callbacks(
+    handle: *mut FhHandle,
+    callbacks: *const FhEventCallbacks,
+    user_data: *mut c_void,
+) -> i32 {
+    guard(-1, || {
+        if handle.is_null() {
+            return -1;
+        }
+        // SAFETY: the caller promises a live handle.
+        let h = unsafe { &*handle };
+        if callbacks.is_null() {
+            h.clear_event_callbacks();
+            return 0;
+        }
+        // SAFETY: the caller promises a readable callback table; it is Copy,
+        // so no pointer to the caller's table is retained.
+        let callbacks = unsafe { *callbacks };
+        let handler = Arc::new(events::FfiEventHandler::new(callbacks, user_data));
+        if let Err(error) = h.set_event_callbacks(Some(handler)) {
+            tracing::warn!(%error, "could not start callback worker");
+            return 1;
+        }
+        if let Err(error) = h.activate_event_push() {
+            tracing::warn!(%error, "could not activate event callbacks");
+            return 1;
+        }
+        0
+    })
 }
 
 /// Invokes one method by id. See docs/ffi.md for the method table.
@@ -172,7 +237,9 @@ pub unsafe extern "C" fn fh_call(
             return -1;
         }
         // SAFETY: `out` was checked non-null.
-        unsafe { *out = FhBuffer::EMPTY; }
+        unsafe {
+            *out = FhBuffer::EMPTY;
+        }
 
         let payload = if req.is_null() || req_len == 0 {
             Vec::new()
@@ -187,7 +254,9 @@ pub unsafe extern "C" fn fh_call(
         match h.call(method_id, payload) {
             Ok(bytes) => {
                 // SAFETY: `out` was checked non-null.
-                unsafe { *out = FhBuffer::from_vec(bytes); }
+                unsafe {
+                    *out = FhBuffer::from_vec(bytes);
+                }
                 0
             }
             Err(e) => write_error(out, &e),
@@ -216,15 +285,25 @@ pub unsafe extern "C" fn fh_poll_event(
             return -1;
         }
         // SAFETY: `out` was checked non-null.
-        unsafe { *out = FhBuffer::EMPTY; }
+        unsafe {
+            *out = FhBuffer::EMPTY;
+        }
 
         // SAFETY: `handle` is a live pointer, per the caller's contract.
         let h = unsafe { &*handle };
-        let payload = timeout_ms.to_le_bytes().to_vec();
-        match h.call(METHOD_POLL_EVENT, payload) {
-            Ok(bytes) => {
+        match h.poll_event(Duration::from_millis(timeout_ms as u64)) {
+            Ok(event) => {
+                let bytes = match event {
+                    Some(event) => match serde_json::to_vec(&event) {
+                        Ok(bytes) => bytes,
+                        Err(error) => return write_error(out, &Error::from(error)),
+                    },
+                    None => Vec::new(),
+                };
                 // SAFETY: `out` was checked non-null.
-                unsafe { *out = FhBuffer::from_vec(bytes); }
+                unsafe {
+                    *out = FhBuffer::from_vec(bytes);
+                }
                 0
             }
             Err(e) => write_error(out, &e),
@@ -260,7 +339,9 @@ pub unsafe extern "C" fn fh_ack_event(handle: *mut FhHandle, event_id: u64) -> i
 fn write_error(out: *mut FhBuffer, e: &Error) -> i32 {
     let bytes = e.to_json().into_bytes();
     // SAFETY: every caller passes a pointer it has already checked non-null.
-    unsafe { *out = FhBuffer::from_vec(bytes); }
+    unsafe {
+        *out = FhBuffer::from_vec(bytes);
+    }
     1
 }
 

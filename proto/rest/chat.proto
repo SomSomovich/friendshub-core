@@ -1,0 +1,364 @@
+syntax = "proto3";
+
+package fh.rest.chat;
+
+// REST message schema for conversations and adjacent chat resources.
+// All *_at fields are Unix seconds (int64), matching the existing handlers.
+// Entity identifiers and enum-like values remain strings as in the API.
+
+// Used only for request fields whose presence must distinguish a missing
+// required list from a present but empty list. The containing message field
+// is absent when the list was omitted and present with items=[] when empty.
+message StringItems {
+  repeated string items = 1;
+}
+
+message ConversationItem {
+  string id = 1;
+  string kind = 2;
+  optional string title = 3;
+  optional string avatar_url = 4;
+  int64 member_count = 5;
+  optional int64 last_envelope_at = 6;
+  int64 created_at = 7;
+  int64 updated_at = 8;
+  optional int64 archived_at = 9;
+  optional int64 muted_until = 10;
+  int64 unread_count = 11;
+  optional int64 expires_at = 12;
+  optional int64 closed_at = 13;
+  string notification_level = 14;
+}
+
+message ConversationListResponse {
+  repeated ConversationItem items = 1;
+}
+
+message CreateDirectRequest {
+  optional string peer_fh_number = 1;
+  optional int64 expires_in_seconds = 2;
+}
+
+message CreateDirectResponse {
+  string id = 1;
+  string kind = 2;
+}
+
+message ConversationDetailResponse {
+  string id = 1;
+  string kind = 2;
+  optional string title = 3;
+  optional string created_by = 4;
+  int64 created_at = 5;
+  int64 updated_at = 6;
+  repeated string members = 7;
+  optional int64 expires_at = 8;
+  optional int64 closed_at = 9;
+}
+
+message MuteRequest {
+  optional int64 duration_seconds = 1;
+}
+
+message EnvelopeHistoryItem {
+  string envelope_id = 1;
+  string sender_account_id = 2;
+  int64 sender_device_number = 3;
+  int64 recipient_device_number = 4;
+  int64 envelope_type = 5;
+  bool is_prekey_message = 6;
+  string ciphertext = 7;
+  int64 client_timestamp = 8;
+  int64 server_timestamp = 9;
+  optional string conversation_id = 10;
+}
+
+message EnvelopeHistoryResponse {
+  repeated EnvelopeHistoryItem items = 1;
+}
+
+message NotificationLevelRequest {
+  optional string level = 1;
+}
+
+message SavedConversationResponse {
+  string conversation_id = 1;
+  string kind = 2;
+  int64 created_at = 3;
+}
+
+message SavedHistoryQuery {
+  optional int64 before = 1;
+  optional string before_id = 2;
+  optional int64 limit = 3;
+  optional int64 envelope_type = 4;
+}
+
+message SavedEnvelopeItem {
+  string envelope_id = 1;
+  string sender_account_id = 2;
+  int64 sender_device_number = 3;
+  int64 recipient_device_number = 4;
+  int64 envelope_type = 5;
+  bool is_prekey_message = 6;
+  string ciphertext = 7;
+  int64 client_timestamp = 8;
+  int64 server_timestamp = 9;
+}
+
+message SavedHistoryResponse {
+  repeated SavedEnvelopeItem envelopes = 1;
+}
+
+message PinRequest {
+  optional string message_id = 1;
+}
+
+message PinnedItem {
+  string message_id = 1;
+  string pinned_by_account_id = 2;
+  int64 pinned_at = 3;
+}
+
+message PinnedListResponse {
+  repeated PinnedItem items = 1;
+}
+
+message MarkReadRequest {
+  optional int64 up_to = 1;
+}
+
+message ReadStateItem {
+  string account_id = 1;
+  int64 last_read_at = 2;
+}
+
+message ReadStateListResponse {
+  repeated ReadStateItem items = 1;
+}
+
+message CreatePollRequest {
+  optional string poll_type = 1;
+  bool allows_multiple = 2;
+  // Optional because the handler defaults an omitted value to true.
+  optional bool allows_revoting = 3;
+  bool allows_user_options = 4;
+  optional int64 open_period_seconds = 5;
+  optional string encrypted_meta = 6;
+  StringItems option_ids = 7;
+  optional string correct_option_id = 8;
+}
+
+message PollCountItem {
+  string option_id = 1;
+  int64 count = 2;
+}
+
+message PollExtraOption {
+  string option_id = 1;
+  string encrypted_meta = 2;
+  optional string proposed_by_account_id = 3;
+  optional int64 proposed_by_device_number = 4;
+  int64 created_at = 5;
+}
+
+message PollItem {
+  string id = 1;
+  int64 revision = 2;
+  string conversation_id = 3;
+  optional string creator_account_id = 4;
+  optional int64 creator_device_number = 5;
+  string poll_type = 6;
+  bool allows_multiple = 7;
+  bool allows_revoting = 8;
+  bool allows_user_options = 9;
+  string encrypted_meta = 10;
+  optional int64 closes_at = 11;
+  optional int64 closed_at = 12;
+  int64 created_at = 13;
+  repeated PollCountItem counts = 14;
+  int64 total_voters = 15;
+  repeated string my_votes = 16;
+  optional string correct_option_id = 17;
+  repeated PollExtraOption extra_options = 18;
+  repeated string deleted_option_ids = 19;
+}
+
+message PollListResponse {
+  repeated PollItem items = 1;
+}
+
+message VoteRequest {
+  StringItems option_ids = 1;
+}
+
+message AddPollOptionRequest {
+  optional string option_id = 1;
+  optional string encrypted_meta = 2;
+}
+
+message InviteCreateRequest {
+  optional string kind = 1;
+}
+
+message InviteItem {
+  string id = 1;
+  string token = 2;
+  string kind = 3;
+  int64 used_count = 4;
+  optional int64 max_uses = 5;
+  int64 created_at = 6;
+}
+
+message InviteListResponse {
+  repeated InviteItem items = 1;
+}
+
+message JoinInviteResponse {
+  string conversation_id = 1;
+}
+
+message FolderItem {
+  string id = 1;
+  string name = 2;
+  int64 position = 3;
+  repeated string conversation_ids = 4;
+  int64 created_at = 5;
+  int64 updated_at = 6;
+}
+
+message FolderListResponse {
+  repeated FolderItem items = 1;
+}
+
+message CreateFolderRequest {
+  optional string name = 1;
+}
+
+message UpdateFolderRequest {
+  optional string name = 1;
+  optional int64 position = 2;
+}
+
+message AddFolderItemRequest {
+  optional string conversation_id = 1;
+}
+
+message ScheduledItem {
+  string envelope_id = 1;
+  optional string conversation_id = 2;
+  string recipient_account_id = 3;
+  int64 recipient_device_number = 4;
+  int64 envelope_type = 5;
+  int64 client_timestamp = 6;
+  int64 send_at = 7;
+}
+
+message ScheduledListResponse {
+  repeated ScheduledItem items = 1;
+}
+
+message RecordCallRequest {
+  optional string peer_account_id = 1;
+  optional string direction = 2;
+  optional string status = 3;
+  optional int64 started_at = 4;
+  optional int64 ended_at = 5;
+}
+
+message CallRecordItem {
+  string id = 1;
+  string peer_account_id = 2;
+  string direction = 3;
+  string status = 4;
+  int64 started_at = 5;
+  optional int64 ended_at = 6;
+}
+
+message CallListResponse {
+  repeated CallRecordItem items = 1;
+}
+
+message SearchQuery {
+  optional string q = 1;
+  // Omitted by callers means "identifiers"; an explicitly empty value is
+  // invalid, so preserve query-parameter presence.
+  optional string scope = 2;
+  optional int64 limit = 3;
+}
+
+message SearchResult {
+  string entity_type = 1;
+  string entity_id = 2;
+  string display_name = 3;
+  optional string identifier = 4;
+  optional string avatar_url = 5;
+}
+
+message SearchResponse {
+  repeated SearchResult results = 1;
+}
+
+// Route mapping (paths are relative to /api/v1). Query messages represent
+// query parameters; 204 responses have no protobuf body.
+//
+// GET    /conversations                              -> (none) / ConversationListResponse
+// POST   /conversations/direct                       -> CreateDirectRequest / CreateDirectResponse (201)
+// GET    /conversations/{id}                         -> path id / ConversationDetailResponse
+// POST   /conversations/{id}/leave                   -> path id / 204 no body
+// POST   /conversations/{id}/archive                 -> path id / 204 no body
+// DELETE /conversations/{id}/archive                 -> path id / 204 no body
+// POST   /conversations/{id}/mute                    -> MuteRequest + path id / 204 no body
+// DELETE /conversations/{id}/mute                    -> path id / 204 no body
+// GET    /conversations/{id}/envelopes               -> EnvelopeHistoryQuery + path id / EnvelopeHistoryResponse
+// PUT    /conversations/{id}/notification-level      -> NotificationLevelRequest + path id / 204 no body
+// GET    /saved                                       -> (none) / SavedConversationResponse
+// GET    /saved/messages                             -> SavedHistoryQuery / SavedHistoryResponse
+// POST   /conversations/{id}/pinned                 -> PinRequest + path id / 201 or 204, no body
+// GET    /conversations/{id}/pinned                 -> path id / PinnedListResponse
+// DELETE /conversations/{id}/pinned/{message_id}    -> path ids / 204 no body
+// POST   /conversations/{id}/read                   -> MarkReadRequest + path id / 204 no body
+// GET    /conversations/{id}/reads                  -> path id / ReadStateListResponse
+// GET    /conversations/{id}/polls                  -> PollListQuery + path id / PollListResponse
+// POST   /conversations/{id}/polls                  -> CreatePollRequest + path id / PollItem (201)
+// GET    /polls/{id}                                 -> path id / PollItem
+// POST   /polls/{id}/vote                            -> VoteRequest + path id / PollItem
+// POST   /polls/{id}/stop                            -> path id / 204 no body
+// POST   /polls/{id}/options                         -> AddPollOptionRequest + path id / 204 no body
+// DELETE /polls/{id}/options/{option_id}             -> path ids / 204 no body
+// DELETE /polls/{id}                                 -> path id / 204 no body
+// GET    /conversations/{id}/invites               -> path id / InviteListResponse
+// POST   /conversations/{id}/invites               -> InviteCreateRequest + path id / InviteItem (201)
+// DELETE /invites/{id}                               -> path id / 204 no body
+// POST   /invites/join/{token}                       -> path token / JoinInviteResponse
+// GET    /folders                                    -> (none) / FolderListResponse
+// POST   /folders                                    -> CreateFolderRequest / FolderItem (201)
+// PATCH  /folders/{id}                               -> UpdateFolderRequest + path id / 204 no body
+// DELETE /folders/{id}                               -> path id / 204 no body
+// POST   /folders/{id}/items                         -> AddFolderItemRequest + path id / 204 no body
+// DELETE /folders/{id}/items/{conversation_id}       -> path ids / 204 no body
+// GET    /scheduled                                  -> (none) / ScheduledListResponse
+// DELETE /scheduled/{id}                            -> path id / 204 no body
+// GET    /calls                                      -> CallListQuery / CallListResponse
+// POST   /calls                                      -> RecordCallRequest / CallRecordItem (201)
+// POST   /calls/clear                                -> (none) / 204 no body
+// DELETE /calls/{id}                                 -> path id / 204 no body
+// GET    /search                                     -> SearchQuery / SearchResponse
+
+// Query-only request schemas, defined here with the route mappings above.
+message EnvelopeHistoryQuery {
+  optional int64 before = 1;
+  optional string before_id = 2;
+  optional int64 limit = 3;
+}
+
+message PollListQuery {
+  optional int64 before = 1;
+  optional string before_id = 2;
+  optional int64 limit = 3;
+}
+
+message CallListQuery {
+  optional string peer_account_id = 1;
+  optional int64 limit = 2;
+}

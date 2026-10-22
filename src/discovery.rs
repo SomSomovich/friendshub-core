@@ -43,7 +43,9 @@ pub struct Discovery {
     pub updated_at: Option<i64>,
 }
 
-fn default_version() -> u32 { 1 }
+fn default_version() -> u32 {
+    1
+}
 
 #[derive(Debug, Serialize, Deserialize)]
 struct CacheEntry {
@@ -180,9 +182,7 @@ fn write_cache(path: &Path, discovery: &Discovery) -> std::io::Result<()> {
 
 fn default_cache_path(db_path: &Path) -> PathBuf {
     match db_path.parent() {
-        Some(parent) if !parent.as_os_str().is_empty() => {
-            parent.join(".friendshub-discovery.json")
-        }
+        Some(parent) if !parent.as_os_str().is_empty() => parent.join(".friendshub-discovery.json"),
         _ => PathBuf::from(".friendshub-discovery.json"),
     }
 }

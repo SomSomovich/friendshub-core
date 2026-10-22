@@ -6,8 +6,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use crate::api::common::{bearer, id_from};
 use crate::crypto::attachments::{
-    decode_key_and_base, new_key_and_base, open_chunk, seal_chunk, BASE_NONCE_LEN, KEY_LEN,
-    TAG_LEN,
+    BASE_NONCE_LEN, KEY_LEN, TAG_LEN, decode_key_and_base, new_key_and_base, open_chunk, seal_chunk,
 };
 use crate::error::{Error, Result};
 use crate::runtime::ActorState;
@@ -119,7 +118,9 @@ pub async fn upload(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>
         .http
         .post(
             "/api/v1/attachments/recommend",
-            &RecommendRequest { total_size: plaintext_size },
+            &RecommendRequest {
+                total_size: plaintext_size,
+            },
             Some(&token),
         )
         .await?;
@@ -267,7 +268,9 @@ pub async fn download(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u
         plaintext_total += plaintext.len() as u64;
     }
 
-    out.flush().await.map_err(|e| Error::Internal(format!("flush failed: {e}")))?;
+    out.flush()
+        .await
+        .map_err(|e| Error::Internal(format!("flush failed: {e}")))?;
 
     Ok(serde_json::to_vec(&DownloadResult {
         output_path: params.output_path,
@@ -377,7 +380,7 @@ pub async fn send_key(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u
             &inner_bytes,
             ENVELOPE_TYPE_ATTACHMENT_KEY,
             req.conversation_id.as_deref(),
-)
+        )
         .await
         {
             Ok(info) => sent.push(info),

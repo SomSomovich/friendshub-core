@@ -31,7 +31,10 @@ pub struct AddRequest {
 pub async fn add(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
     let token = bearer(state).await?;
     let req: AddRequest = serde_json::from_slice(&payload)?;
-    let item: ContactItem = state.http.post("/api/v1/contacts", &req, Some(&token)).await?;
+    let item: ContactItem = state
+        .http
+        .post("/api/v1/contacts", &req, Some(&token))
+        .await?;
     Ok(serde_json::to_vec(&item)?)
 }
 
@@ -49,7 +52,10 @@ pub async fn block(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>>
     let v: serde_json::Value = serde_json::from_slice(&payload)?;
     let id = id_from(&v)?;
     let path = format!("/api/v1/blocks/{id}");
-    let _: serde_json::Value = state.http.post(&path, &serde_json::json!({}), Some(&token)).await?;
+    let _: serde_json::Value = state
+        .http
+        .post(&path, &serde_json::json!({}), Some(&token))
+        .await?;
     Ok(br#"{"blocked":true}"#.to_vec())
 }
 
@@ -78,6 +84,11 @@ pub async fn list_blocked(state: &Arc<ActorState>, _payload: Vec<u8>) -> Result<
 }
 
 #[allow(dead_code)]
-fn _unused(_: AddRequest, _: BlockedItem, _: ContactItem, _: fn(&serde_json::Value, &str) -> Result<String>) {
+fn _unused(
+    _: AddRequest,
+    _: BlockedItem,
+    _: ContactItem,
+    _: fn(&serde_json::Value, &str) -> Result<String>,
+) {
     let _ = str_field;
 }

@@ -1,11 +1,14 @@
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use base64::Engine as _;
 use futures::{SinkExt, StreamExt};
 use prost::Message as ProstMessage;
+use serde::Deserialize;
 use serde_json::json;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use tokio_tungstenite::{connect_async, tungstenite::Message};
 
 use crate::crypto::groups;
@@ -13,8 +16,9 @@ use crate::db::{auth as db_auth, pending_events};
 use crate::error::{Error, Result};
 use crate::events::types::Event;
 use crate::proto::{
-    client_frame, server_frame, ClientFrame, ClientHello, Envelope, EnvelopeAck, EnvelopeUpload,
-    Ping, ServerFrame,
+    BotCallbackAnswered, CallSignal, ClientFrame, ClientHello, Envelope, EnvelopeAck,
+    EnvelopeUpload, ErrorFrame, HistoryRequest, Nudge, Ping, ServerFrame, TypingFrame,
+    client_frame, server_frame,
 };
 use crate::runtime::ActorState;
 use crate::util::time::now_unix;
@@ -30,7 +34,20 @@ const ENVELOPE_TYPE_SENDER_KEY: i32 = 3;
 
 enum Cmd {
     Send(ClientFrame),
+    Ping {
+        client_timestamp: u64,
+        sent_at: Instant,
+        reply: oneshot::Sender<Result<u64>>,
+    },
+    CancelPing(u64),
     Shutdown,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrameAction {
+    Continue,
+    Reconnect,
+    Stop,
 }
 
 #[derive(Clone)]
@@ -40,15 +57,20 @@ pub struct WsClient {
 
 struct WsInner {
     cmd_tx: Mutex<Option<mpsc::UnboundedSender<Cmd>>>,
+    stop_signal: watch::Sender<bool>,
     running: AtomicBool,
+    next_ping_timestamp: std::sync::atomic::AtomicU64,
 }
 
 impl WsClient {
     pub fn new() -> Self {
+        let (stop_signal, _) = watch::channel(false);
         Self {
             inner: Arc::new(WsInner {
                 cmd_tx: Mutex::new(None),
+                stop_signal,
                 running: AtomicBool::new(false),
+                next_ping_timestamp: std::sync::atomic::AtomicU64::new(0),
             }),
         }
     }
@@ -71,16 +93,19 @@ impl WsClient {
 
         let (tx, rx) = mpsc::unbounded_channel();
         *self.inner.cmd_tx.lock().await = Some(tx);
+        self.inner.stop_signal.send_replace(false);
+        let stop_rx = self.inner.stop_signal.subscribe();
 
         let self_clone = self.clone();
         tokio::task::spawn_local(async move {
-            run_loop(state, self_clone, rx).await;
+            run_loop(state, self_clone, rx, stop_rx).await;
         });
 
         Ok(())
     }
 
     pub async fn stop(&self) -> Result<()> {
+        self.inner.stop_signal.send_replace(true);
         let tx = self.inner.cmd_tx.lock().await.take();
         if let Some(tx) = tx {
             let _ = tx.send(Cmd::Shutdown);
@@ -92,6 +117,54 @@ impl WsClient {
         let tx = self.inner.cmd_tx.lock().await.clone();
         let tx = tx.ok_or(Error::Internal("websocket is not running".into()))?;
         tx.send(Cmd::Send(frame)).map_err(|_| Error::ActorClosed)
+    }
+
+    /// Sends a server ping and resolves with round-trip milliseconds when the
+    /// matching protobuf Pong arrives.
+    pub async fn ping(&self, timeout: Duration) -> Result<u64> {
+        if !self.is_running() {
+            return Err(Error::Internal("websocket is not running".into()));
+        }
+        let tx = self
+            .inner
+            .cmd_tx
+            .lock()
+            .await
+            .clone()
+            .ok_or_else(|| Error::Internal("websocket is not running".into()))?;
+        let now_micros = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_micros()
+            .min(u64::MAX as u128) as u64;
+        let client_timestamp = next_unique_timestamp(&self.inner.next_ping_timestamp, now_micros);
+        let (reply, response) = oneshot::channel();
+        tx.send(Cmd::Ping {
+            client_timestamp,
+            sent_at: Instant::now(),
+            reply,
+        })
+        .map_err(|_| Error::ActorClosed)?;
+
+        match tokio::time::timeout(timeout, response).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => Err(Error::ActorClosed),
+            Err(_) => {
+                let _ = tx.send(Cmd::CancelPing(client_timestamp));
+                Err(Error::Network("no Pong before ping timeout".into()))
+            }
+        }
+    }
+}
+
+fn next_unique_timestamp(last: &std::sync::atomic::AtomicU64, now_micros: u64) -> u64 {
+    let mut previous = last.load(Ordering::SeqCst);
+    loop {
+        let next = now_micros.max(previous.saturating_add(1));
+        match last.compare_exchange(previous, next, Ordering::SeqCst, Ordering::SeqCst) {
+            Ok(_) => return next,
+            Err(actual) => previous = actual,
+        }
     }
 }
 
@@ -105,6 +178,7 @@ async fn run_loop(
     state: Arc<ActorState>,
     self_ref: Arc<WsClient>,
     mut cmd_rx: mpsc::UnboundedReceiver<Cmd>,
+    mut stop_rx: watch::Receiver<bool>,
 ) {
     let mut backoff_secs: u64 = 1;
 
@@ -128,12 +202,25 @@ async fn run_loop(
             break;
         }
 
-        tokio::time::sleep(Duration::from_secs(backoff_secs)).await;
+        if !wait_before_reconnect(Duration::from_secs(backoff_secs), &mut stop_rx).await {
+            break;
+        }
         backoff_secs = (backoff_secs * 2).min(60);
     }
 
     self_ref.inner.running.store(false, Ordering::SeqCst);
     state.events.push(Event::ephemeral("ws_stopped", json!({})));
+}
+
+async fn wait_before_reconnect(delay: Duration, stop_rx: &mut watch::Receiver<bool>) -> bool {
+    if *stop_rx.borrow() {
+        return false;
+    }
+
+    tokio::select! {
+        _ = tokio::time::sleep(delay) => true,
+        changed = stop_rx.changed() => changed.is_ok() && !*stop_rx.borrow(),
+    }
 }
 
 /// Returns Ok(true) when a Shutdown command ended the loop on purpose.
@@ -173,23 +260,35 @@ async fn run_once(
 
     let mut ping = tokio::time::interval(Duration::from_secs(PING_INTERVAL_SECS));
     ping.tick().await;
+    let mut pending_pings: HashMap<u64, (Instant, oneshot::Sender<Result<u64>>)> = HashMap::new();
 
     let first = next_frame(&mut stream).await?;
     match first.kind {
-        Some(server_frame::Kind::Hello(_)) => {}
+        Some(server_frame::Kind::Hello(hello)) => {
+            state.events.push(Event::ephemeral(
+                "ws_connected",
+                json!({
+                    "session_id": hello.session_id,
+                    "account_id": uuid_or_hex(&hello.account_id),
+                    "device_number": hello.device_number,
+                    "server_timestamp": hello.server_timestamp,
+                    "protocol_major": hello.protocol_major,
+                    "protocol_minor": hello.protocol_minor,
+                    "protocol_patch": hello.protocol_patch,
+                }),
+            ));
+        }
         Some(server_frame::Kind::Error(e)) => {
-            return Err(Error::Network(format!(
-                "server rejected hello: {} ({})",
-                e.message, e.code
-            )));
+            let action = handle_server_error(state, e);
+            return match action {
+                FrameAction::Stop => Ok(true),
+                FrameAction::Continue | FrameAction::Reconnect => {
+                    Err(Error::Network("server rejected websocket hello".into()))
+                }
+            };
         }
         _ => return Err(Error::Network("first server frame was not Hello".into())),
     }
-
-    state.events.push(Event::ephemeral(
-        "ws_connected",
-        json!({ "device_number": device_number }),
-    ));
 
     loop {
         tokio::select! {
@@ -197,6 +296,19 @@ async fn run_once(
                 match cmd {
                     Some(Cmd::Send(frame)) => {
                         send_proto(&mut sink, &frame).await?;
+                    }
+                    Some(Cmd::Ping { client_timestamp, sent_at, reply }) => {
+                        let frame = ClientFrame {
+                            kind: Some(client_frame::Kind::Ping(Ping { client_timestamp })),
+                        };
+                        if let Err(error) = send_proto(&mut sink, &frame).await {
+                            let _ = reply.send(Err(Error::Network(error.to_string())));
+                            return Err(error);
+                        }
+                        pending_pings.insert(client_timestamp, (sent_at, reply));
+                    }
+                    Some(Cmd::CancelPing(client_timestamp)) => {
+                        pending_pings.remove(&client_timestamp);
                     }
                     Some(Cmd::Shutdown) | None => {
                         let _ = sink.close().await;
@@ -222,7 +334,18 @@ async fn run_once(
                                 continue;
                             }
                         };
-                        handle_frame(state, frame).await;
+                        if let Some(server_frame::Kind::Pong(pong)) = frame.kind.as_ref() {
+                            resolve_pending_ping(&mut pending_pings, pong.client_timestamp);
+                        }
+                        let action = handle_frame(state, frame).await;
+                        crate::api::emit_pending_identity_changes(state).await;
+                        match action {
+                            FrameAction::Continue => {}
+                            FrameAction::Reconnect => {
+                                return Err(Error::Network("server requested websocket reconnect".into()));
+                            }
+                            FrameAction::Stop => return Ok(true),
+                        }
                     }
                     Some(Ok(Message::Close(_))) | None => {
                         return Err(Error::Network("server closed connection".into()));
@@ -258,9 +381,8 @@ where
 
 async fn next_frame<S>(stream: &mut S) -> Result<ServerFrame>
 where
-    S: futures::Stream<
-            Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>,
-        > + Unpin,
+    S: futures::Stream<Item = std::result::Result<Message, tokio_tungstenite::tungstenite::Error>>
+        + Unpin,
 {
     loop {
         match stream.next().await {
@@ -278,8 +400,20 @@ where
     }
 }
 
-async fn handle_frame(state: &Arc<ActorState>, frame: ServerFrame) {
-    let Some(kind) = frame.kind else { return };
+fn resolve_pending_ping(
+    pending: &mut HashMap<u64, (Instant, oneshot::Sender<Result<u64>>)>,
+    client_timestamp: u64,
+) {
+    if let Some((sent_at, reply)) = pending.remove(&client_timestamp) {
+        let round_trip_ms = sent_at.elapsed().as_millis().min(u64::MAX as u128) as u64;
+        let _ = reply.send(Ok(round_trip_ms));
+    }
+}
+
+async fn handle_frame(state: &Arc<ActorState>, frame: ServerFrame) -> FrameAction {
+    let Some(kind) = frame.kind else {
+        return FrameAction::Continue;
+    };
 
     match kind {
         server_frame::Kind::Hello(h) => {
@@ -298,17 +432,18 @@ async fn handle_frame(state: &Arc<ActorState>, frame: ServerFrame) {
             }
         }
 
-        server_frame::Kind::Receipt(_) => {}
+        server_frame::Kind::Receipt(receipt) => {
+            let payload = json!({
+                "envelope_ids": receipt.envelope_ids.iter().map(|id| uuid_or_hex(id)).collect::<Vec<_>>(),
+                "server_timestamps": receipt.server_timestamps,
+            });
+            state.events.push(Event::ephemeral("receipt", payload));
+        }
 
         server_frame::Kind::Pong(_) => {}
 
         server_frame::Kind::Error(e) => {
-            let payload = json!({
-                "code": e.code,
-                "message": e.message,
-                "fatal": e.fatal,
-            });
-            state.events.push(Event::ephemeral("server_error", payload));
+            return handle_server_error(state, e);
         }
 
         server_frame::Kind::Presence(p) => {
@@ -320,7 +455,9 @@ async fn handle_frame(state: &Arc<ActorState>, frame: ServerFrame) {
                 "custom_status_emoji": p.custom_status_emoji,
                 "custom_status_expires_at": p.custom_status_expires_at,
             });
-            state.events.push(Event::ephemeral("presence_updated", payload));
+            state
+                .events
+                .push(Event::ephemeral("presence_updated", payload));
         }
 
         server_frame::Kind::BotMessage(m) => {
@@ -330,6 +467,7 @@ async fn handle_frame(state: &Arc<ActorState>, frame: ServerFrame) {
                 "account_id": uuid_or_hex(&m.account_id),
                 "text": m.text,
                 "reply_to_message_id": m.reply_to_message_id,
+                "reply_markup": m.reply_markup,
                 "created_at": m.created_at,
             });
             state.events.push(Event::ephemeral("bot_message", payload));
@@ -348,7 +486,218 @@ async fn handle_frame(state: &Arc<ActorState>, frame: ServerFrame) {
             });
             state.events.push(Event::ephemeral("channel_post", payload));
         }
+
+        server_frame::Kind::Typing(typing) => {
+            state.events.push(Event::ephemeral(
+                "typing",
+                json!({
+                    "conversation_id": uuid_or_hex(&typing.conversation_id),
+                    "account_id": uuid_or_hex(&typing.account_id),
+                }),
+            ));
+        }
+
+        server_frame::Kind::ReadReceipt(receipt) => {
+            state.events.push(Event::ephemeral(
+                "read_receipt",
+                json!({
+                    "conversation_id": uuid_or_hex(&receipt.conversation_id),
+                    "account_id": uuid_or_hex(&receipt.account_id),
+                    "last_read_at": receipt.last_read_at,
+                }),
+            ));
+        }
+
+        server_frame::Kind::ConversationUpdated(update) => {
+            state.events.push(Event::ephemeral(
+                "conversation_updated",
+                json!({
+                    "conversation_id": uuid_or_hex(&update.conversation_id),
+                    "title": update.title,
+                    "description": update.description,
+                    "is_public": update.is_public,
+                    "members_changed": update.members_changed,
+                }),
+            ));
+        }
+
+        server_frame::Kind::HistoryRequestRelay(request) => {
+            state.events.push(Event::ephemeral(
+                "history_request",
+                json!({
+                    "from_device_number": request.from_device_number,
+                    "conversation_ids": request.conversation_ids.iter().map(|id| uuid_or_hex(id)).collect::<Vec<_>>(),
+                }),
+            ));
+        }
+
+        server_frame::Kind::Nudge(nudge) => {
+            state.events.push(Event::ephemeral(
+                "nudge",
+                json!({
+                    "conversation_id": uuid_or_hex(&nudge.conversation_id),
+                    "from_account_id": uuid_or_hex(&nudge.from_account_id),
+                }),
+            ));
+        }
+
+        server_frame::Kind::NudgeResult(result) => {
+            state.events.push(Event::ephemeral(
+                "nudge_result",
+                json!({ "delivered": result.delivered }),
+            ));
+        }
+
+        server_frame::Kind::ConversationExpired(expired) => {
+            state.events.push(Event::ephemeral(
+                "conversation_expired",
+                json!({ "conversation_id": uuid_or_hex(&expired.conversation_id) }),
+            ));
+        }
+
+        server_frame::Kind::ScheduledCreated(created) => {
+            state.events.push(Event::ephemeral(
+                "scheduled_created",
+                json!({
+                    "envelope_id": uuid_or_hex(&created.envelope_id),
+                    "conversation_id": if created.conversation_id.is_empty() {
+                        None
+                    } else {
+                        Some(uuid_or_hex(&created.conversation_id))
+                    },
+                    "send_at": created.send_at,
+                }),
+            ));
+        }
+
+        server_frame::Kind::ScheduledCancelled(cancelled) => {
+            state.events.push(Event::ephemeral(
+                "scheduled_cancelled",
+                json!({ "envelope_id": uuid_or_hex(&cancelled.envelope_id) }),
+            ));
+        }
+
+        server_frame::Kind::FoldersUpdated(updated) => {
+            state.events.push(Event::ephemeral(
+                "folders_updated",
+                json!({ "account_id": uuid_or_hex(&updated.account_id) }),
+            ));
+        }
+
+        server_frame::Kind::BotMessageEdited(edited) => {
+            state.events.push(Event::ephemeral(
+                "bot_message_edited",
+                json!({
+                    "message_id": edited.message_id,
+                    "text": edited.text,
+                    "reply_markup": edited.reply_markup,
+                    "edited_at": edited.edited_at,
+                }),
+            ));
+        }
+
+        server_frame::Kind::BotMessageDeleted(deleted) => {
+            state.events.push(Event::ephemeral(
+                "bot_message_deleted",
+                json!({
+                    "message_id": deleted.message_id,
+                    "deleted_at": deleted.deleted_at,
+                }),
+            ));
+        }
+
+        server_frame::Kind::PollUpdated(updated) => {
+            let payload = json!({
+                "poll_id": updated.poll_id,
+                "conversation_id": uuid_or_hex(&updated.conversation_id),
+                "revision": updated.revision,
+                "counts": updated.counts.iter().map(|count| json!({
+                    "option_id": count.option_id,
+                    "count": count.count,
+                })).collect::<Vec<_>>(),
+                "total_voters": updated.total_voters,
+                "closed_at": updated.closed_at,
+                "correct_option_id": updated.correct_option_id,
+                "extra_options": updated.extra_options.iter().map(|option| json!({
+                    "option_id": option.option_id,
+                    "encrypted_meta": base64::engine::general_purpose::STANDARD.encode(&option.encrypted_meta),
+                    "proposed_by_account_id": option.proposed_by_account_id,
+                    "proposed_by_device_number": option.proposed_by_device_number,
+                    "created_at": option.created_at,
+                })).collect::<Vec<_>>(),
+                "deleted_option_ids": updated.deleted_option_ids,
+            });
+            state.events.push(Event::ephemeral("poll_updated", payload));
+        }
+
+        server_frame::Kind::PollDeleted(deleted) => {
+            state.events.push(Event::ephemeral(
+                "poll_deleted",
+                json!({
+                    "poll_id": deleted.poll_id,
+                    "conversation_id": uuid_or_hex(&deleted.conversation_id),
+                }),
+            ));
+        }
+
+        server_frame::Kind::CallSignal(signal) => {
+            state.events.push(call_signal_event(signal));
+        }
+
+        server_frame::Kind::BotCallbackAnswered(answer) => {
+            state.events.push(bot_callback_answered_event(answer));
+        }
     }
+
+    FrameAction::Continue
+}
+
+fn handle_server_error(state: &Arc<ActorState>, error: ErrorFrame) -> FrameAction {
+    let action = server_error_action(&error.code, error.fatal);
+    state.events.push(Event::ephemeral(
+        "server_error",
+        json!({
+            "code": error.code,
+            "message": error.message,
+            "fatal": error.fatal,
+        }),
+    ));
+    action
+}
+
+fn server_error_action(code: &str, fatal: bool) -> FrameAction {
+    if !fatal {
+        FrameAction::Continue
+    } else if code == "flood" {
+        FrameAction::Reconnect
+    } else {
+        FrameAction::Stop
+    }
+}
+
+fn call_signal_event(signal: CallSignal) -> Event {
+    Event::ephemeral(
+        "call_signal",
+        json!({
+            "conversation_id": uuid_or_hex(&signal.conversation_id),
+            "peer_account_id": uuid_or_hex(&signal.peer_account_id),
+            "peer_device_number": signal.peer_device_number,
+            "kind": signal.kind,
+            "payload": base64::engine::general_purpose::STANDARD.encode(&signal.payload),
+        }),
+    )
+}
+
+fn bot_callback_answered_event(answer: BotCallbackAnswered) -> Event {
+    Event::ephemeral(
+        "bot_callback_answered",
+        json!({
+            "callback_query_id": answer.callback_query_id,
+            "text": answer.text,
+            "message_id": answer.message_id,
+            "show_alert": answer.show_alert,
+        }),
+    )
 }
 
 /// One envelope, three possibilities.
@@ -409,7 +758,13 @@ async fn handle_envelope(state: &Arc<ActorState>, env: &Envelope) {
         EnvelopeOutcome::Plaintext(hex) => {
             if let Some(obj) = payload.as_object_mut() {
                 obj.insert("plaintext_hex".into(), json!(hex));
-                obj.insert("group".into(), json!(env.envelope_type == ENVELOPE_TYPE_MESSAGE && groups::looks_like_sender_key_message(&env.ciphertext)));
+                obj.insert(
+                    "group".into(),
+                    json!(
+                        env.envelope_type == ENVELOPE_TYPE_MESSAGE
+                            && groups::looks_like_sender_key_message(&env.ciphertext)
+                    ),
+                );
             }
         }
         EnvelopeOutcome::DistributionStored => {
@@ -477,6 +832,7 @@ fn envelope_to_json(e: &Envelope) -> serde_json::Value {
         "client_timestamp": e.client_timestamp,
         "conversation_id": if e.conversation_id.is_empty() { None } else { Some(uuid_or_hex(&e.conversation_id)) },
         "sender_is_bot": e.sender_is_bot,
+        "send_at": e.send_at,
     })
 }
 
@@ -518,10 +874,103 @@ pub async fn ack_envelopes(state: &Arc<ActorState>, ids: &[String]) -> Result<()
     }
 
     let frame = ClientFrame {
-        kind: Some(client_frame::Kind::Ack(EnvelopeAck { envelope_ids: raw })),
+        kind: Some(client_frame::Kind::Ack(EnvelopeAck {
+            envelope_ids: raw,
+            server_timestamps: Vec::new(),
+        })),
     };
 
     state.ws.send_frame(frame).await
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct TypingRequest {
+    conversation_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct NudgeRequest {
+    conversation_id: String,
+    target_account_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct HistoryRequestInput {
+    target_device_number: u32,
+    conversation_ids: Vec<String>,
+}
+
+fn parse_typing_frame(payload: &[u8]) -> Result<ClientFrame> {
+    let request: TypingRequest = serde_json::from_slice(payload)?;
+    Ok(ClientFrame {
+        kind: Some(client_frame::Kind::Typing(TypingFrame {
+            conversation_id: parse_uuid_text(&request.conversation_id, "conversation_id")?,
+        })),
+    })
+}
+
+fn parse_nudge_frame(payload: &[u8]) -> Result<ClientFrame> {
+    let request: NudgeRequest = serde_json::from_slice(payload)?;
+    Ok(ClientFrame {
+        kind: Some(client_frame::Kind::Nudge(Nudge {
+            conversation_id: parse_uuid_text(&request.conversation_id, "conversation_id")?,
+            target_account_id: parse_uuid_text(&request.target_account_id, "target_account_id")?,
+        })),
+    })
+}
+
+fn parse_history_request_frame(payload: &[u8]) -> Result<ClientFrame> {
+    let request: HistoryRequestInput = serde_json::from_slice(payload)?;
+    if request.target_device_number == 0 {
+        return Err(Error::InvalidPayload(
+            "target_device_number must be greater than zero".into(),
+        ));
+    }
+    if request.conversation_ids.len() > 200 {
+        return Err(Error::InvalidPayload(
+            "conversation_ids must contain at most 200 ids".into(),
+        ));
+    }
+    let conversation_ids = request
+        .conversation_ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| parse_uuid_text(id, &format!("conversation_ids[{index}]")))
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(ClientFrame {
+        kind: Some(client_frame::Kind::HistoryRequest(HistoryRequest {
+            target_device_number: request.target_device_number,
+            conversation_ids,
+        })),
+    })
+}
+
+fn parse_uuid_text(value: &str, field: &str) -> Result<Vec<u8>> {
+    uuid::Uuid::parse_str(value)
+        .map(|id| id.as_bytes().to_vec())
+        .map_err(|error| Error::InvalidPayload(format!("{field}: {error}")))
+}
+
+pub async fn send_typing(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
+    state.ws.send_frame(parse_typing_frame(&payload)?).await?;
+    Ok(br#"{"sent":true}"#.to_vec())
+}
+
+pub async fn send_nudge(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
+    state.ws.send_frame(parse_nudge_frame(&payload)?).await?;
+    Ok(br#"{"sent":true}"#.to_vec())
+}
+
+pub async fn request_history(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
+    state
+        .ws
+        .send_frame(parse_history_request_frame(&payload)?)
+        .await?;
+    Ok(br#"{"sent":true}"#.to_vec())
 }
 
 fn json_to_envelope(v: &serde_json::Value) -> Result<Envelope> {
@@ -556,6 +1005,7 @@ fn json_to_envelope(v: &serde_json::Value) -> Result<Envelope> {
         client_timestamp: get_i64(v, "client_timestamp"),
         conversation_id,
         sender_is_bot: false,
+        send_at: get_i64(v, "send_at"),
     })
 }
 
@@ -589,4 +1039,189 @@ fn get_i64(v: &serde_json::Value, key: &str) -> i64 {
 
 fn get_bool(v: &serde_json::Value, key: &str) -> bool {
     v.get(key).and_then(|x| x.as_bool()).unwrap_or(false)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn call_signal_event_preserves_fields_and_base64_encodes_payload() {
+        let event = call_signal_event(CallSignal {
+            conversation_id: vec![0x12; 16],
+            peer_account_id: vec![0x34; 16],
+            peer_device_number: 7,
+            kind: 3,
+            payload: vec![0, 1, 255],
+        });
+
+        assert_eq!(event.kind, "call_signal");
+        assert_eq!(
+            event.payload,
+            json!({
+                "conversation_id": "12121212-1212-1212-1212-121212121212",
+                "peer_account_id": "34343434-3434-3434-3434-343434343434",
+                "peer_device_number": 7,
+                "kind": 3,
+                "payload": "AAH/",
+            })
+        );
+    }
+
+    #[test]
+    fn bot_callback_answered_event_preserves_optional_fields() {
+        let event = bot_callback_answered_event(BotCallbackAnswered {
+            callback_query_id: "query-1".into(),
+            text: Some("Done".into()),
+            message_id: None,
+            show_alert: true,
+        });
+
+        assert_eq!(event.kind, "bot_callback_answered");
+        assert_eq!(
+            event.payload,
+            json!({
+                "callback_query_id": "query-1",
+                "text": "Done",
+                "message_id": null,
+                "show_alert": true,
+            })
+        );
+    }
+
+    #[test]
+    fn outgoing_typing_nudge_and_history_frames_match_proto_contract() {
+        let conversation_id = "00000000-0000-0000-0000-000000000001";
+        let target_account_id = "00000000-0000-0000-0000-000000000002";
+
+        let typing = parse_typing_frame(
+            json!({ "conversation_id": conversation_id })
+                .to_string()
+                .as_bytes(),
+        )
+        .unwrap();
+        let Some(client_frame::Kind::Typing(typing)) = typing.kind else {
+            panic!("expected typing frame");
+        };
+        assert_eq!(
+            typing.conversation_id,
+            parse_uuid_text(conversation_id, "id").unwrap()
+        );
+
+        let nudge = parse_nudge_frame(
+            json!({
+                "conversation_id": conversation_id,
+                "target_account_id": target_account_id,
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+        let Some(client_frame::Kind::Nudge(nudge)) = nudge.kind else {
+            panic!("expected nudge frame");
+        };
+        assert_eq!(
+            nudge.conversation_id,
+            parse_uuid_text(conversation_id, "id").unwrap()
+        );
+        assert_eq!(
+            nudge.target_account_id,
+            parse_uuid_text(target_account_id, "id").unwrap()
+        );
+
+        let history = parse_history_request_frame(
+            json!({
+                "target_device_number": 2,
+                "conversation_ids": [conversation_id, target_account_id],
+            })
+            .to_string()
+            .as_bytes(),
+        )
+        .unwrap();
+        let Some(client_frame::Kind::HistoryRequest(history)) = history.kind else {
+            panic!("expected history request frame");
+        };
+        assert_eq!(history.target_device_number, 2);
+        assert_eq!(history.conversation_ids.len(), 2);
+        assert_eq!(
+            history.conversation_ids[0],
+            parse_uuid_text(conversation_id, "id").unwrap()
+        );
+        assert_eq!(
+            history.conversation_ids[1],
+            parse_uuid_text(target_account_id, "id").unwrap()
+        );
+    }
+
+    #[test]
+    fn outgoing_ws_arguments_reject_invalid_uuids_and_history_bounds() {
+        assert!(parse_typing_frame(br#"{"conversation_id":"not-a-uuid"}"#).is_err());
+        assert!(parse_nudge_frame(
+            br#"{"conversation_id":"00000000-0000-0000-0000-000000000001","target_account_id":"bad"}"#
+        )
+        .is_err());
+        assert!(
+            parse_history_request_frame(br#"{"target_device_number":0,"conversation_ids":[]}"#)
+                .is_err()
+        );
+
+        let too_many = json!({
+            "target_device_number": 1,
+            "conversation_ids": vec!["00000000-0000-0000-0000-000000000001"; 201],
+        });
+        assert!(parse_history_request_frame(too_many.to_string().as_bytes()).is_err());
+
+        assert!(
+            parse_typing_frame(
+                br#"{"conversation_id":"00000000-0000-0000-0000-000000000001","extra":true}"#
+            )
+            .is_err()
+        );
+    }
+
+    #[tokio::test]
+    async fn matching_pong_resolves_only_its_ping_and_returns_round_trip_time() {
+        let (reply, response) = oneshot::channel();
+        let mut pending = HashMap::new();
+        pending.insert(123, (Instant::now(), reply));
+
+        resolve_pending_ping(&mut pending, 456);
+        assert_eq!(pending.len(), 1);
+        resolve_pending_ping(&mut pending, 123);
+        assert!(pending.is_empty());
+        assert!(response.await.unwrap().unwrap() <= 1_000);
+    }
+
+    #[test]
+    fn ping_timestamps_are_unique_even_with_same_clock_value() {
+        let last = std::sync::atomic::AtomicU64::new(0);
+        let first = next_unique_timestamp(&last, 42);
+        let second = next_unique_timestamp(&last, 42);
+        assert_eq!(first, 42);
+        assert_eq!(second, 43);
+    }
+
+    #[tokio::test]
+    async fn stop_signal_interrupts_reconnect_backoff() {
+        let (stop_tx, mut stop_rx) = watch::channel(false);
+        let waiting = tokio::spawn(async move {
+            wait_before_reconnect(Duration::from_secs(60), &mut stop_rx).await
+        });
+
+        stop_tx.send_replace(true);
+        assert!(!waiting.await.unwrap());
+    }
+
+    #[test]
+    fn fatal_server_errors_stop_except_flood() {
+        assert_eq!(
+            server_error_action("invalid_session", true),
+            FrameAction::Stop
+        );
+        assert_eq!(server_error_action("flood", true), FrameAction::Reconnect);
+        assert_eq!(
+            server_error_action("internal", false),
+            FrameAction::Continue
+        );
+    }
 }

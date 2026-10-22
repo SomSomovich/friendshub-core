@@ -49,7 +49,7 @@ pub async fn send_edit(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<
         &inner_bytes,
         ENVELOPE_TYPE_EDIT,
         Some(&req.common.conversation_id),
-)
+    )
     .await
 }
 
@@ -74,7 +74,7 @@ pub async fn send_delete(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Ve
         &inner_bytes,
         ENVELOPE_TYPE_DELETE,
         Some(&req.common.conversation_id),
-)
+    )
     .await
 }
 
@@ -102,7 +102,7 @@ pub async fn send_reaction(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<
         &inner_bytes,
         ENVELOPE_TYPE_REACTION,
         Some(&req.common.conversation_id),
-)
+    )
     .await
 }
 
@@ -114,7 +114,9 @@ async fn send_to_devices(
     envelope_type: i32,
     conversation_id: Option<&str>,
 ) -> Result<Vec<u8>> {
-    let auth = db_auth::load(&state.db).await?.ok_or(Error::NotAuthenticated)?;
+    let auth = db_auth::load(&state.db)
+        .await?
+        .ok_or(Error::NotAuthenticated)?;
     let sender_account_id = auth.account_id.ok_or(Error::NotAuthenticated)?;
     let sender_device_number = auth.device_number.unwrap_or(1);
     let token = bearer(state).await?;
@@ -148,7 +150,7 @@ async fn send_to_devices(
             payload,
             envelope_type,
             conversation_id,
-)
+        )
         .await
         {
             Ok(info) => envelopes.push(info),

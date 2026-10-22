@@ -1,6 +1,25 @@
 # Events
 
-The library produces events that a consumer reads with `fh_poll_event`.
+The library pushes events to a registered callback handler on a dedicated
+worker thread. Rust consumers register an `EventHandler` with
+`Client::set_event_handler`; C consumers register individual slots through
+`fh_set_event_callbacks`. Each event kind has its own callback. If no handler
+is installed, events remain available through `Client::poll_event` or
+`fh_poll_event`. Installing a handler drains events that accumulated in the
+in-memory pull queue into that handler. Durable events left unacknowledged in
+SQLite are restored into the queue when the client opens, so the next handler
+registration pushes them again.
+
+Callbacks run serially on the library-owned worker, not on the websocket or
+actor thread. A callback may call back into the client. Rust event references
+and C `FhEventView.event_json` bytes are borrowed for the callback duration;
+the library allocates and releases the payload. C callers keep `user_data`
+valid until callbacks have drained after unregister/destroy.
+
+Callback registration first queues new events in the pull queue while the
+library transfers older queued events to the callback worker. This keeps the
+event order stable across activation. A pull wait blocks only on the event
+queue; it does not occupy the actor thread or delay callback registration.
 
 | Return | Out buffer | Meaning |
 |---|---|---|
@@ -34,12 +53,34 @@ restart. The library does not re-decrypt: the plaintext is already stored.
 | `ws_connected` | no | `{"device_number":N}` |
 | `ws_disconnected` | no | `{"reason":"..."}` |
 | `ws_stopped` | no | `{}` |
+| `envelope_received` | yes | decrypted and persisted envelope; see below |
+| `receipt` | no | delivery receipt |
 | `server_error` | no | `{"code":"...","message":"...","fatal":bool}` |
+| `typing` | no | conversation, account, and typing state |
+| `read_receipt` | no | conversation and read marker |
+| `conversation_updated` | no | updated conversation metadata |
+| `history_request` | no | requested conversation history cursor |
+| `nudge` | no | incoming nudge |
+| `nudge_result` | no | response to an outgoing nudge |
+| `conversation_expired` | no | conversation expiration notice |
+| `scheduled_created` | no | scheduled envelope created |
+| `scheduled_cancelled` | no | scheduled envelope cancelled |
+| `folders_updated` | no | folder state changed |
 | `presence_updated` | no | account_id, is_online, last_seen, custom status |
 | `bot_message` | no | bot_id, text, reply_to_message_id, created_at |
+| `bot_message_edited` | no | edited bot message |
+| `bot_message_deleted` | no | deleted bot message |
+| `bot_callback_answered` | no | bot callback result |
 | `channel_post` | no | post_id, channel_id, author, text, attachments, reply |
+| `poll_updated` | no | poll data changed |
+| `poll_deleted` | no | poll removed |
+| `call_signal` | no | signaling frame for a call |
+| `identity_changed` | no | peer identity key changed |
 | `webrtc_event` | no | see below |
-| `envelope_received` | yes | see below |
+
+WebRTC callbacks have distinct methods for each subtype (`ice_candidate`,
+state changes, data-channel open/close/message, remote track, and close). The
+C ABI exposes matching `on_webrtc_*` slots.
 
 ### `envelope_received`
 
@@ -80,6 +121,10 @@ library adds the results of its own processing:
 
 **Acking `envelope_received`** does two things: the durable row is removed,
 and a receipt is sent to the sender over the websocket.
+The receipt is best effort. If it cannot be sent, the local row is still
+released because the consumer has already acknowledged handling the payload;
+the server may redeliver the envelope, so consumers should deduplicate by
+`envelope_id`.
 
 ### `webrtc_event`
 
@@ -94,7 +139,14 @@ The `event` field discriminates:
 - `track_received` - a remote media track arrived.
 - `closed` - the peer connection was closed.
 
-## Polling pattern
+## Callback pattern
+
+Install one callback per event type and handle durable IDs from the event
+view. For C, `event_id == 0` marks an ephemeral event; a nonzero ID must be
+passed to `fh_ack_event` after the application has safely handled the payload.
+The callback's JSON bytes must not be retained after it returns.
+
+## Pull compatibility pattern
 
 1. Call `fh_poll_event(handle, 5000, &out)`.
 2. Non-zero return: treat as error and back off.

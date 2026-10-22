@@ -11,7 +11,7 @@
 
 use chacha20poly1305::aead::{Aead, KeyInit, Payload};
 use chacha20poly1305::{ChaCha20Poly1305, Key, Nonce};
-use rand::Rng;
+use rand::RngExt;
 
 use crate::error::{Error, Result};
 
@@ -51,16 +51,22 @@ pub fn seal_chunk(
     chunk_index: u64,
     plaintext: &[u8],
 ) -> Result<Vec<u8>> {
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
-    let nonce_bytes = nonce_for(base, chunk_index);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let cipher_key = Key::from(*key);
+    let cipher = ChaCha20Poly1305::new(&cipher_key);
+    let nonce_bytes = Nonce::from(nonce_for(base, chunk_index));
 
     // The chunk index is bound into the AEAD as associated data, so a chunk
     // swapped from one position to another fails authentication instead of
     // silently decrypting into the wrong offset.
     let aad = chunk_index.to_be_bytes();
     cipher
-        .encrypt(nonce, Payload { msg: plaintext, aad: &aad })
+        .encrypt(
+            &nonce_bytes,
+            Payload {
+                msg: plaintext,
+                aad: &aad,
+            },
+        )
         .map_err(|e| Error::Internal(format!("chunk seal failed: {e}")))
 }
 
@@ -79,13 +85,19 @@ pub fn open_chunk(
         )));
     }
 
-    let cipher = ChaCha20Poly1305::new(Key::from_slice(key));
-    let nonce_bytes = nonce_for(base, chunk_index);
-    let nonce = Nonce::from_slice(&nonce_bytes);
+    let cipher_key = Key::from(*key);
+    let cipher = ChaCha20Poly1305::new(&cipher_key);
+    let nonce_bytes = Nonce::from(nonce_for(base, chunk_index));
     let aad = chunk_index.to_be_bytes();
 
     cipher
-        .decrypt(nonce, Payload { msg: ciphertext, aad: &aad })
+        .decrypt(
+            &nonce_bytes,
+            Payload {
+                msg: ciphertext,
+                aad: &aad,
+            },
+        )
         .map_err(|_| Error::InvalidPayload("chunk failed authentication".into()))
 }
 
@@ -95,8 +107,8 @@ pub fn decode_key_and_base(
     key_hex: &str,
     base_hex: &str,
 ) -> Result<([u8; KEY_LEN], [u8; BASE_NONCE_LEN])> {
-    let key_bytes = hex::decode(key_hex)
-        .map_err(|e| Error::InvalidPayload(format!("key hex: {e}")))?;
+    let key_bytes =
+        hex::decode(key_hex).map_err(|e| Error::InvalidPayload(format!("key hex: {e}")))?;
     if key_bytes.len() != KEY_LEN {
         return Err(Error::InvalidPayload(format!(
             "key is {} bytes, expected {}",
@@ -105,8 +117,8 @@ pub fn decode_key_and_base(
         )));
     }
 
-    let base_bytes = hex::decode(base_hex)
-        .map_err(|e| Error::InvalidPayload(format!("base nonce hex: {e}")))?;
+    let base_bytes =
+        hex::decode(base_hex).map_err(|e| Error::InvalidPayload(format!("base nonce hex: {e}")))?;
     if base_bytes.len() != BASE_NONCE_LEN {
         return Err(Error::InvalidPayload(format!(
             "base nonce is {} bytes, expected {}",

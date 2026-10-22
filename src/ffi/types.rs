@@ -12,11 +12,19 @@ pub struct FhBuffer {
 }
 
 impl FhBuffer {
-    pub const EMPTY: FhBuffer = FhBuffer { data: ptr::null_mut(), len: 0, cap: 0 };
+    pub const EMPTY: FhBuffer = FhBuffer {
+        data: ptr::null_mut(),
+        len: 0,
+        cap: 0,
+    };
 
     pub fn from_vec(v: Vec<u8>) -> Self {
         let mut v = std::mem::ManuallyDrop::new(v);
-        FhBuffer { data: v.as_mut_ptr(), len: v.len(), cap: v.capacity() }
+        FhBuffer {
+            data: v.as_mut_ptr(),
+            len: v.len(),
+            cap: v.capacity(),
+        }
     }
 
     /// Rebuilds the Vec and drops it.

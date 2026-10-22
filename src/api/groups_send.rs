@@ -45,10 +45,7 @@ pub struct CreateDistributionResponse {
 
 /// Generates this device's sender key for a group (or rotates it), then
 /// distributes the public half to every device of every member.
-pub async fn create_distribution(
-    state: &Arc<ActorState>,
-    payload: Vec<u8>,
-) -> Result<Vec<u8>> {
+pub async fn create_distribution(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
     let req: CreateDistributionRequest = serde_json::from_slice(&payload)?;
     let members = member_account_ids(state, &req.conversation_id).await?;
 
@@ -99,7 +96,7 @@ pub async fn create_distribution(
                 &skdm,
                 ENVELOPE_TYPE_SENDER_KEY,
                 Some(&req.conversation_id),
-)
+            )
             .await
             {
                 Ok(info) => envelopes.push(DistributionEnvelope {
@@ -160,10 +157,7 @@ pub struct SendGroupResponse {
 /// tells the device "the following was sent by one of your sibling devices",
 /// not the group ciphertext: a device cannot decrypt its own sender key
 /// output, and does not need to.
-pub async fn send_group_message(
-    state: &Arc<ActorState>,
-    payload: Vec<u8>,
-) -> Result<Vec<u8>> {
+pub async fn send_group_message(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
     let req: SendGroupRequest = serde_json::from_slice(&payload)?;
     let plaintext = hex::decode(&req.plaintext_hex)
         .map_err(|e| Error::InvalidPayload(format!("plaintext hex: {e}")))?;
@@ -213,7 +207,7 @@ pub async fn send_group_message(
                 &skm,
                 ENVELOPE_TYPE_MESSAGE,
                 Some(&req.conversation_id),
-)
+            )
             .await
             {
                 Ok(info) => envelopes.push(DistributionEnvelope {
@@ -257,7 +251,7 @@ pub async fn send_group_message(
                 &sync_bytes,
                 ENVELOPE_TYPE_SYNC,
                 Some(&req.conversation_id),
-)
+            )
             .await
             {
                 Ok(info) => sync_envelopes.push(DistributionEnvelope {
@@ -288,10 +282,7 @@ pub async fn send_group_message(
 
 /// Returns the account ids of everyone in the conversation, including the
 /// caller. Only accounts, not bots. Order is not guaranteed.
-async fn member_account_ids(
-    state: &Arc<ActorState>,
-    conversation_id: &str,
-) -> Result<Vec<String>> {
+async fn member_account_ids(state: &Arc<ActorState>, conversation_id: &str) -> Result<Vec<String>> {
     let rows: Vec<(String,)> = sqlx::query_as(
         "SELECT account_id FROM conversation_members WHERE conversation_id = ? AND left_at IS NULL",
     )

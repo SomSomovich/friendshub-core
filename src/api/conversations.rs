@@ -21,7 +21,10 @@ pub struct ConversationItem {
 
 pub async fn list(state: &Arc<ActorState>, _payload: Vec<u8>) -> Result<Vec<u8>> {
     let token = bearer(state).await?;
-    let rows: Vec<ConversationItem> = state.http.get("/api/v1/conversations", Some(&token)).await?;
+    let rows: Vec<ConversationItem> = state
+        .http
+        .get("/api/v1/conversations", Some(&token))
+        .await?;
     Ok(serde_json::to_vec(&rows)?)
 }
 
@@ -71,7 +74,10 @@ pub async fn leave(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>>
     let v: serde_json::Value = serde_json::from_slice(&payload)?;
     let id = id_from(&v)?;
     let path = format!("/api/v1/conversations/{id}/leave");
-    let _: serde_json::Value = state.http.post(&path, &serde_json::json!({}), Some(&token)).await?;
+    let _: serde_json::Value = state
+        .http
+        .post(&path, &serde_json::json!({}), Some(&token))
+        .await?;
     Ok(br#"{"left":true}"#.to_vec())
 }
 
@@ -80,7 +86,10 @@ pub async fn archive(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8
     let v: serde_json::Value = serde_json::from_slice(&payload)?;
     let id = id_from(&v)?;
     let path = format!("/api/v1/conversations/{id}/archive");
-    let _: serde_json::Value = state.http.post(&path, &serde_json::json!({}), Some(&token)).await?;
+    let _: serde_json::Value = state
+        .http
+        .post(&path, &serde_json::json!({}), Some(&token))
+        .await?;
     Ok(br#"{"archived":true}"#.to_vec())
 }
 
@@ -97,7 +106,10 @@ pub async fn mute(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> 
     let token = bearer(state).await?;
     let v: serde_json::Value = serde_json::from_slice(&payload)?;
     let id = id_from(&v)?;
-    let duration = v.get("duration_seconds").cloned().unwrap_or(serde_json::Value::Null);
+    let duration = v
+        .get("duration_seconds")
+        .cloned()
+        .unwrap_or(serde_json::Value::Null);
     let path = format!("/api/v1/conversations/{id}/mute");
     let body = serde_json::json!({ "duration_seconds": duration });
     let _: serde_json::Value = state.http.post(&path, &body, Some(&token)).await?;

@@ -12,8 +12,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use bytes::BytesMut;
 use serde::Serialize;
-use tokio::sync::mpsc;
 use tokio::sync::Mutex;
+use tokio::sync::mpsc;
 
 use webrtc::data_channel::{DataChannel, DataChannelEvent};
 use webrtc::peer_connection::{
@@ -35,23 +35,67 @@ pub mod vp8;
 #[derive(Debug, Serialize)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum WebRtcEvent {
-    IceCandidate { call_id: String, candidate: serde_json::Value },
-    SignalingStateChanged { call_id: String, state: String },
-    IceConnectionStateChanged { call_id: String, state: String },
-    IceGatheringStateChanged { call_id: String, state: String },
-    ConnectionStateChanged { call_id: String, state: String },
-    DataChannelOpened { call_id: String, label: String },
-    DataChannelClosed { call_id: String, label: String },
-    DataChannelMessage { call_id: String, label: String, data_base64: String, is_text: bool },
-    TrackReceived { call_id: String, track_id: String, kind: String },
-    Closed { call_id: String },
+    IceCandidate {
+        call_id: String,
+        candidate: serde_json::Value,
+    },
+    SignalingStateChanged {
+        call_id: String,
+        state: String,
+    },
+    IceConnectionStateChanged {
+        call_id: String,
+        state: String,
+    },
+    IceGatheringStateChanged {
+        call_id: String,
+        state: String,
+    },
+    ConnectionStateChanged {
+        call_id: String,
+        state: String,
+    },
+    DataChannelOpened {
+        call_id: String,
+        label: String,
+    },
+    DataChannelClosed {
+        call_id: String,
+        label: String,
+    },
+    DataChannelMessage {
+        call_id: String,
+        label: String,
+        data_base64: String,
+        is_text: bool,
+    },
+    TrackReceived {
+        call_id: String,
+        track_id: String,
+        kind: String,
+    },
+    Closed {
+        call_id: String,
+    },
 }
 
 enum InternalEvent {
     User(WebRtcEvent),
-    ChannelOpened { call_id: String, label: String, channel: Arc<dyn DataChannel> },
-    ChannelClosed { call_id: String, label: String },
-    TrackOpened { call_id: String, track_id: String, kind: String, track: Arc<dyn webrtc::media_stream::track_remote::TrackRemote> },
+    ChannelOpened {
+        call_id: String,
+        label: String,
+        channel: Arc<dyn DataChannel>,
+    },
+    ChannelClosed {
+        call_id: String,
+        label: String,
+    },
+    TrackOpened {
+        call_id: String,
+        track_id: String,
+        kind: String,
+        track: Arc<dyn webrtc::media_stream::track_remote::TrackRemote>,
+    },
 }
 
 #[derive(Clone)]
@@ -68,7 +112,10 @@ fn candidate_to_sdp(c: &webrtc::peer_connection::RTCIceCandidate) -> String {
         c.foundation, c.component, proto, c.priority, c.address, c.port, typ
     );
     if !c.related_address.is_empty() {
-        s.push_str(&format!(" raddr {} rport {}", c.related_address, c.related_port));
+        s.push_str(&format!(
+            " raddr {} rport {}",
+            c.related_address, c.related_port
+        ));
     }
     s
 }
@@ -77,7 +124,8 @@ fn candidate_to_sdp(c: &webrtc::peer_connection::RTCIceCandidate) -> String {
 impl PeerConnectionEventHandler for Handler {
     async fn on_ice_candidate(&self, event: RTCPeerConnectionIceEvent) {
         let candidate_sdp = candidate_to_sdp(&event.candidate);
-        let candidate = serde_json::json!({ "candidate": candidate_sdp, "sdpMid": "0", "sdpMLineIndex": 0 });
+        let candidate =
+            serde_json::json!({ "candidate": candidate_sdp, "sdpMid": "0", "sdpMLineIndex": 0 });
         let _ = self.tx.send(InternalEvent::User(WebRtcEvent::IceCandidate {
             call_id: self.call_id.clone(),
             candidate,
@@ -85,31 +133,39 @@ impl PeerConnectionEventHandler for Handler {
     }
 
     async fn on_signaling_state_change(&self, state: RTCSignalingState) {
-        let _ = self.tx.send(InternalEvent::User(WebRtcEvent::SignalingStateChanged {
-            call_id: self.call_id.clone(),
-            state: format!("{state:?}"),
-        }));
+        let _ = self
+            .tx
+            .send(InternalEvent::User(WebRtcEvent::SignalingStateChanged {
+                call_id: self.call_id.clone(),
+                state: format!("{state:?}"),
+            }));
     }
 
     async fn on_ice_connection_state_change(&self, state: RTCIceConnectionState) {
-        let _ = self.tx.send(InternalEvent::User(WebRtcEvent::IceConnectionStateChanged {
-            call_id: self.call_id.clone(),
-            state: format!("{state:?}"),
-        }));
+        let _ = self.tx.send(InternalEvent::User(
+            WebRtcEvent::IceConnectionStateChanged {
+                call_id: self.call_id.clone(),
+                state: format!("{state:?}"),
+            },
+        ));
     }
 
     async fn on_ice_gathering_state_change(&self, state: RTCIceGatheringState) {
-        let _ = self.tx.send(InternalEvent::User(WebRtcEvent::IceGatheringStateChanged {
-            call_id: self.call_id.clone(),
-            state: format!("{state:?}"),
-        }));
+        let _ = self
+            .tx
+            .send(InternalEvent::User(WebRtcEvent::IceGatheringStateChanged {
+                call_id: self.call_id.clone(),
+                state: format!("{state:?}"),
+            }));
     }
 
     async fn on_connection_state_change(&self, state: RTCPeerConnectionState) {
-        let _ = self.tx.send(InternalEvent::User(WebRtcEvent::ConnectionStateChanged {
-            call_id: self.call_id.clone(),
-            state: format!("{state:?}"),
-        }));
+        let _ = self
+            .tx
+            .send(InternalEvent::User(WebRtcEvent::ConnectionStateChanged {
+                call_id: self.call_id.clone(),
+                state: format!("{state:?}"),
+            }));
     }
 
     async fn on_data_channel(&self, channel: Arc<dyn DataChannel>) {
@@ -136,11 +192,13 @@ impl PeerConnectionEventHandler for Handler {
             kind: kind.clone(),
             track: track.clone(),
         });
-        let _ = self.tx.send(InternalEvent::User(WebRtcEvent::TrackReceived {
-            call_id: self.call_id.clone(),
-            track_id,
-            kind,
-        }));
+        let _ = self
+            .tx
+            .send(InternalEvent::User(WebRtcEvent::TrackReceived {
+                call_id: self.call_id.clone(),
+                track_id,
+                kind,
+            }));
     }
 }
 
@@ -180,7 +238,11 @@ impl WebRtcManager {
                         serde_json::to_value(&user).unwrap_or(serde_json::Value::Null),
                     ));
                 }
-                InternalEvent::ChannelOpened { call_id, label, channel } => {
+                InternalEvent::ChannelOpened {
+                    call_id,
+                    label,
+                    channel,
+                } => {
                     self.channels
                         .lock()
                         .await
@@ -205,7 +267,12 @@ impl WebRtcManager {
                 InternalEvent::ChannelClosed { call_id, label } => {
                     self.channels.lock().await.remove(&(call_id, label));
                 }
-                InternalEvent::TrackOpened { call_id, track_id, kind, track } => {
+                InternalEvent::TrackOpened {
+                    call_id,
+                    track_id,
+                    kind,
+                    track,
+                } => {
                     // Video and audio arrive on the same callback. Route by the
                     // codec kind so each ends up in its own frame queue; a
                     // consumer then reads whichever stream it cares about.
@@ -219,20 +286,36 @@ impl WebRtcManager {
         }
     }
 
-    pub async fn send_data(&self, call_id: &str, label: &str, data: Vec<u8>, is_text: bool) -> Result<()> {
+    pub async fn send_data(
+        &self,
+        call_id: &str,
+        label: &str,
+        data: Vec<u8>,
+        is_text: bool,
+    ) -> Result<()> {
         let channel = {
             let channels = self.channels.lock().await;
-            channels.get(&(call_id.to_string(), label.to_string())).cloned()
+            channels
+                .get(&(call_id.to_string(), label.to_string()))
+                .cloned()
         };
         let channel = channel.ok_or_else(|| {
-            Error::InvalidPayload(format!("no open data channel {label:?} on call {call_id:?}"))
+            Error::InvalidPayload(format!(
+                "no open data channel {label:?} on call {call_id:?}"
+            ))
         })?;
         if is_text {
             let text = String::from_utf8(data)
                 .map_err(|e| Error::InvalidPayload(format!("text payload is not utf-8: {e}")))?;
-            channel.send_text(&text).await.map_err(|e| Error::Internal(format!("send_text: {e}")))?;
+            channel
+                .send_text(&text)
+                .await
+                .map_err(|e| Error::Internal(format!("send_text: {e}")))?;
         } else {
-            channel.send(BytesMut::from(&data[..])).await.map_err(|e| Error::Internal(format!("send: {e}")))?;
+            channel
+                .send(BytesMut::from(&data[..]))
+                .await
+                .map_err(|e| Error::Internal(format!("send: {e}")))?;
         }
         Ok(())
     }
@@ -243,49 +326,77 @@ impl WebRtcManager {
     pub async fn add_video_track(&self, call_id: &str, label: &str) -> Result<()> {
         let pc = self.get(call_id).await?;
         let track = self.video.register_local(call_id, label).await?;
-        pc.add_track(track).await
+        pc.add_track(track)
+            .await
             .map_err(|e| Error::Internal(format!("add_track: {e}")))?;
         Ok(())
     }
 
-/// Adds an Opus audio track to a call. The caller produces encoded Opus
+    /// Adds an Opus audio track to a call. The caller produces encoded Opus
     /// frames and hands them to `write_audio_frame`; the library only routes
     /// them through RTP.
     pub async fn add_audio_track(&self, call_id: &str, label: &str) -> Result<()> {
         let pc = self.get(call_id).await?;
         let track = self.audio.register_local(call_id, label).await?;
-        pc.add_track(track).await
+        pc.add_track(track)
+            .await
             .map_err(|e| Error::Internal(format!("add_track: {e}")))?;
         Ok(())
     }
 
-    pub async fn write_audio_frame(&self, call_id: &str, data: Vec<u8>, duration_ms: u64) -> Result<()> {
+    pub async fn write_audio_frame(
+        &self,
+        call_id: &str,
+        data: Vec<u8>,
+        duration_ms: u64,
+    ) -> Result<()> {
         self.audio.write_frame(call_id, data, duration_ms).await
     }
 
-    pub async fn write_video_frame(&self, call_id: &str, data: Vec<u8>, duration_ms: u64) -> Result<()> {
+    pub async fn write_video_frame(
+        &self,
+        call_id: &str,
+        data: Vec<u8>,
+        duration_ms: u64,
+    ) -> Result<()> {
         self.video.write_frame(call_id, data, duration_ms).await
     }
 
-    pub async fn create_offer(&self, call_id: &str, ice_servers: Vec<serde_json::Value>) -> Result<String> {
+    pub async fn create_offer(
+        &self,
+        call_id: &str,
+        ice_servers: Vec<serde_json::Value>,
+    ) -> Result<String> {
         let pc = self.build_peer(call_id, ice_servers).await?;
-        let offer = pc.create_offer(None).await
+        let offer = pc
+            .create_offer(None)
+            .await
             .map_err(|e| Error::Internal(format!("create_offer: {e}")))?;
-        pc.set_local_description(offer.clone()).await
+        pc.set_local_description(offer.clone())
+            .await
             .map_err(|e| Error::Internal(format!("set_local_description: {e}")))?;
         self.peers.lock().await.insert(call_id.to_string(), pc);
         Ok(offer.sdp)
     }
 
-    pub async fn accept_offer(&self, call_id: &str, remote_sdp: &str, ice_servers: Vec<serde_json::Value>) -> Result<String> {
+    pub async fn accept_offer(
+        &self,
+        call_id: &str,
+        remote_sdp: &str,
+        ice_servers: Vec<serde_json::Value>,
+    ) -> Result<String> {
         let pc = self.build_peer(call_id, ice_servers).await?;
         let remote = RTCSessionDescription::offer(remote_sdp.to_string())
             .map_err(|e| Error::Internal(format!("bad offer: {e}")))?;
-        pc.set_remote_description(remote).await
+        pc.set_remote_description(remote)
+            .await
             .map_err(|e| Error::Internal(format!("set_remote_description: {e}")))?;
-        let answer = pc.create_answer(None).await
+        let answer = pc
+            .create_answer(None)
+            .await
             .map_err(|e| Error::Internal(format!("create_answer: {e}")))?;
-        pc.set_local_description(answer.clone()).await
+        pc.set_local_description(answer.clone())
+            .await
             .map_err(|e| Error::Internal(format!("set_local_description: {e}")))?;
         self.peers.lock().await.insert(call_id.to_string(), pc);
         Ok(answer.sdp)
@@ -295,24 +406,31 @@ impl WebRtcManager {
         let pc = self.get(call_id).await?;
         let remote = RTCSessionDescription::answer(remote_sdp.to_string())
             .map_err(|e| Error::Internal(format!("bad answer: {e}")))?;
-        pc.set_remote_description(remote).await
+        pc.set_remote_description(remote)
+            .await
             .map_err(|e| Error::Internal(format!("set_remote_description: {e}")))?;
         Ok(())
     }
 
-    pub async fn add_ice_candidate(&self, call_id: &str, candidate: serde_json::Value) -> Result<()> {
+    pub async fn add_ice_candidate(
+        &self,
+        call_id: &str,
+        candidate: serde_json::Value,
+    ) -> Result<()> {
         let pc = self.get(call_id).await?;
-        let init: webrtc::peer_connection::RTCIceCandidateInit =
-            serde_json::from_value(candidate)
-                .map_err(|e| Error::InvalidPayload(format!("ice candidate: {e}")))?;
-        pc.add_ice_candidate(init).await
+        let init: webrtc::peer_connection::RTCIceCandidateInit = serde_json::from_value(candidate)
+            .map_err(|e| Error::InvalidPayload(format!("ice candidate: {e}")))?;
+        pc.add_ice_candidate(init)
+            .await
             .map_err(|e| Error::Internal(format!("add_ice_candidate: {e}")))?;
         Ok(())
     }
 
     pub async fn create_data_channel(&self, call_id: &str, label: &str) -> Result<()> {
         let pc = self.get(call_id).await?;
-        let dc = pc.create_data_channel(label, None).await
+        let dc = pc
+            .create_data_channel(label, None)
+            .await
             .map_err(|e| Error::Internal(format!("create_data_channel: {e}")))?;
         let label_owned = label.to_string();
         let call_id_owned = call_id.to_string();
@@ -350,14 +468,23 @@ impl WebRtcManager {
     }
 
     async fn get(&self, call_id: &str) -> Result<Arc<dyn PeerConnection>> {
-        self.peers.lock().await.get(call_id).cloned().ok_or_else(|| {
-            Error::InvalidPayload(format!("unknown call_id: {call_id}"))
-        })
+        self.peers
+            .lock()
+            .await
+            .get(call_id)
+            .cloned()
+            .ok_or_else(|| Error::InvalidPayload(format!("unknown call_id: {call_id}")))
     }
 
-    async fn build_peer(&self, call_id: &str, ice_servers: Vec<serde_json::Value>) -> Result<Arc<dyn PeerConnection>> {
+    async fn build_peer(
+        &self,
+        call_id: &str,
+        ice_servers: Vec<serde_json::Value>,
+    ) -> Result<Arc<dyn PeerConnection>> {
         let servers = parse_ice_servers(ice_servers)?;
-        let config = RTCConfigurationBuilder::default().with_ice_servers(servers).build();
+        let config = RTCConfigurationBuilder::default()
+            .with_ice_servers(servers)
+            .build();
         let handler = Arc::new(Handler {
             call_id: call_id.to_string(),
             tx: self.event_tx.clone(),
@@ -366,23 +493,34 @@ impl WebRtcManager {
             .with_configuration(config)
             .with_handler(handler)
             .with_udp_addrs(vec!["0.0.0.0:0"])
-            .build().await
+            .build()
+            .await
             .map_err(|e| Error::Internal(format!("peer build: {e}")))?;
         Ok(Arc::new(pc_impl))
     }
 }
 
 impl Default for WebRtcManager {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 fn parse_ice_servers(input: Vec<serde_json::Value>) -> Result<Vec<RTCIceServer>> {
     let mut out = Vec::with_capacity(input.len());
     for item in input {
-        let urls: Vec<String> = item.get("urls").and_then(|u| serde_json::from_value(u.clone()).ok())
+        let urls: Vec<String> = item
+            .get("urls")
+            .and_then(|u| serde_json::from_value(u.clone()).ok())
             .ok_or_else(|| Error::InvalidPayload("ice server urls missing".into()))?;
-        let username = item.get("username").and_then(|u| u.as_str()).map(String::from);
-        let credential = item.get("credential").and_then(|u| u.as_str()).map(String::from);
+        let username = item
+            .get("username")
+            .and_then(|u| u.as_str())
+            .map(String::from);
+        let credential = item
+            .get("credential")
+            .and_then(|u| u.as_str())
+            .map(String::from);
         out.push(RTCIceServer {
             urls,
             username: username.unwrap_or_default(),

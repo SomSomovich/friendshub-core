@@ -76,7 +76,8 @@ fn default_discovery_enabled() -> bool {
 }
 
 fn default_discovery_url() -> String {
-    "https://raw.githubusercontent.com/SomSomovich/friendshub-core/master/discovery.json".to_string()
+    "https://raw.githubusercontent.com/SomSomovich/friendshub-core/master/discovery.json"
+        .to_string()
 }
 
 fn default_discovery_ttl() -> u64 {
@@ -89,8 +90,8 @@ fn default_discovery_timeout() -> u64 {
 
 impl Config {
     pub fn from_json(bytes: &[u8]) -> Result<Self> {
-        let cfg: Config = serde_json::from_slice(bytes)
-            .map_err(|e| Error::Config(e.to_string()))?;
+        let cfg: Config =
+            serde_json::from_slice(bytes).map_err(|e| Error::Config(e.to_string()))?;
 
         if cfg.db_path.as_os_str().is_empty() {
             return Err(Error::Config("db_path is empty".into()));

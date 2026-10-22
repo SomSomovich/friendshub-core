@@ -63,7 +63,10 @@ impl Error {
             code: &'a str,
             message: String,
         }
-        let body = Body { code: self.code(), message: self.to_string() };
+        let body = Body {
+            code: self.code(),
+            message: self.to_string(),
+        };
         serde_json::to_string(&body).unwrap_or_else(|_| {
             "{\"code\":\"internal\",\"message\":\"serialization failed\"}".to_string()
         })

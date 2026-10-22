@@ -20,6 +20,10 @@ message Envelope {
   int64 client_timestamp = 9;
   bytes conversation_id = 10;
   bool sender_is_bot = 11;
+  // Non-zero: deliver at this unix time. Zero: deliver now.
+  // Set by the client, bounded by the server to now + 24h.
+  // A zero means the message is not scheduled.
+  int64 send_at = 12;
 }
 
 enum EnvelopeType {
@@ -39,8 +43,13 @@ enum EnvelopeType {
   ENVELOPE_TYPE_CALL_HANGUP = 13;
   ENVELOPE_TYPE_CALL_REJECT = 14;
   ENVELOPE_TYPE_BOT_MESSAGE = 15;
-  ENVELOPE_TYPE_PIN = 16;
-  ENVELOPE_TYPE_UNPIN = 17;
+
+  // 16 and 17 were ENVELOPE_TYPE_PIN and ENVELOPE_TYPE_UNPIN. Pins are
+  // conversation state, not messages one device sends to another, and
+  // they are now managed through REST. The numbers are reserved rather
+  // than reused so an old client that still emits them cannot be
+  // silently interpreted as a different type.
+  reserved 16, 17;
 }
 
 message ClientFrame {
@@ -49,6 +58,10 @@ message ClientFrame {
     EnvelopeUpload upload = 2;
     EnvelopeAck ack = 3;
     Ping ping = 4;
+    TypingFrame typing = 5;
+    HistoryRequest history_request = 6;
+    Nudge nudge = 7;
+    CallSignal call_signal = 8;
   }
 }
 
@@ -68,6 +81,10 @@ message EnvelopeUpload {
 
 message EnvelopeAck {
   repeated bytes envelope_ids = 1;
+  // Filled only by the server, in the same order as envelope_ids.
+  // A client ack never sets it: the client does not know the server
+  // timestamp of the envelopes it is acknowledging.
+  repeated int64 server_timestamps = 2;
 }
 
 message Ping {
@@ -84,6 +101,22 @@ message ServerFrame {
     PresenceUpdate presence = 6;
     BotMessageDelivery bot_message = 7;
     ChannelPostDelivery channel_post = 8;
+    TypingDelivery typing = 9;
+    ReadReceiptDelivery read_receipt = 10;
+    ConversationUpdatedDelivery conversation_updated = 11;
+    HistoryRequestRelay history_request_relay = 12;
+    NudgeDelivery nudge = 13;
+    NudgeResult nudge_result = 14;
+    ConversationExpiredDelivery conversation_expired = 15;
+    ScheduledEnvelopeCreated scheduled_created = 16;
+    ScheduledEnvelopeCancelled scheduled_cancelled = 17;
+    FoldersUpdated folders_updated = 18;
+    CallSignal call_signal = 19;
+    BotMessageEdited bot_message_edited = 20;
+    BotMessageDeleted bot_message_deleted = 21;
+    BotCallbackAnswered bot_callback_answered = 22;
+    PollUpdated poll_updated = 23;
+    PollDeleted poll_deleted = 24;
   }
 }
 
@@ -128,6 +161,9 @@ message BotMessageDelivery {
   string text = 4;
   optional string reply_to_message_id = 5;
   int64 created_at = 6;
+  // JSON: {"inline_keyboard":[[{"text":"...","callback_data":"..."}]]}
+  // Opaque to the server; carried verbatim to the client.
+  optional string reply_markup = 7;
 }
 
 message ChannelPostDelivery {
@@ -139,4 +175,207 @@ message ChannelPostDelivery {
   repeated string attachment_ids = 6;
   optional string reply_to_post_id = 7;
   int64 created_at = 8;
+}
+
+message TypingFrame {
+  bytes conversation_id = 1;
+}
+
+message TypingDelivery {
+  bytes conversation_id = 1;
+  bytes account_id = 2;
+}
+
+message ReadReceiptDelivery {
+  bytes conversation_id = 1;
+  bytes account_id = 2;
+  int64 last_read_at = 3;
+}
+
+// Metadata of a group or channel changed, or its member list changed.
+// Fields are the current values, not a delta: a client that missed an
+// earlier frame still ends up consistent after any later one.
+message ConversationUpdatedDelivery {
+  bytes conversation_id = 1;
+  optional string title = 2;
+  optional string description = 3;
+  optional bool is_public = 4;
+  bool members_changed = 5;
+}
+// History sync between two devices of the same account.
+//
+// `HistoryRequest` travels from a newly registered device that has no
+// local history to an older device that does. The server validates that
+// `target_device_number` names another active device of the sender's
+// account and that every conversation id in the list is one the sender
+// is a member of, then relays the request as `HistoryRequestRelay`.
+//
+// The relayed frame carries only the request: the actual history is
+// sent back as ordinary `Envelope`s, addressed by the old device to the
+// new one, and encrypted with the sessions the old device establishes
+// for the new. The server neither reads nor stores any of it beyond the
+// normal envelope path.
+
+message HistoryRequest {
+  uint32 target_device_number = 1;
+  repeated bytes conversation_ids = 2;
+}
+
+message HistoryRequestRelay {
+  uint32 from_device_number = 1;
+  repeated bytes conversation_ids = 2;
+}
+// Nudge: a "shake" sent from one account to another inside a direct
+// conversation. Relayed, never stored. The target can opt out via the
+// `allow_nudges` flag on their account, in which case the sender's
+// request is refused without notification to the target.
+
+message Nudge {
+  bytes conversation_id = 1;
+  bytes target_account_id = 2;
+}
+
+message NudgeDelivery {
+  bytes conversation_id = 1;
+  bytes from_account_id = 2;
+}
+
+message NudgeResult {
+  bool delivered = 1;
+}
+
+// Sent to all live members of a temporary room when the cleanup worker
+// deletes it. The client is expected to remove the conversation and its
+// local messages; a client that does not is outside the server's reach.
+
+message ConversationExpiredDelivery {
+  bytes conversation_id = 1;
+}
+
+// Signals that a new scheduled envelope has been queued, or that one
+// has been cancelled. Sent only to the sender's other devices.
+
+message ScheduledEnvelopeCreated {
+  bytes envelope_id = 1;
+  bytes conversation_id = 2;
+  int64 send_at = 3;
+}
+
+message ScheduledEnvelopeCancelled {
+  bytes envelope_id = 1;
+}
+
+// Sent to a device when the same account's folders change on another
+// device. Carries no data: the client re-fetches `GET /folders`.
+
+message FoldersUpdated {
+  bytes account_id = 1;
+}
+// Call signaling for 1-on-1 calls.
+//
+// The server relays these frames between two devices that are both
+// members of a direct conversation. It never stores them, never parses
+// the payload, and never touches the media itself: the audio and video
+// travel over TURN or P2P, not through FriendsHub.
+//
+// `peer_device_number` addresses one device of the peer. A caller who
+// knows two devices of the same peer picks one (the first active one,
+// or the one it has a session for); the server does not fan out the
+// offer to all of them. If that device is offline the sender gets
+// CALL_SIGNAL_UNAVAILABLE back.
+
+enum CallSignalKind {
+  CALL_SIGNAL_UNSPECIFIED = 0;
+  CALL_SIGNAL_OFFER       = 1;
+  CALL_SIGNAL_ANSWER      = 2;
+  CALL_SIGNAL_ICE         = 3;
+  CALL_SIGNAL_HANGUP      = 4;
+  CALL_SIGNAL_REJECT      = 5;
+  CALL_SIGNAL_UNAVAILABLE = 6;
+}
+
+message CallSignal {
+  bytes conversation_id     = 1;
+  bytes peer_account_id     = 2;
+  uint32 peer_device_number = 3;
+  CallSignalKind kind       = 4;
+  // SDP offer/answer, or a serialized ICE candidate. Opaque to the
+  // server; the client picks the encoding.
+  bytes payload             = 5;
+}
+// Bot-related delivery frames.
+//
+// `BotMessageEdited` and `BotMessageDeleted` arrive when a bot modifies
+// or removes a message it already sent. The client updates its local
+// copy and, if the message is on screen, re-renders.
+//
+// `BotCallbackAnswered` dismisses the spinner that was shown when the
+// user tapped an inline button. `text` is the optional toast message,
+// `show_alert = true` turns it into a modal. Both fields are the
+// bot's choice; the server forwards them unchanged.
+
+message BotMessageEdited {
+  string message_id = 1;
+  string text = 2;
+  optional string reply_markup = 3;
+  int64 edited_at = 4;
+}
+
+message BotMessageDeleted {
+  string message_id = 1;
+  int64 deleted_at = 2;
+}
+
+message BotCallbackAnswered {
+  string callback_query_id = 1;
+  optional string text = 2;
+  optional string message_id = 3;
+  bool show_alert = 4;
+}
+// Poll aggregate update.
+//
+// Delivered to every live participant of the poll's conversation when
+// the counts change or the poll closes. Carries only what the server
+// knows: option ids, their counts, and the correct option id once the
+// poll is closed. Mapping id → text is the client's job, from the
+// encrypted `encrypted_meta` it already holds.
+
+message PollUpdated {
+  string poll_id = 1;
+  bytes conversation_id = 2;
+  repeated PollOptionCount counts = 3;
+  int64 total_voters = 4;
+  optional int64 closed_at = 5;
+  optional string correct_option_id = 6;
+  // Full current list of user-proposed options. Replaced wholesale on
+  // each frame, not merged. Base options (from encrypted_meta) are not
+  // repeated here — their text is already inside encrypted_meta.
+  repeated PollExtraOption extra_options = 7;
+  // IDs removed by the creator, including base options that are otherwise
+  // represented only inside encrypted_meta.
+  repeated string deleted_option_ids = 8;
+  // Monotonically increases whenever any poll-visible state changes.
+  int64 revision = 9;
+}
+
+message PollExtraOption {
+  string option_id = 1;
+  bytes encrypted_meta = 2;
+  optional string proposed_by_account_id = 3;
+  optional uint32 proposed_by_device_number = 4;
+  int64 created_at = 5;
+}
+
+message PollOptionCount {
+  string option_id = 1;
+  int64 count = 2;
+}
+// Sent to every live participant of the conversation when the poll's
+// creator deletes it. The client removes the poll from its local
+// history; a client that is offline when this arrives will find the
+// poll missing on its next fetch.
+
+message PollDeleted {
+  string poll_id = 1;
+  bytes conversation_id = 2;
 }

@@ -33,6 +33,17 @@ pub async fn get(db: &SqlitePool, id: i64) -> Result<Option<PendingEvent>> {
     Ok(row)
 }
 
+/// Loads durable events in delivery order during actor startup. These rows
+/// remain in the database until the consumer acknowledges them.
+pub async fn list_all(db: &SqlitePool) -> Result<Vec<PendingEvent>> {
+    let rows = sqlx::query_as::<_, PendingEvent>(
+        "SELECT id, event_type, payload, created_at FROM pending_events ORDER BY id ASC",
+    )
+    .fetch_all(db)
+    .await?;
+    Ok(rows)
+}
+
 pub async fn ack(db: &SqlitePool, id: i64) -> Result<bool> {
     let res = sqlx::query("DELETE FROM pending_events WHERE id = ?")
         .bind(id)

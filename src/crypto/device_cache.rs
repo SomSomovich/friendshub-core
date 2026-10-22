@@ -28,28 +28,25 @@ pub struct CachedDevice {
 
 /// Returns the recipient's device list, from cache when it is fresh.
 pub async fn get(state: &ActorState, account_id: &str) -> Result<Vec<CachedDevice>> {
-    let row: Option<(String, i64)> = sqlx::query_as(
-        "SELECT devices_json, fetched_at FROM device_cache WHERE account_id = ?",
-    )
-    .bind(account_id)
-    .fetch_optional(&state.db)
-    .await?;
+    let row: Option<(String, i64)> =
+        sqlx::query_as("SELECT devices_json, fetched_at FROM device_cache WHERE account_id = ?")
+            .bind(account_id)
+            .fetch_optional(&state.db)
+            .await?;
 
     if let Some((json, fetched_at)) = row
-        && now_unix() - fetched_at < CACHE_TTL_SECS {
-            let devices: Vec<CachedDevice> = serde_json::from_str(&json)
-                .map_err(|e| Error::InvalidPayload(format!("cached devices: {e}")))?;
-            return Ok(devices);
-        }
+        && now_unix() - fetched_at < CACHE_TTL_SECS
+    {
+        let devices: Vec<CachedDevice> = serde_json::from_str(&json)
+            .map_err(|e| Error::InvalidPayload(format!("cached devices: {e}")))?;
+        return Ok(devices);
+    }
 
     force_refresh(state, account_id).await
 }
 
 /// Fetches the device list regardless of cache state and stores it.
-pub async fn force_refresh(
-    state: &ActorState,
-    account_id: &str,
-) -> Result<Vec<CachedDevice>> {
+pub async fn force_refresh(state: &ActorState, account_id: &str) -> Result<Vec<CachedDevice>> {
     let devices = fetch_from_server(state, account_id).await?;
     let json = serde_json::to_string(&devices)?;
     let now = now_unix();
@@ -74,10 +71,7 @@ pub async fn invalidate(state: &ActorState, account_id: &str) -> Result<()> {
     Ok(())
 }
 
-async fn fetch_from_server(
-    state: &ActorState,
-    account_id: &str,
-) -> Result<Vec<CachedDevice>> {
+async fn fetch_from_server(state: &ActorState, account_id: &str) -> Result<Vec<CachedDevice>> {
     let token = bearer(state).await?;
     let path = format!("/api/v1/accounts/{account_id}/devices");
     let devices: Vec<CachedDevice> = state.http.get(&path, Some(&token)).await?;

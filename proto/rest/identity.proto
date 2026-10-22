@@ -1,0 +1,581 @@
+syntax = "proto3";
+
+package fh.rest.identity;
+
+// REST identity/authentication messages. UUIDs, FH numbers, hex keys, URLs,
+// and tokens remain strings because that is how the handlers represent them.
+// Unix timestamps and integer identifiers keep their signed/unsigned widths
+// from the Rust DTOs.
+
+// ---------- Authentication ----------
+
+message RegisterRequest {
+  // Required by the JSON handler; optional preserves missing-vs-empty.
+  optional string password = 1;
+}
+
+message RegisterResponse {
+  string id = 1;
+  int64 user_id = 2;
+  string fh_number = 3;
+  string username = 4;
+}
+
+message LoginRequest {
+  optional string fh_number = 1;
+  optional string password = 2;
+  optional int64 device_number = 3;
+}
+
+message Login2faRequest {
+  optional string challenge_token = 1;
+  optional string code = 2;
+  optional int64 device_number = 3;
+}
+
+// Mirrors serde's internally tagged enum: kind is "session" or
+// "totp_required", with only the corresponding variant fields present.
+message LoginResponse {
+  string kind = 1;
+  optional string session_token = 2;
+  optional int64 expires_at = 3;
+  optional string challenge_token = 4;
+  optional uint64 expires_in_seconds = 5;
+}
+
+message EnrollResponse {
+  string secret_base32 = 1;
+  string otpauth_uri = 2;
+}
+
+message EnrollVerifyRequest {
+  optional string code = 1;
+}
+
+message EnrollVerifyResponse {
+  repeated string backup_codes = 1;
+}
+
+message DisableRequest {
+  optional string password = 1;
+  optional string code = 2;
+}
+
+message MeResponse {
+  string id = 1;
+  int64 user_id = 2;
+  string fh_number = 3;
+  string username = 4;
+  optional string avatar_url = 5;
+  bool totp_enabled = 6;
+  optional string custom_status_text = 7;
+  optional string custom_status_emoji = 8;
+  optional int64 custom_status_expires_at = 9;
+}
+
+// ---------- Account deletion ----------
+
+message InitiateResponse {
+  int64 confirm_after = 1;
+  int64 confirm_until = 2;
+  int64 confirm_after_seconds = 3;
+  int64 confirm_window_seconds = 4;
+}
+
+message ConfirmRequest {
+  // Rust DTO fields are Option<String>; missing and null both mean None.
+  optional string password = 1;
+  optional string code = 2;
+}
+
+message StatusResponse {
+  bool pending = 1;
+  optional string account_id = 2;
+  optional int64 initiated_at = 3;
+  optional int64 confirm_after = 4;
+  optional int64 confirm_until = 5;
+}
+
+// ---------- Sessions ----------
+
+message SessionItem {
+  string id = 1;
+  optional string ip_address = 2;
+  optional string user_agent = 3;
+  int64 created_at = 4;
+  int64 expires_at = 5;
+  optional int64 revoked_at = 6;
+  bool is_current = 7;
+}
+
+message SessionsResponse {
+  // The existing handler returns Json<Vec<SessionItem>> (a top-level array).
+  repeated SessionItem items = 1;
+}
+
+message RevokeAllResponse {
+  uint64 revoked = 1;
+}
+
+// ---------- Contacts and blocks ----------
+
+message ContactItem {
+  string target_account_id = 1;
+  string local_username = 2;
+  int64 user_id = 3;
+  string fh_number = 4;
+  string username = 5;
+  optional string avatar_url = 6;
+}
+
+message ContactsResponse {
+  // Existing handler response is a top-level Vec<ContactItem>.
+  repeated ContactItem items = 1;
+}
+
+message AddContactRequest {
+  optional string target_fh_number = 1;
+  optional string local_username = 2;
+}
+
+message ContactSearchQuery {
+  optional string q = 1;
+  optional int64 limit = 2;
+}
+
+message BlockedItem {
+  string account_id = 1;
+  string fh_number = 2;
+  string username = 3;
+  optional string avatar_url = 4;
+  int64 blocked_at = 5;
+}
+
+message BlockedContactsResponse {
+  // Existing handler response is a top-level Vec<BlockedItem>.
+  repeated BlockedItem items = 1;
+}
+
+// ---------- Profile and privacy ----------
+
+message UpdateUsernameRequest {
+  optional string username = 1;
+}
+
+message UpdateStatusRequest {
+  optional string text = 1;
+  optional string emoji = 2;
+  optional int64 ttl_seconds = 3;
+}
+
+message InvisibleModeRequest {
+  optional bool enabled = 1;
+}
+
+message InvisibleModeResponse {
+  bool enabled = 1;
+}
+
+message PresenceExceptionRequest {
+  optional string target_account_id = 1;
+  optional string kind = 2;
+}
+
+message PresenceExceptionItem {
+  string target_account_id = 1;
+  string kind = 2;
+  int64 created_at = 3;
+}
+
+message PresenceExceptionsResponse {
+  // Existing handler response is a top-level Vec<ExceptionItem>.
+  repeated PresenceExceptionItem items = 1;
+}
+
+message ProfileField {
+  // Required when supplied to SetProfileFieldsRequest; presence distinguishes
+  // a missing value from an explicitly empty string.
+  optional string label = 1;
+  optional string value = 2;
+}
+
+message ProfileFieldList {
+  repeated ProfileField items = 1;
+}
+
+message PublicProfile {
+  string id = 1;
+  int64 user_id = 2;
+  string fh_number = 3;
+  string username = 4;
+  optional string avatar_url = 5;
+  optional string custom_status_text = 6;
+  optional string custom_status_emoji = 7;
+  optional int64 custom_status_expires_at = 8;
+  bool is_blocked_by_me = 9;
+  bool is_contact = 10;
+  repeated ProfileField profile_fields = 11;
+}
+
+message PresenceResponse {
+  string account_id = 1;
+  bool is_online = 2;
+  optional int64 last_seen = 3;
+  optional string custom_status_text = 4;
+  optional string custom_status_emoji = 5;
+  optional int64 custom_status_expires_at = 6;
+  bool visible = 7;
+}
+
+message GroupAddPolicyRequest {
+  optional string policy = 1;
+}
+
+message GroupAddPolicyResponse {
+  string policy = 1;
+}
+
+message GroupAddExceptionItem {
+  string account_id = 1;
+  int64 created_at = 2;
+}
+
+message GroupAddExceptionsResponse {
+  // Existing handler response is a top-level Vec<GroupAddExceptionItem>.
+  repeated GroupAddExceptionItem items = 1;
+}
+
+message GroupAddExceptionRequest {
+  optional string account_id = 1;
+}
+
+message AccountsBatchRequest {
+  // Required Rust Vec field: wrapper presence distinguishes omitted from empty.
+  StringList account_ids = 1;
+}
+
+message AccountBatchItem {
+  string account_id = 1;
+  int64 user_id = 2;
+  string fh_number = 3;
+  string username = 4;
+  optional string avatar_url = 5;
+  optional string custom_status_text = 6;
+  optional string custom_status_emoji = 7;
+  optional int64 custom_status_expires_at = 8;
+}
+
+message AccountsBatchResponse {
+  // Existing handler returns Json<Vec<AccountBatchItem>>.
+  repeated AccountBatchItem items = 1;
+}
+
+message ProfileFieldsResponse {
+  // Existing response is an object containing the fields array.
+  repeated ProfileField fields = 1;
+}
+
+message SetProfileFieldsRequest {
+  // Required Rust Vec field: wrapper presence distinguishes omitted from empty.
+  ProfileFieldList fields = 1;
+}
+
+message DmPolicyRequest {
+  optional string policy = 1;
+}
+
+message DmPolicyResponse {
+  string policy = 1;
+}
+
+message AllowNudgesResponse {
+  bool allow = 1;
+}
+
+message SetAllowNudgesRequest {
+  optional bool allow = 1;
+}
+
+message PrivacySettingsResponse {
+  bool hide_profile = 1;
+  bool hide_from_search = 2;
+}
+
+message ToggleRequest {
+  optional bool enabled = 1;
+}
+
+message ProfileExceptionItem {
+  string account_id = 1;
+  int64 created_at = 2;
+}
+
+message ProfileExceptionsResponse {
+  // Existing handler response is a top-level Vec<ProfileExceptionItem>.
+  repeated ProfileExceptionItem items = 1;
+}
+
+message ProfileExceptionRequest {
+  optional string account_id = 1;
+}
+
+// ---------- User-profile handles ----------
+
+message HandleLookupResponse {
+  string entity_type = 1;
+  string entity_id = 2;
+  string handle_display = 3;
+  string handle_normalized = 4;
+}
+
+message HandleAvailabilityResponse {
+  string handle = 1;
+  string normalized = 2;
+  bool available = 3;
+  string handle_kind = 4;
+}
+
+message BatchLookupRequest {
+  // Required Rust Vec field: wrapper presence distinguishes omitted from empty.
+  StringList handles = 1;
+}
+
+message BatchLookupItem {
+  string handle_input = 1;
+  string normalized = 2;
+  bool found = 3;
+  optional string entity_type = 4;
+  optional string entity_id = 5;
+  optional string handle_display = 6;
+  optional string handle_normalized = 7;
+}
+
+message BatchLookupResponse {
+  // Existing handler already returns an object containing `items`.
+  repeated BatchLookupItem items = 1;
+}
+
+// Nullable wrapper used only where the Rust request has a required Vec field.
+message StringList {
+  repeated string items = 1;
+}
+
+// ---------- Devices and prekeys ----------
+
+message RegisterDeviceRequest {
+  optional string name = 1;
+  optional int64 registration_id = 2;
+  optional string identity_key_pub = 3;
+}
+
+message DeviceItem {
+  string id = 1;
+  int64 device_number = 2;
+  string name = 3;
+  int64 registration_id = 4;
+  string identity_key_pub = 5;
+  int64 created_at = 6;
+  optional int64 last_seen_at = 7;
+}
+
+message DevicesResponse {
+  // Existing handler response is a top-level Vec<DeviceItem>.
+  repeated DeviceItem items = 1;
+}
+
+message PublicDeviceItem {
+  int64 device_number = 1;
+  int64 registration_id = 2;
+  string identity_key_pub = 3;
+}
+
+message PublicDevicesResponse {
+  // Existing handler response is a top-level Vec<PublicDeviceItem>.
+  repeated PublicDeviceItem items = 1;
+}
+
+message PrekeyRef {
+  optional int64 id = 1;
+  // Serde explicitly renames `public_key` to the JSON key `pub`.
+  optional string public_key = 2 [json_name = "pub"];
+}
+
+message SignedPrekeyRef {
+  optional int64 id = 1;
+  optional string public_key = 2 [json_name = "pub"];
+  optional string sig = 3;
+}
+
+message UploadPrekeysRequest {
+  SignedPrekeyRef signed_prekey = 1;
+  SignedPrekeyRef kyber_last_resort = 2;
+  // Serde defaults both arrays to empty when omitted, so these remain repeated.
+  repeated PrekeyRef one_time_prekeys = 3;
+  repeated PrekeyRef kyber_one_time_prekeys = 4;
+}
+
+message UploadPrekeysResponse {
+  uint64 one_time_inserted = 1;
+  uint64 kyber_one_time_inserted = 2;
+}
+
+message PrekeyStatusResponse {
+  int64 one_time_available = 1;
+  int64 kyber_one_time_available = 2;
+  bool has_signed_prekey = 3;
+  bool has_kyber_last_resort = 4;
+}
+
+message PrekeyBundleResponse {
+  string account_id = 1;
+  int64 device_number = 2;
+  int64 registration_id = 3;
+  string identity_key_pub = 4;
+  SignedPrekeyRef signed_prekey = 5;
+  SignedPrekeyRef kyber_last_resort = 6;
+  PrekeyRef one_time_prekey = 7;
+  PrekeyRef kyber_one_time_prekey = 8;
+}
+
+// ---------- Security events ----------
+
+message SecurityEventsQuery {
+  optional int64 limit = 1;
+}
+
+message SecurityEventItem {
+  string id = 1;
+  string event_type = 2;
+  optional string ip_address = 3;
+  optional string user_agent = 4;
+  optional string metadata = 5;
+  int64 created_at = 6;
+}
+
+message SecurityEventsResponse {
+  // Existing handler response is a top-level Vec<EventItem>.
+  repeated SecurityEventItem items = 1;
+}
+
+// ---------- Web Push ----------
+
+message VapidResponse {
+  string public_key = 1;
+  string subject = 2;
+}
+
+message SubscribeRequest {
+  SubscriptionPayload subscription = 1;
+  optional string user_agent = 2;
+}
+
+message SubscriptionPayload {
+  optional string endpoint = 1;
+  SubscriptionKeys keys = 2;
+}
+
+message SubscriptionKeys {
+  optional string p256dh = 1;
+  optional string auth = 2;
+}
+
+message UnsubscribeRequest {
+  optional string endpoint = 1;
+}
+
+// ---------- Avatars ----------
+
+message AvatarUploadInitRequest {
+  optional uint64 size_bytes = 1;
+}
+
+message AvatarUploadInitResponse {
+  string upload_id = 1;
+  uint64 size_bytes = 2;
+  string url = 3;
+}
+
+message AvatarUrlResponse {
+  string avatar_url = 1;
+}
+
+// Route map for handlers in auth.rs, account_deletion.rs, sessions.rs,
+// contacts.rs, profile.rs, user_profiles.rs, devices.rs, prekeys.rs,
+// security.rs, and push.rs. The existing JSON body shape is noted where it
+// differs from the new protobuf response envelope. Path/query-only routes do
+// not have a body request message. HTTP 204 responses have no protobuf body.
+//
+// POST   /register                                               RegisterRequest -> RegisterResponse (201)
+// POST   /login                                                  LoginRequest -> LoginResponse (200)
+// POST   /login/2fa                                              Login2faRequest -> LoginResponse (200)
+// POST   /logout                                                 no request -> no body (204)
+// GET    /me                                                     no request -> MeResponse (200)
+// POST   /2fa/enroll                                             no request -> EnrollResponse (200)
+// POST   /2fa/enroll/verify                                      EnrollVerifyRequest -> EnrollVerifyResponse (200)
+// POST   /2fa/disable                                            DisableRequest -> no body (204)
+// POST   /account/delete/initiate                                no request -> InitiateResponse (200)
+// POST   /account/delete/confirm                                 ConfirmRequest -> no body (204)
+// POST   /account/delete/cancel                                  no request -> no body (204)
+// GET    /account/delete/status                                  no request -> StatusResponse (200)
+// GET    /sessions                                               no request -> SessionsResponse; existing JSON was Vec<SessionItem> (200)
+// DELETE /sessions/{id}                                          path id only -> no body (204)
+// POST   /sessions/revoke-all                                    no request -> RevokeAllResponse (200)
+// GET    /contacts                                               no request -> ContactsResponse; existing JSON was Vec<ContactItem> (200)
+// POST   /contacts                                               AddContactRequest -> ContactItem (201)
+// GET    /contacts/search                                        ContactSearchQuery -> ContactsResponse; existing JSON was Vec<ContactItem> (200)
+// DELETE /contacts/{id}                                          path id only -> no body (204)
+// GET    /blocks                                                 no request -> BlockedContactsResponse; existing JSON was Vec<BlockedItem> (200)
+// POST   /blocks/{id}                                            path id only -> no body (204)
+// DELETE /blocks/{id}                                            path id only -> no body (204)
+// PUT    /profile/username                                       UpdateUsernameRequest -> no body (204)
+// PUT    /profile/status                                         UpdateStatusRequest -> no body (204)
+// DELETE /profile/status                                         no request -> no body (204)
+// PUT    /profile/invisible                                      InvisibleModeRequest -> no body (204)
+// GET    /profile/invisible                                      no request -> InvisibleModeResponse (200)
+// GET    /profile/presence-exceptions                            no request -> PresenceExceptionsResponse; existing JSON was Vec<ExceptionItem> (200)
+// POST   /profile/presence-exceptions                            PresenceExceptionRequest -> no body (204)
+// POST   /profile/presence-exceptions/remove                     PresenceExceptionRequest -> no body (204)
+// GET    /accounts/{id}/profile                                  path id only -> PublicProfile (200)
+// GET    /accounts/{id}/presence                                 path id only -> PresenceResponse (200)
+// POST   /accounts/batch                                         AccountsBatchRequest -> AccountsBatchResponse; existing JSON was Vec<AccountBatchItem> (200)
+// GET    /profile/group-add-policy                               no request -> GroupAddPolicyResponse (200)
+// PUT    /profile/group-add-policy                               GroupAddPolicyRequest -> no body (204)
+// GET    /profile/group-add-exceptions                           no request -> GroupAddExceptionsResponse; existing JSON was Vec<GroupAddExceptionItem> (200)
+// POST   /profile/group-add-exceptions                           GroupAddExceptionRequest -> no body (204)
+// DELETE /profile/group-add-exceptions/{account_id}              path account_id only -> no body (204)
+// GET    /profile/fields                                         no request -> ProfileFieldsResponse (200)
+// PUT    /profile/fields                                         SetProfileFieldsRequest -> no body (204)
+// GET    /profile/dm-policy                                      no request -> DmPolicyResponse (200)
+// PUT    /profile/dm-policy                                      DmPolicyRequest -> no body (204)
+// GET    /profile/allow-nudges                                   no request -> AllowNudgesResponse (200)
+// PUT    /profile/allow-nudges                                   SetAllowNudgesRequest -> no body (204)
+// GET    /profile/privacy                                        no request -> PrivacySettingsResponse (200)
+// PUT    /profile/privacy/hide-profile                           ToggleRequest -> no body (204)
+// PUT    /profile/privacy/hide-from-search                       ToggleRequest -> no body (204)
+// GET    /profile/privacy/profile-exceptions                     no request -> ProfileExceptionsResponse; existing JSON was Vec<ProfileExceptionItem> (200)
+// POST   /profile/privacy/profile-exceptions                     ProfileExceptionRequest -> no body (204)
+// DELETE /profile/privacy/profile-exceptions/{account_id}        path account_id only -> no body (204)
+// GET    /handles/{handle}                                       path handle only -> HandleLookupResponse (200)
+// GET    /handles/{handle}/available                             path handle only -> HandleAvailabilityResponse (200)
+// POST   /handles/batch                                          BatchLookupRequest -> BatchLookupResponse (200; existing JSON object contains items)
+// GET    /devices                                                no request -> DevicesResponse; existing JSON was Vec<DeviceItem> (200)
+// POST   /devices                                                RegisterDeviceRequest -> DeviceItem (201)
+// DELETE /devices/{id}                                           path id only -> no body (204)
+// GET    /accounts/{account_id}/devices                          path account_id only -> PublicDevicesResponse; existing JSON was Vec<PublicDeviceItem> (200)
+// POST   /devices/me/prekeys                                     UploadPrekeysRequest -> UploadPrekeysResponse (200)
+// GET    /devices/me/prekeys/status                              no request -> PrekeyStatusResponse (200)
+// GET    /accounts/{account_id}/devices/{device_number}/bundle   path account_id and device_number only -> PrekeyBundleResponse (200)
+// GET    /security/events                                        SecurityEventsQuery -> SecurityEventsResponse; existing JSON was Vec<EventItem> (200)
+// GET    /push/vapid                                             no request -> VapidResponse (200; public route)
+// POST   /push/subscribe                                         SubscribeRequest -> no body (201)
+// DELETE /push/subscribe                                         UnsubscribeRequest -> no body (204)
+// POST   /avatars/me/uploads                                     AvatarUploadInitRequest -> AvatarUploadInitResponse (201)
+// POST   /avatars/me/uploads/{id}/finalize                       path id, no request body -> AvatarUrlResponse (200)
+// POST   /avatars/me                                             raw image/webp bytes -> AvatarUrlResponse (200; raw upload body remains outside protobuf)
+// DELETE /avatars/me                                             no request -> no body (204)
+// POST   /groups/{id}/avatar                                     path id + raw image/webp bytes -> AvatarUrlResponse (200; raw upload body remains outside protobuf)
+// DELETE /groups/{id}/avatar                                     path id only -> no body (204)
+// POST   /channels/{id}/avatar                                   path id + raw image/webp bytes -> AvatarUrlResponse (200; raw upload body remains outside protobuf)
+// DELETE /channels/{id}/avatar                                   path id only -> no body (204)
+// GET    /avatars/{account_id}                                   path account_id only -> HTTP 307 redirect to image/webp; no protobuf body
+// GET    /conversations/{id}/avatar                              path id only -> raw image/webp bytes; no protobuf body

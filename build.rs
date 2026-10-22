@@ -40,17 +40,45 @@ fn main() {
     }
 
     println!("cargo:rerun-if-changed={}", proto_file.display());
+    for rest_file in [
+        "common.proto",
+        "identity.proto",
+        "chat.proto",
+        "community.proto",
+    ] {
+        let rest_path = proto_dir.join("rest").join(rest_file);
+        if !rest_path.is_file() {
+            panic!("REST protobuf schema not found: {}", rest_path.display());
+        }
+        println!("cargo:rerun-if-changed={}", rest_path.display());
+    }
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-env-changed=FRIENDSHUB_PROTO_DIR");
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR is always set by cargo"));
 
-    let file_name = "friendshub.proto";
-
     let mut config = prost_build::Config::new();
     config.out_dir(&out_dir);
+    config.type_attribute(
+        ".fh.rest",
+        "#[derive(serde::Serialize, serde::Deserialize)]",
+    );
+    config.type_attribute(
+        ".fh.rest",
+        "#[serde(rename_all = \"camelCase\", deny_unknown_fields)]",
+    );
+    config.field_attribute(".fh.rest", "#[serde(default)]");
     config
-        .compile_protos(&[file_name], &[proto_dir.as_path()])
+        .compile_protos(
+            &[
+                proto_file.as_path(),
+                proto_dir.join("rest/common.proto").as_path(),
+                proto_dir.join("rest/identity.proto").as_path(),
+                proto_dir.join("rest/chat.proto").as_path(),
+                proto_dir.join("rest/community.proto").as_path(),
+            ],
+            &[proto_dir.as_path()],
+        )
         .unwrap_or_else(|e| panic!("prost-build failed to compile friendshub.proto: {e}"));
 
     let generated = out_dir.join("fh.rs");

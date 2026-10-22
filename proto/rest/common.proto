@@ -1,0 +1,27 @@
+syntax = "proto3";
+
+package fh.rest;
+
+// Standard error response returned by the REST API when the HTTP status is
+// not successful. Retry timing remains in the Retry-After header.
+message ErrorResponse {
+  string error = 1;
+  string message = 2;
+  ErrorDetails details = 3;
+}
+
+message ErrorDetails {
+  optional int64 one_time_available = 1;
+  optional int64 kyber_one_time_available = 2;
+  optional int64 minimum_required = 3;
+}
+
+// Public process and database status. /health remains an HTTP GET, but its
+// body uses the same protobuf media type as the first-party REST API.
+message HealthResponse {
+  string status = 1;
+  string version = 2;
+  uint64 uptime_secs = 3;
+  string database = 4;
+  int64 timestamp = 5;
+}

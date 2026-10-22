@@ -91,7 +91,10 @@ pub struct ApplyAnswerRequest {
 
 pub async fn apply_answer(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
     let req: ApplyAnswerRequest = serde_json::from_slice(&payload)?;
-    state.webrtc.apply_answer(&req.call_id, &req.remote_sdp).await?;
+    state
+        .webrtc
+        .apply_answer(&req.call_id, &req.remote_sdp)
+        .await?;
     Ok(br#"{"ok":true}"#.to_vec())
 }
 
@@ -161,7 +164,7 @@ pub async fn initiate_call(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<
         &req.recipient_account_id,
         &req.call_id,
         &sdp,
-)
+    )
     .await?;
     Ok(serde_json::to_vec(&serde_json::json!({
         "call_id": req.call_id,
@@ -189,7 +192,7 @@ pub async fn accept_call(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Ve
         &req.recipient_account_id,
         &req.call_id,
         &sdp,
-)
+    )
     .await?;
     Ok(serde_json::to_vec(&serde_json::json!({
         "call_id": req.call_id,
@@ -216,7 +219,7 @@ pub async fn send_ice(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u
         &req.recipient_account_id,
         &req.call_id,
         req.candidate,
-)
+    )
     .await?;
     Ok(serde_json::to_vec(&serde_json::json!({
         "envelopes_sent": sent.len(),
@@ -238,7 +241,7 @@ pub async fn hangup(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>
         &req.recipient_account_id,
         &req.call_id,
         req.reason.as_deref(),
-)
+    )
     .await?;
     Ok(serde_json::to_vec(&serde_json::json!({
         "envelopes_sent": sent.len(),
@@ -259,7 +262,7 @@ pub async fn reject(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>
         &req.recipient_account_id,
         &req.call_id,
         req.reason.as_deref(),
-)
+    )
     .await?;
     Ok(serde_json::to_vec(&serde_json::json!({
         "envelopes_sent": sent.len(),

@@ -9,9 +9,9 @@
 use std::time::SystemTime;
 
 use libsignal_protocol::{
-    message_decrypt, message_encrypt, process_prekey_bundle, CiphertextMessage, DeviceId,
-    IdentityKey, KyberPreKeyId, PreKeyBundle, PreKeyId, PreKeySignalMessage, ProtocolAddress,
-    PublicKey, SignalMessage, SignedPreKeyId,
+    CiphertextMessage, DeviceId, IdentityKey, KyberPreKeyId, PreKeyBundle, PreKeyId,
+    PreKeySignalMessage, ProtocolAddress, PublicKey, SignalMessage, SignedPreKeyId,
+    message_decrypt, message_encrypt, process_prekey_bundle,
 };
 
 use crate::crypto::error::{CryptoError, CryptoResult};
@@ -52,15 +52,15 @@ pub async fn has_session(
 }
 
 fn bundle_from_json(v: &serde_json::Value) -> CryptoResult<PreKeyBundle> {
-    let registration_id = v
-        .get("registration_id")
-        .and_then(|x| x.as_u64())
-        .ok_or_else(|| CryptoError::Invalid("registration_id missing".into()))? as u32;
+    let registration_id =
+        v.get("registration_id")
+            .and_then(|x| x.as_u64())
+            .ok_or_else(|| CryptoError::Invalid("registration_id missing".into()))? as u32;
 
-    let device_number = v
-        .get("device_number")
-        .and_then(|x| x.as_u64())
-        .ok_or_else(|| CryptoError::Invalid("device_number missing".into()))? as u32;
+    let device_number =
+        v.get("device_number")
+            .and_then(|x| x.as_u64())
+            .ok_or_else(|| CryptoError::Invalid("device_number missing".into()))? as u32;
     let device_id = DeviceId::try_from(device_number)
         .map_err(|e| CryptoError::Invalid(format!("device_id: {e}")))?;
 
@@ -70,8 +70,8 @@ fn bundle_from_json(v: &serde_json::Value) -> CryptoResult<PreKeyBundle> {
         .ok_or_else(|| CryptoError::Invalid("identity_key_pub missing".into()))?;
     let identity_key_bytes = hex::decode(identity_key_hex)
         .map_err(|e| CryptoError::Invalid(format!("identity_key_pub hex: {e}")))?;
-    let identity_key = IdentityKey::decode(&identity_key_bytes)
-        .map_err(|e| CryptoError::Signal(e.to_string()))?;
+    let identity_key =
+        IdentityKey::decode(&identity_key_bytes).map_err(|e| CryptoError::Signal(e.to_string()))?;
 
     let signed = v
         .get("signed_prekey")
@@ -79,7 +79,8 @@ fn bundle_from_json(v: &serde_json::Value) -> CryptoResult<PreKeyBundle> {
     let signed_id = signed
         .get("id")
         .and_then(|x| x.as_u64())
-        .ok_or_else(|| CryptoError::Invalid("signed_prekey.id missing".into()))? as u32;
+        .ok_or_else(|| CryptoError::Invalid("signed_prekey.id missing".into()))?
+        as u32;
     let signed_pub_hex = signed
         .get("pub")
         .and_then(|x| x.as_str())
@@ -159,7 +160,7 @@ pub async fn establish_outbound_session(
     // Rust will not allow two mutable borrows of the same value in one call.
     let mut session_store = Store::new(state.db.clone());
     let mut identity_store = Store::new(state.db.clone());
-    let mut rng = rand::rng();
+    let mut rng = signal_rand::rng();
 
     process_prekey_bundle(
         &remote,
@@ -191,7 +192,7 @@ pub async fn encrypt_for_device(
 
     let mut session_store = Store::new(state.db.clone());
     let mut identity_store = Store::new(state.db.clone());
-    let mut rng = rand::rng();
+    let mut rng = signal_rand::rng();
 
     let msg = message_encrypt(
         plaintext,
@@ -226,7 +227,8 @@ pub async fn decrypt_envelope(
     let sender_device = envelope
         .get("sender_device_number")
         .and_then(|x| x.as_u64())
-        .ok_or_else(|| CryptoError::Invalid("sender_device_number missing".into()))? as u32;
+        .ok_or_else(|| CryptoError::Invalid("sender_device_number missing".into()))?
+        as u32;
     let is_prekey = envelope
         .get("is_prekey_message")
         .and_then(|x| x.as_bool())
@@ -259,7 +261,7 @@ pub async fn decrypt_envelope(
     let mut pre_key_store = Store::new(state.db.clone());
     let signed_pre_key_store = Store::new(state.db.clone());
     let mut kyber_store = Store::new(state.db.clone());
-    let mut rng = rand::rng();
+    let mut rng = signal_rand::rng();
 
     let plaintext = message_decrypt(
         &ciphertext,

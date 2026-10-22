@@ -1,6 +1,6 @@
 # FriendsHub Core - C ABI reference
 
-Everything a consumer needs: the eight entry points, the JSON shape of a
+Everything a consumer needs: the entry points, the JSON shape of a
 configuration, the full method id table, and worked examples.
 
 ## Entry points
@@ -24,8 +24,19 @@ int32_t fh_poll_event(
 
 int32_t fh_ack_event(FhHandle* handle, uint64_t event_id);
 
+int32_t fh_set_event_callbacks(
+    FhHandle* handle, const FhEventCallbacks* callbacks, void* user_data);
+
 void fh_buffer_free(FhBuffer* buf);
 ```
+
+`fh_set_event_callbacks` installs one optional callback per event kind. Pass
+`NULL` for `callbacks` to clear the handler and return future events to the
+pull queue. Callbacks run serially on the library-owned worker thread and may
+reenter `fh_call`. Each receives an `FhEventView`; its JSON pointer is borrowed
+until the callback returns, so the consumer never allocates or frees event
+payload memory. Keep `user_data` alive until callbacks drain during clear or
+destroy.
 
 Every function returns `int32_t`: 0 on success, non-zero on failure. On
 failure the out buffer carries a JSON `{ "code": "...", "message": "..." }`.
@@ -57,7 +68,7 @@ so existing IDs never move.
 
 | Range | Area |
 |---|---|
-| `0x0000_xxxx` | service (ping, version, poll_event, ack_event) |
+| `0x0000_xxxx` | service (ping, version, poll_event, ack_event, event callback activation) |
 | `0x0001_xxxx` | auth |
 | `0x0002_xxxx` | contacts, blocks |
 | `0x0003_xxxx` | conversations |
@@ -76,6 +87,7 @@ so existing IDs never move.
 | `0x0010_xxxx` | handles |
 | `0x0011_xxxx` | TURN credentials |
 | `0x0012_xxxx` | WebRTC calls |
+| `0x0013_xxxx` | conversation history, pins, polls, folders, scheduled messages, search |
 | `0x00FF_xxxx` | websocket lifecycle |
 
 ### Service
@@ -86,6 +98,7 @@ so existing IDs never move.
 | `0x0000_0002` | (empty) | server version, urls, ws state |
 | `0x0000_0003` | (usually via fh_poll_event) | next event or empty |
 | `0x0000_0004` | `{"event_id": N}` | `{"acked":true}` |
+| `0x0000_0005` | internal | activates PUSH delivery and drains queued events; called by the client facades |
 
 ### Auth
 
@@ -112,6 +125,10 @@ so existing IDs never move.
 | `0x00FF_0001` | (empty) | start the connect loop |
 | `0x00FF_0002` | (empty) | stop the loop |
 | `0x00FF_0003` | envelope JSON | send one envelope |
+| `0x00FF_0004` | typing JSON | send typing state |
+| `0x00FF_0005` | nudge JSON | send a nudge |
+| `0x00FF_0006` | history request JSON | request conversation history |
+| `0x00FF_0007` | `{"timeout_ms":5000}` or empty | send a protobuf ping and return round-trip milliseconds |
 
 ### Messages (Signal Protocol)
 

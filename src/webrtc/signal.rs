@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api::common::bearer;
 use crate::crypto::device_cache;
-use crate::crypto::send::{send_one, SentEnvelope};
+use crate::crypto::send::{SentEnvelope, send_one};
 use crate::db::auth as db_auth;
 use crate::error::{Error, Result};
 use crate::runtime::ActorState;
@@ -69,7 +69,7 @@ async fn send_to_recipient(
             payload,
             envelope_type,
             None,
-)
+        )
         .await
         {
             Ok(info) => sent.push(info),
@@ -95,7 +95,9 @@ pub async fn send_call_offer(
     let payload = serde_json::to_vec(&signal)?;
     let (sent, errs) = send_to_recipient(state, recipient_account_id, &payload, CALL_OFFER).await?;
     if sent.is_empty() && !errs.is_empty() {
-        return Err(Error::Internal(format!("all recipient devices failed: {errs:?}")));
+        return Err(Error::Internal(format!(
+            "all recipient devices failed: {errs:?}"
+        )));
     }
     Ok(sent)
 }

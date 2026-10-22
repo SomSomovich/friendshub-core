@@ -28,7 +28,10 @@ pub struct ChannelResponse {
 pub async fn create(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
     let token = bearer(state).await?;
     let req: CreateChannelRequest = serde_json::from_slice(&payload)?;
-    let resp: ChannelResponse = state.http.post("/api/v1/channels", &req, Some(&token)).await?;
+    let resp: ChannelResponse = state
+        .http
+        .post("/api/v1/channels", &req, Some(&token))
+        .await?;
     Ok(serde_json::to_vec(&resp)?)
 }
 
@@ -167,7 +170,10 @@ pub async fn subscribe(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<
     let v: serde_json::Value = serde_json::from_slice(&payload)?;
     let id = id_from(&v)?;
     let path = format!("/api/v1/channels/{id}/subscribe");
-    let _: serde_json::Value = state.http.post(&path, &serde_json::json!({}), Some(&token)).await?;
+    let _: serde_json::Value = state
+        .http
+        .post(&path, &serde_json::json!({}), Some(&token))
+        .await?;
     Ok(br#"{"subscribed":true}"#.to_vec())
 }
 

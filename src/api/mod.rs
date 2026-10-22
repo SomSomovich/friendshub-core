@@ -1,6 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::db::pending_events;
 use crate::error::{Error, Result};
 use crate::events::types::Event;
 use crate::runtime::ActorState;
@@ -13,11 +14,13 @@ pub mod bots;
 pub mod calls;
 pub mod channel_posts;
 pub mod channels;
+pub mod chat_extras;
 pub mod common;
+pub mod community_extras;
 pub mod contacts;
 pub mod conversations;
-pub mod device_init;
 pub mod device_cache_api;
+pub mod device_init;
 pub mod devices;
 pub mod groups;
 pub mod groups_send;
@@ -26,24 +29,26 @@ pub mod message_actions;
 pub mod messages;
 pub mod prekeys;
 pub mod profile;
+pub mod profile_extras;
 pub mod sessions;
 pub mod twofa;
 pub mod user_profiles;
 pub mod webrtc;
-pub mod webrtc_video;
 pub mod webrtc_data;
+pub mod webrtc_video;
 pub mod ws;
 
 pub struct DispatchMarker;
 
 /// Method IDs are namespaced by area. See docs/ffi.md for the full table.
 pub async fn dispatch(state: Arc<ActorState>, method: u32, payload: Vec<u8>) -> Result<Vec<u8>> {
-    match method {
+    let result = match method {
         // service
         0x0000_0001 => ping().await,
         0x0000_0002 => version(&state).await,
         0x0000_0003 => poll_event(&state, &payload).await,
         0x0000_0004 => ws::ack_event(&state, payload).await,
+        0x0000_0005 => activate_push(&state).await,
 
         // auth
         0x0001_0001 => auth::register(&state, payload).await,
@@ -62,6 +67,7 @@ pub async fn dispatch(state: Arc<ActorState>, method: u32, payload: Vec<u8>) -> 
         0x0002_0004 => contacts::block(&state, payload).await,
         0x0002_0005 => contacts::unblock(&state, payload).await,
         0x0002_0006 => contacts::list_blocked(&state, payload).await,
+        0x0002_0007 => chat_extras::contact_search(&state, payload).await,
 
         // conversations
         0x0003_0001 => conversations::list(&state, payload).await,
@@ -72,6 +78,9 @@ pub async fn dispatch(state: Arc<ActorState>, method: u32, payload: Vec<u8>) -> 
         0x0003_0006 => conversations::unarchive(&state, payload).await,
         0x0003_0007 => conversations::mute(&state, payload).await,
         0x0003_0008 => conversations::unmute(&state, payload).await,
+        0x0003_0009 => chat_extras::conversation_envelopes(&state, payload).await,
+        0x0003_000A => chat_extras::conversation_reads(&state, payload).await,
+        0x0003_000B => chat_extras::conversation_mark_read(&state, payload).await,
 
         // messages
         0x0004_0001 => messages::establish_session(&state, payload).await,
@@ -133,6 +142,10 @@ pub async fn dispatch(state: Arc<ActorState>, method: u32, payload: Vec<u8>) -> 
         0x0009_0009 => channels::can_publish(&state, payload).await,
         0x0009_000A => channels::subscribe(&state, payload).await,
         0x0009_000B => channels::unsubscribe(&state, payload).await,
+        0x0009_000C => community_extras::get_channel(&state, payload).await,
+        0x0009_000D => community_extras::list_public_channels(&state, payload).await,
+        0x0009_000E => community_extras::lookup_channel_by_handle(&state, payload).await,
+        0x0009_000F => community_extras::delete_channel(&state, payload).await,
         0x0009_0010 => channel_posts::publish(&state, payload).await,
         0x0009_0011 => channel_posts::list(&state, payload).await,
         0x0009_0012 => channel_posts::edit(&state, payload).await,
@@ -144,6 +157,8 @@ pub async fn dispatch(state: Arc<ActorState>, method: u32, payload: Vec<u8>) -> 
         0x0009_0018 => channel_posts::unpin(&state, payload).await,
         0x0009_0019 => channel_posts::list_pinned(&state, payload).await,
         0x0009_001A => channel_posts::get_discussion(&state, payload).await,
+        0x0009_001B => community_extras::transfer_channel_owner(&state, payload).await,
+        0x0009_001C => community_extras::get_channel_analytics(&state, payload).await,
 
         // groups
         0x000A_0001 => groups::create(&state, payload).await,
@@ -154,6 +169,17 @@ pub async fn dispatch(state: Arc<ActorState>, method: u32, payload: Vec<u8>) -> 
         0x000A_0006 => groups::set_role(&state, payload).await,
         0x000A_0007 => groups::mute_member(&state, payload).await,
         0x000A_0008 => groups::set_user_profile(&state, payload).await,
+        0x000A_0009 => community_extras::get_group(&state, payload).await,
+        0x000A_000A => community_extras::update_group(&state, payload).await,
+        0x000A_000B => community_extras::delete_group(&state, payload).await,
+        0x000A_000C => community_extras::transfer_group_owner(&state, payload).await,
+        0x000A_000D => community_extras::add_group_member(&state, payload).await,
+        0x000A_000E => community_extras::remove_group_member(&state, payload).await,
+        0x000A_000F => community_extras::set_group_member_tag(&state, payload).await,
+        0x000A_0010 => community_extras::remove_group_member_tag(&state, payload).await,
+        0x000A_0011 => community_extras::list_group_bans(&state, payload).await,
+        0x000A_0012 => community_extras::ban_group_member(&state, payload).await,
+        0x000A_0013 => community_extras::unban_group_member(&state, payload).await,
         0x000A_0020 => groups_send::create_distribution(&state, payload).await,
         0x000A_0021 => groups_send::send_group_message(&state, payload).await,
 
@@ -179,6 +205,32 @@ pub async fn dispatch(state: Arc<ActorState>, method: u32, payload: Vec<u8>) -> 
         0x000D_0007 => profile::remove_exception(&state, payload).await,
         0x000D_0008 => profile::get_public_profile(&state, payload).await,
         0x000D_0009 => profile::get_presence(&state, payload).await,
+        0x000D_0010 => profile_extras::get_privacy(&state, payload).await,
+        0x000D_0011 => profile_extras::set_profile_hidden(&state, payload).await,
+        0x000D_0012 => profile_extras::set_hidden_from_search(&state, payload).await,
+        0x000D_0013 => profile_extras::list_profile_exceptions(&state, payload).await,
+        0x000D_0014 => profile_extras::add_profile_exception(&state, payload).await,
+        0x000D_0015 => profile_extras::remove_profile_exception(&state, payload).await,
+        0x000D_0016 => profile_extras::get_profile_fields(&state, payload).await,
+        0x000D_0017 => profile_extras::set_profile_fields(&state, payload).await,
+        0x000D_0018 => profile_extras::get_dm_policy(&state, payload).await,
+        0x000D_0019 => profile_extras::set_dm_policy(&state, payload).await,
+        0x000D_001A => profile_extras::get_group_add_policy(&state, payload).await,
+        0x000D_001B => profile_extras::set_group_add_policy(&state, payload).await,
+        0x000D_001C => profile_extras::list_group_add_exceptions(&state, payload).await,
+        0x000D_001D => profile_extras::add_group_add_exception(&state, payload).await,
+        0x000D_001E => profile_extras::remove_group_add_exception(&state, payload).await,
+        0x000D_001F => profile_extras::get_allow_nudges(&state, payload).await,
+        0x000D_0020 => profile_extras::set_allow_nudges(&state, payload).await,
+        0x000D_0021 => profile_extras::get_discover_profile(&state, payload).await,
+        0x000D_0022 => profile_extras::save_discover_profile(&state, payload).await,
+        0x000D_0023 => profile_extras::hide_discover_profile(&state, payload).await,
+        0x000D_0024 => profile_extras::list_discover_profiles(&state, payload).await,
+        0x000D_0025 => profile_extras::get_discover_profile_details(&state, payload).await,
+        0x000D_0026 => profile_extras::get_vapid(&state, payload).await,
+        0x000D_0027 => profile_extras::subscribe_push(&state, payload).await,
+        0x000D_0028 => profile_extras::unsubscribe_push(&state, payload).await,
+        0x000D_0029 => profile_extras::list_security_events(&state, payload).await,
 
         // account deletion
         0x000E_0001 => account_deletion::initiate(&state, payload).await,
@@ -195,6 +247,30 @@ pub async fn dispatch(state: Arc<ActorState>, method: u32, payload: Vec<u8>) -> 
         0x0010_0001 => user_profiles::lookup(&state, payload).await,
         0x0010_0002 => user_profiles::check_available(&state, payload).await,
         0x0010_0003 => user_profiles::batch_lookup(&state, payload).await,
+
+        // conversation extensions
+        0x0013_0001 => chat_extras::conversation_pins_list(&state, payload).await,
+        0x0013_0002 => chat_extras::conversation_pin(&state, payload).await,
+        0x0013_0003 => chat_extras::conversation_unpin(&state, payload).await,
+        0x0013_0004 => chat_extras::conversation_polls_list(&state, payload).await,
+        0x0013_0005 => chat_extras::poll_get(&state, payload).await,
+        0x0013_0006 => chat_extras::poll_create(&state, payload).await,
+        0x0013_0007 => chat_extras::poll_vote(&state, payload).await,
+        0x0013_0008 => chat_extras::poll_stop(&state, payload).await,
+        0x0013_0009 => chat_extras::poll_delete(&state, payload).await,
+        0x0013_000A => chat_extras::poll_add_option(&state, payload).await,
+        0x0013_000B => chat_extras::poll_delete_option(&state, payload).await,
+        0x0013_000C => chat_extras::saved_conversation(&state, payload).await,
+        0x0013_000D => chat_extras::saved_messages(&state, payload).await,
+        0x0013_000E => chat_extras::folders_list(&state, payload).await,
+        0x0013_000F => chat_extras::folder_create(&state, payload).await,
+        0x0013_0010 => chat_extras::folder_update(&state, payload).await,
+        0x0013_0011 => chat_extras::folder_delete(&state, payload).await,
+        0x0013_0012 => chat_extras::folder_add_conversation(&state, payload).await,
+        0x0013_0013 => chat_extras::folder_remove_conversation(&state, payload).await,
+        0x0013_0014 => chat_extras::scheduled_list(&state, payload).await,
+        0x0013_0015 => chat_extras::scheduled_cancel(&state, payload).await,
+        0x0013_0016 => chat_extras::global_search(&state, payload).await,
 
         // webrtc
         0x0011_0001 => webrtc::ice_servers(&state, payload).await,
@@ -222,9 +298,52 @@ pub async fn dispatch(state: Arc<ActorState>, method: u32, payload: Vec<u8>) -> 
         0x00FF_0001 => ws::start(&state).await,
         0x00FF_0002 => ws::stop(&state).await,
         0x00FF_0003 => ws::send_envelope(&state, payload).await,
+        0x00FF_0004 => ws::send_typing(&state, payload).await,
+        0x00FF_0005 => ws::send_nudge(&state, payload).await,
+        0x00FF_0006 => ws::request_history(&state, payload).await,
+        0x00FF_0007 => ws::ping(&state, payload).await,
 
         _ => Err(Error::UnknownMethod(method)),
+    };
+    emit_pending_identity_changes(&state).await;
+    result
+}
+
+/// Restores durable events into the in-memory queue before the actor becomes
+/// available. The rows remain in SQLite until the consumer acknowledges them.
+pub(crate) async fn restore_pending_events(state: &ActorState) -> Result<()> {
+    for row in pending_events::list_all(&state.db).await? {
+        let event_id = match u64::try_from(row.id) {
+            Ok(id) => id,
+            Err(_) => {
+                tracing::warn!(event_id = row.id, "ignoring pending event with invalid ID");
+                continue;
+            }
+        };
+        let payload = match serde_json::from_str(&row.payload) {
+            Ok(payload) => payload,
+            Err(error) => {
+                tracing::error!(event_id, %error, "ignoring malformed pending event payload");
+                continue;
+            }
+        };
+        state.events.push(Event {
+            id: Some(event_id),
+            kind: row.event_type,
+            payload,
+        });
     }
+    Ok(())
+}
+
+async fn activate_push(state: &Arc<ActorState>) -> Result<Vec<u8>> {
+    state
+        .events
+        .drain_backlog_to_handler()
+        .map_err(|error| Error::Internal(format!("could not activate event callbacks: {error}")))?;
+    Ok(serde_json::to_vec(&serde_json::json!({
+        "active": state.events.has_handler(),
+    }))?)
 }
 
 async fn ping() -> Result<Vec<u8>> {
@@ -242,20 +361,11 @@ async fn version(state: &Arc<ActorState>) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec(&v)?)
 }
 
-async fn poll_event(state: &Arc<ActorState>, payload: &[u8]) -> Result<Vec<u8>> {
-    // Identity key changes are stored in a table by the crypto store, which
-    // has no access to the event queue. Move any waiting rows into the
-    // queue before polling so the consumer sees them in order.
+async fn poll_event(state: &Arc<ActorState>, _payload: &[u8]) -> Result<Vec<u8>> {
+    // Identity key changes are persisted outside the event queue. Flush them
+    // first so the pull compatibility API can return one in this poll.
     emit_pending_identity_changes(state).await;
-
-    let timeout_ms = if payload.len() >= 4 {
-        u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as u64
-    } else {
-        0
-    };
-
-    let timeout = Duration::from_millis(timeout_ms);
-    match state.events.poll(timeout).await {
+    match state.events.poll(Duration::ZERO) {
         Some(ev) => Ok(serde_json::to_vec(&ev)?),
         None => Ok(Vec::new()),
     }
@@ -268,7 +378,7 @@ fn _touch(_: Event) {}
 /// notified. The event is ephemeral: the consumer is expected to show it
 /// immediately and the durable copy is not replayed after a crash. If the
 /// UI is not running, the warning would arrive too late to matter anyway.
-async fn emit_pending_identity_changes(state: &Arc<ActorState>) {
+pub(crate) async fn emit_pending_identity_changes(state: &Arc<ActorState>) {
     #[derive(sqlx::FromRow)]
     struct Row {
         id: i64,

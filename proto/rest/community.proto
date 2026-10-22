@@ -1,0 +1,549 @@
+syntax = "proto3";
+
+package fh.rest.community;
+
+// REST wire messages for groups, channels, channel posts, bots, discover,
+// attachments metadata, and WebRTC configuration. IDs remain strings and
+// timestamps remain Unix-second integers to match the current REST contract.
+// String-valued roles, actor types, kinds, and profile filters intentionally
+// remain strings so their existing values are preserved verbatim.
+
+// --- Groups ---
+
+message CreateGroupRequest {
+  optional string title = 1;
+  repeated string member_ids = 2;
+  bool is_public = 3;
+  optional string description = 4;
+  optional int64 expires_in_seconds = 5;
+}
+
+message GroupResponse {
+  string conversation_id = 1;
+  optional string title = 2;
+  bool is_public = 3;
+  optional string description = 4;
+  string owner_account_id = 5;
+  int64 created_at = 6;
+}
+
+message GroupMember {
+  string account_id = 1;
+  string role = 2;
+  int64 permissions = 3;
+  optional int64 muted_until = 4;
+  optional int64 moderator_muted_until = 5;
+  int64 joined_at = 6;
+  optional string group_tag = 7;
+}
+
+message GroupMembersResponse {
+  repeated GroupMember items = 1;
+}
+
+message SetGroupRoleRequest {
+  optional string target_account_id = 1;
+  optional string role = 2;
+  int64 permissions = 3;
+}
+
+message SetGroupProfileRequest {
+  optional string handle = 1;
+}
+
+message GroupProfileResponse {
+  string handle = 1;
+  string handle_normalized = 2;
+}
+
+message MuteGroupMemberRequest {
+  optional string target_account_id = 1;
+  optional int64 muted_until = 2;
+}
+
+message PublicGroup {
+  string conversation_id = 1;
+  optional string title = 2;
+  optional string description = 3;
+  string owner_account_id = 4;
+  int64 created_at = 5;
+  int64 updated_at = 6;
+  int64 member_count = 7;
+  optional string handle = 8;
+  optional string handle_normalized = 9;
+}
+
+message PublicGroupsResponse {
+  repeated PublicGroup items = 1;
+}
+
+message PublicGroupsQuery {
+  optional int64 limit = 1;
+}
+
+message GroupByHandleResponse {
+  string conversation_id = 1;
+  optional string title = 2;
+  optional string description = 3;
+  int64 member_count = 4;
+  bool already_member = 5;
+}
+
+message GroupDetail {
+  string conversation_id = 1;
+  optional string title = 2;
+  optional string description = 3;
+  bool is_public = 4;
+  string owner_account_id = 5;
+  optional string handle = 6;
+  optional string handle_normalized = 7;
+  int64 member_count = 8;
+  int64 created_at = 9;
+  int64 updated_at = 10;
+}
+
+message UpdateGroupRequest {
+  optional string title = 1;
+  optional string description = 2;
+  optional bool is_public = 3;
+}
+
+message AddGroupMemberRequest {
+  optional string account_id = 1;
+}
+
+message TransferGroupOwnerRequest {
+  optional string new_owner_account_id = 1;
+}
+
+message SetGroupTagRequest {
+  optional string tag = 1;
+}
+
+message GroupBan {
+  string account_id = 1;
+  optional string banned_by_account_id = 2;
+  optional string reason = 3;
+  int64 banned_at = 4;
+}
+
+message GroupBansResponse {
+  repeated GroupBan items = 1;
+}
+
+message BanGroupMemberRequest {
+  optional string account_id = 1;
+  optional string reason = 2;
+}
+
+// --- Channels ---
+
+message CreateChannelRequest {
+  optional string title = 1;
+  optional string description = 2;
+  bool is_public = 3;
+}
+
+message ChannelResponse {
+  string conversation_id = 1;
+  optional string title = 2;
+  optional string description = 3;
+  string owner_account_id = 4;
+  optional string linked_group_conversation_id = 5;
+  bool is_public = 6;
+  int64 created_at = 7;
+}
+
+message ChannelMember {
+  string actor_type = 1;
+  string actor_id = 2;
+  string role = 3;
+  int64 joined_at = 4;
+}
+
+message ChannelMembersResponse {
+  repeated ChannelMember items = 1;
+}
+
+message SetChannelRoleRequest {
+  optional string actor_type = 1;
+  optional string actor_id = 2;
+  optional string role = 3;
+}
+
+message SetLinkedGroupRequest {
+  optional string linked_group_conversation_id = 1;
+}
+
+message SetChannelProfileRequest {
+  optional string handle = 1;
+}
+
+message ChannelProfileResponse {
+  string handle = 1;
+  string handle_normalized = 2;
+}
+
+message AddChannelBotRequest {
+  optional string bot_id = 1;
+}
+
+message CanPublishResponse {
+  bool can_publish = 1;
+}
+
+message RemoveChannelMemberRequest {
+  optional string actor_type = 1;
+  optional string actor_id = 2;
+}
+
+message SetChannelPublicRequest {
+  optional bool is_public = 1;
+}
+
+message ChannelDetail {
+  string conversation_id = 1;
+  optional string title = 2;
+  optional string description = 3;
+  bool is_public = 4;
+  string owner_account_id = 5;
+  optional string linked_group_conversation_id = 6;
+  optional string handle = 7;
+  optional string handle_normalized = 8;
+  int64 member_count = 9;
+  int64 created_at = 10;
+  int64 updated_at = 11;
+}
+
+message TransferChannelOwnerRequest {
+  optional string new_owner_account_id = 1;
+}
+
+message PublicChannel {
+  string conversation_id = 1;
+  optional string title = 2;
+  optional string description = 3;
+  string owner_account_id = 4;
+  int64 created_at = 5;
+  int64 updated_at = 6;
+  int64 member_count = 7;
+  optional string handle = 8;
+  optional string handle_normalized = 9;
+}
+
+message PublicChannelsResponse {
+  repeated PublicChannel items = 1;
+}
+
+message PublicChannelsQuery {
+  optional int64 limit = 1;
+}
+
+message ChannelByHandleResponse {
+  string conversation_id = 1;
+  optional string title = 2;
+  optional string description = 3;
+  int64 member_count = 4;
+  bool already_member = 5;
+}
+
+message PostView {
+  string post_id = 1;
+  int64 views = 2;
+}
+
+message ChannelAnalyticsResponse {
+  repeated PostView posts = 1;
+}
+
+// --- Channel posts ---
+
+message PublishChannelPostRequest {
+  optional string text = 1;
+  repeated string attachment_ids = 2;
+  optional string reply_to_post_id = 3;
+  optional string forward_from = 4;
+}
+
+message ChannelPost {
+  string id = 1;
+  string channel_id = 2;
+  string author_type = 3;
+  string author_id = 4;
+  string text = 5;
+  repeated string attachment_ids = 6;
+  optional string forward_from = 7;
+  optional string reply_to_post_id = 8;
+  int64 created_at = 9;
+  optional int64 edited_at = 10;
+  optional int64 pinned_at = 11;
+  int64 discussion_comment_count = 12;
+}
+
+message ChannelPostsResponse {
+  repeated ChannelPost items = 1;
+}
+
+message ListChannelPostsQuery {
+  optional string before = 1;
+  optional int64 limit = 2;
+}
+
+message EditChannelPostRequest {
+  optional string text = 1;
+}
+
+message SetChannelPostReactionRequest {
+  optional string emoji = 1;
+}
+
+message ChannelPostReaction {
+  string actor_type = 1;
+  string actor_id = 2;
+  string emoji = 3;
+  int64 created_at = 4;
+}
+
+message ChannelPostReactionsResponse {
+  repeated ChannelPostReaction items = 1;
+}
+
+message ListChannelPostReactionsQuery {
+  optional int64 before_created_at = 1;
+  optional string before_actor_id = 2;
+  optional int64 limit = 3;
+}
+
+message ChannelPostDiscussion {
+  string channel_id = 1;
+  string post_id = 2;
+  optional string linked_group_id = 3;
+  string thread_id = 4;
+  int64 comment_count = 5;
+}
+
+// --- Bots and user-facing bot conversations ---
+
+message CreateBotResponse {
+  string bot_id = 1;
+  string token = 2;
+  string token_prefix = 3;
+}
+
+message Bot {
+  string id = 1;
+  string token_prefix = 2;
+  int64 created_at = 3;
+  int64 updated_at = 4;
+  optional string handle = 5;
+}
+
+message BotsResponse {
+  repeated Bot items = 1;
+}
+
+message SetBotProfileRequest {
+  optional string handle = 1;
+}
+
+message BotProfileResponse {
+  string handle = 1;
+  string handle_normalized = 2;
+}
+
+message RotateBotTokenResponse {
+  string token = 1;
+}
+
+message BotPublicInfo {
+  string bot_id = 1;
+  string owner_account_id = 2;
+  optional string handle = 3;
+  int64 created_at = 4;
+}
+
+message SendToBotRequest {
+  optional string text = 1;
+  optional string reply_to_message_id = 2;
+}
+
+message BotMessage {
+  string id = 1;
+  string bot_id = 2;
+  string sender_account_id = 3;
+  string direction = 4;
+  string text = 5;
+  optional string reply_to_id = 6;
+  int64 created_at = 7;
+  optional string reply_markup = 8;
+  optional int64 is_deleted = 9;
+}
+
+message BotMessagesResponse {
+  repeated BotMessage items = 1;
+}
+
+message BotHistoryQuery {
+  optional int64 before = 1;
+  optional string before_id = 2;
+  optional int64 limit = 3;
+}
+
+message OwnedBot {
+  string bot_id = 1;
+  optional string handle = 2;
+  string token_prefix = 3;
+  int64 created_at = 4;
+  bool has_webhook = 5;
+}
+
+message OwnedBotsResponse {
+  repeated OwnedBot items = 1;
+}
+
+message BotCallbackRequest {
+  optional string message_id = 1;
+  optional string callback_data = 2;
+}
+
+message BotCallbackResponse {
+  string callback_query_id = 1;
+}
+
+// --- Discover ---
+
+message StringItems {
+  repeated string items = 1;
+}
+
+message UpsertDiscoverProfileRequest {
+  optional string display_name = 1;
+  optional string city = 2;
+  optional int32 birth_year = 3;
+  optional string gender = 4;
+  optional string looking_for = 5;
+  optional string bio = 6;
+  StringItems interests = 7;
+  optional bool is_listed = 8;
+}
+
+message DiscoverQuery {
+  optional string city = 1;
+  optional string gender = 2;
+  optional string looking_for = 3;
+  optional int32 min_age = 4;
+  optional int32 max_age = 5;
+  optional string interests = 6;
+  optional string q = 7;
+  optional int64 before = 8;
+  optional string before_account_id = 9;
+  optional int64 limit = 10;
+}
+
+message MyDiscoverProfile {
+  string account_id = 1;
+  string display_name = 2;
+  string city = 3;
+  int32 birth_year = 4;
+  string gender = 5;
+  string looking_for = 6;
+  optional string bio = 7;
+  repeated string interests = 8;
+  bool is_listed = 9;
+  int64 updated_at = 10;
+}
+
+message DiscoverCard {
+  string account_id = 1;
+  string display_name = 2;
+  string city = 3;
+  int32 birth_year = 4;
+  int32 age = 5;
+  string gender = 6;
+  string looking_for = 7;
+  optional string bio = 8;
+  repeated string interests = 9;
+  int64 updated_at = 10;
+}
+
+message DiscoverCardsResponse {
+  repeated DiscoverCard items = 1;
+}
+
+// The current JSON response flattens DiscoverCard fields beside avatar_url
+// and fh_number, so those fields are kept flat here rather than nested.
+message DiscoverProfile {
+  string account_id = 1;
+  string display_name = 2;
+  string city = 3;
+  int32 birth_year = 4;
+  int32 age = 5;
+  string gender = 6;
+  string looking_for = 7;
+  optional string bio = 8;
+  repeated string interests = 9;
+  int64 updated_at = 10;
+  optional string avatar_url = 11;
+  string fh_number = 12;
+}
+
+// --- Attachment metadata (no raw media or storage-transfer messages) ---
+
+message UInt64Items {
+  repeated uint64 items = 1;
+}
+
+message InitAttachmentRequest {
+  UInt64Items chunk_sizes = 1;
+  optional string conversation_id = 2;
+  optional string kind = 3;
+}
+
+message PresignedPut {
+  int64 chunk_index = 1;
+  int64 size_bytes = 2;
+  string url = 3;
+}
+
+message InitAttachmentResponse {
+  string attachment_id = 1;
+  int64 chunk_count = 2;
+  int64 total_size = 3;
+  repeated PresignedPut uploads = 4;
+}
+
+message PresignedGet {
+  int64 chunk_index = 1;
+  int64 size_bytes = 2;
+  string url = 3;
+}
+
+message AttachmentDownloadResponse {
+  string attachment_id = 1;
+  int64 total_size = 2;
+  int64 chunk_count = 3;
+  repeated PresignedGet chunks = 4;
+}
+
+message RecommendAttachmentRequest {
+  optional uint64 total_size = 1;
+}
+
+message RecommendAttachmentResponse {
+  uint64 chunk_size = 1;
+  repeated uint64 chunk_sizes = 2;
+  uint64 chunk_count = 3;
+}
+
+// --- WebRTC ---
+
+message IceServer {
+  repeated string urls = 1;
+  optional string username = 2;
+  optional string credential = 3;
+}
+
+message IceServersResponse {
+  repeated IceServer ice_servers = 1;
+  uint64 ttl_seconds = 2;
+}

@@ -22,7 +22,7 @@ use rtc::media_stream::MediaStreamTrack as RtcMediaStreamTrack;
 use rtc::media_stream::{MediaStreamId, MediaStreamTrackId};
 use rtc::rtp_transceiver::rtp_sender::RtpCodecKind;
 use rtc_media::Sample;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
 use webrtc::media_stream::track_remote::{TrackRemote, TrackRemoteEvent};
 
@@ -56,13 +56,29 @@ pub struct VideoTracks {
 }
 
 impl VideoTracks {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
-    pub async fn register_local(&self, call_id: &str, label: &str) -> Result<Arc<TrackLocalStaticSample>> {
-        let stream_track = RtcMediaStreamTrack::new(MediaStreamTrackId::new(), MediaStreamId::new(), label.to_string(), RtpCodecKind::Video, vec![]);
-        let local = TrackLocalStaticSample::new(Instant::now(), stream_track).map_err(|e| Error::Internal(format!("video track: {e}")))?;
+    pub async fn register_local(
+        &self,
+        call_id: &str,
+        label: &str,
+    ) -> Result<Arc<TrackLocalStaticSample>> {
+        let stream_track = RtcMediaStreamTrack::new(
+            MediaStreamTrackId::new(),
+            MediaStreamId::new(),
+            label.to_string(),
+            RtpCodecKind::Video,
+            vec![],
+        );
+        let local = TrackLocalStaticSample::new(Instant::now(), stream_track)
+            .map_err(|e| Error::Internal(format!("video track: {e}")))?;
         let local = Arc::new(local);
-        self.local.lock().await.insert(call_id.to_string(), local.clone());
+        self.local
+            .lock()
+            .await
+            .insert(call_id.to_string(), local.clone());
         Ok(local)
     }
 
@@ -71,7 +87,9 @@ impl VideoTracks {
             let map = self.local.lock().await;
             map.get(call_id).cloned()
         };
-        let track = track.ok_or_else(|| Error::InvalidPayload(format!("no local video track on call {call_id}")))?;
+        let track = track.ok_or_else(|| {
+            Error::InvalidPayload(format!("no local video track on call {call_id}"))
+        })?;
         let sample = Sample {
             data: Bytes::from(data),
             timestamp: Instant::now(),
@@ -80,17 +98,32 @@ impl VideoTracks {
             prev_dropped_packets: 0,
             prev_padding_packets: 0,
         };
-        track.write_sample(0, 0, &sample, &[]).await.map_err(|e| Error::Internal(format!("video write: {e}")))?;
+        track
+            .write_sample(0, 0, &sample, &[])
+            .await
+            .map_err(|e| Error::Internal(format!("video write: {e}")))?;
         Ok(())
     }
 
-    pub async fn register_remote(&self, call_id: &str, track_id: String, track: Arc<dyn TrackRemote>) {
+    pub async fn register_remote(
+        &self,
+        call_id: &str,
+        track_id: String,
+        track: Arc<dyn TrackRemote>,
+    ) {
         let (tx, rx) = mpsc::channel::<Vec<u8>>(FRAME_BUFFER_DEPTH);
 
-        self.frames.lock().await.insert(call_id.to_string(), Arc::new(Mutex::new(rx)));
+        self.frames
+            .lock()
+            .await
+            .insert(call_id.to_string(), Arc::new(Mutex::new(rx)));
         self.remote.lock().await.insert(
             call_id.to_string(),
-            Arc::new(InboundVideoTrack { call_id: call_id.to_string(), track_id, track: track.clone() }),
+            Arc::new(InboundVideoTrack {
+                call_id: call_id.to_string(),
+                track_id,
+                track: track.clone(),
+            }),
         );
 
         let call = call_id.to_string();
@@ -100,9 +133,10 @@ impl VideoTracks {
                 match event {
                     TrackRemoteEvent::OnRtpPacket(pkt) => {
                         if let Some(frame) = depack.push(&pkt)
-                            && tx.try_send(frame).is_err() {
-                                tracing::trace!(call_id = %call, "video frame dropped: buffer full or closed");
-                            }
+                            && tx.try_send(frame).is_err()
+                        {
+                            tracing::trace!(call_id = %call, "video frame dropped: buffer full or closed");
+                        }
                     }
                     TrackRemoteEvent::OnEnding | TrackRemoteEvent::OnEnded => {
                         tracing::debug!(call_id = %call, "remote video track ended");
@@ -134,8 +168,12 @@ impl VideoTracks {
         }
     }
 
-    pub async fn has_local(&self, call_id: &str) -> bool { self.local.lock().await.contains_key(call_id) }
-    pub async fn has_remote(&self, call_id: &str) -> bool { self.remote.lock().await.contains_key(call_id) }
+    pub async fn has_local(&self, call_id: &str) -> bool {
+        self.local.lock().await.contains_key(call_id)
+    }
+    pub async fn has_remote(&self, call_id: &str) -> bool {
+        self.remote.lock().await.contains_key(call_id)
+    }
 
     pub async fn drop_call(&self, call_id: &str) {
         self.local.lock().await.remove(call_id);
@@ -143,5 +181,7 @@ impl VideoTracks {
         self.frames.lock().await.remove(call_id);
     }
 
-    pub fn outgoing_mime() -> &'static str { MIME_VP8 }
+    pub fn outgoing_mime() -> &'static str {
+        MIME_VP8
+    }
 }

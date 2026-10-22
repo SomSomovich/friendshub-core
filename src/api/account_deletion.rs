@@ -18,7 +18,11 @@ pub async fn initiate(state: &Arc<ActorState>, _payload: Vec<u8>) -> Result<Vec<
     let token = bearer(state).await?;
     let resp: InitiateResponse = state
         .http
-        .post("/api/v1/account/delete/initiate", &serde_json::json!({}), Some(&token))
+        .post(
+            "/api/v1/account/delete/initiate",
+            &serde_json::json!({}),
+            Some(&token),
+        )
         .await?;
     Ok(serde_json::to_vec(&resp)?)
 }
@@ -43,7 +47,11 @@ pub async fn cancel(state: &Arc<ActorState>, _payload: Vec<u8>) -> Result<Vec<u8
     let token = bearer(state).await?;
     let _: serde_json::Value = state
         .http
-        .post("/api/v1/account/delete/cancel", &serde_json::json!({}), Some(&token))
+        .post(
+            "/api/v1/account/delete/cancel",
+            &serde_json::json!({}),
+            Some(&token),
+        )
         .await?;
     Ok(br#"{"cancelled":true}"#.to_vec())
 }

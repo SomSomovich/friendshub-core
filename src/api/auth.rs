@@ -35,8 +35,14 @@ pub struct LoginRequest {
 #[derive(Debug, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum LoginResponse {
-    Session { session_token: String, expires_at: i64 },
-    TotpRequired { challenge_token: String, expires_in_seconds: u64 },
+    Session {
+        session_token: String,
+        expires_at: i64,
+    },
+    TotpRequired {
+        challenge_token: String,
+        expires_in_seconds: u64,
+    },
 }
 
 #[derive(Debug, Serialize)]
@@ -59,7 +65,10 @@ pub async fn login(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>>
     let resp: LoginResponse = state.http.post("/api/v1/login", &req, None).await?;
 
     match resp {
-        LoginResponse::Session { session_token, expires_at } => {
+        LoginResponse::Session {
+            session_token,
+            expires_at,
+        } => {
             let me: MeResponse = state.http.get("/api/v1/me", Some(&session_token)).await?;
             persist_session(state, &me, &session_token, req.device_number, expires_at).await?;
 
@@ -72,16 +81,17 @@ pub async fn login(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>>
                 account: Some(me),
             })?)
         }
-        LoginResponse::TotpRequired { challenge_token, expires_in_seconds } => {
-            Ok(serde_json::to_vec(&LoginResult {
-                kind: "totp_required".into(),
-                session_token: None,
-                expires_at: None,
-                challenge_token: Some(challenge_token),
-                expires_in_seconds: Some(expires_in_seconds),
-                account: None,
-            })?)
-        }
+        LoginResponse::TotpRequired {
+            challenge_token,
+            expires_in_seconds,
+        } => Ok(serde_json::to_vec(&LoginResult {
+            kind: "totp_required".into(),
+            session_token: None,
+            expires_at: None,
+            challenge_token: Some(challenge_token),
+            expires_in_seconds: Some(expires_in_seconds),
+            account: None,
+        })?),
     }
 }
 
@@ -96,7 +106,11 @@ pub async fn login_2fa(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<
     let req: Login2faRequest = serde_json::from_slice(&payload)?;
     let resp: LoginResponse = state.http.post("/api/v1/login/2fa", &req, None).await?;
 
-    let LoginResponse::Session { session_token, expires_at } = resp else {
+    let LoginResponse::Session {
+        session_token,
+        expires_at,
+    } = resp
+    else {
         return Err(Error::Internal("2fa endpoint returned a challenge".into()));
     };
 
@@ -126,9 +140,13 @@ pub async fn logout(state: &Arc<ActorState>) -> Result<Vec<u8>> {
         .http
         .post_void("/api/v1/logout", &serde_json::json!({}), Some(&token))
         .await
-        && status != 401 {
-            return Err(Error::Server { status, body: "logout failed".into() });
-        }
+        && status != 401
+    {
+        return Err(Error::Server {
+            status,
+            body: "logout failed".into(),
+        });
+    }
 
     db_auth::clear(&state.db).await?;
     Ok(br#"{"ok":true}"#.to_vec())

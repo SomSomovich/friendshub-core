@@ -36,18 +36,27 @@ pub struct ActorState {
     pub db: Db,
     pub http: HttpClient,
     pub ws: Arc<WsClient>,
-    pub events: EventQueue,
+    pub events: Arc<EventQueue>,
     pub webrtc: Arc<WebRtcManager>,
 }
 
 impl ActorState {
     pub fn new(config: Config, db: Db, http: HttpClient) -> Self {
+        Self::new_with_events(config, db, http, Arc::new(EventQueue::new()))
+    }
+
+    pub fn new_with_events(
+        config: Config,
+        db: Db,
+        http: HttpClient,
+        events: Arc<EventQueue>,
+    ) -> Self {
         Self {
             config,
             db,
             http,
             ws: Arc::new(WsClient::new()),
-            events: EventQueue::new(),
+            events,
             webrtc: Arc::new(WebRtcManager::new()),
         }
     }
@@ -84,6 +93,10 @@ impl Actor {
                             return;
                         }
                     };
+                    if let Err(error) = crate::api::restore_pending_events(&state).await {
+                        let _ = init_tx.send(Err(error));
+                        return;
+                    }
                     let state = Arc::new(state);
 
                     // WebRTC event forwarder. Runs for the lifetime of the actor.
@@ -123,7 +136,11 @@ impl Actor {
 
     pub fn call(&self, method: u32, payload: Vec<u8>) -> Result<Vec<u8>> {
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
-        let req = Request { method, payload, reply: reply_tx };
+        let req = Request {
+            method,
+            payload,
+            reply: reply_tx,
+        };
         self.tx
             .send(ActorMessage::Call(req))
             .map_err(|_| Error::ActorClosed)?;

@@ -22,7 +22,7 @@ use rtc::media_stream::MediaStreamTrack as RtcMediaStreamTrack;
 use rtc::media_stream::{MediaStreamId, MediaStreamTrackId};
 use rtc::rtp_transceiver::rtp_sender::RtpCodecKind;
 use rtc_media::Sample;
-use tokio::sync::{mpsc, Mutex};
+use tokio::sync::{Mutex, mpsc};
 use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
 use webrtc::media_stream::track_remote::{TrackRemote, TrackRemoteEvent};
 
@@ -52,13 +52,29 @@ pub struct AudioTracks {
 }
 
 impl AudioTracks {
-    pub fn new() -> Self { Self::default() }
+    pub fn new() -> Self {
+        Self::default()
+    }
 
-    pub async fn register_local(&self, call_id: &str, label: &str) -> Result<Arc<TrackLocalStaticSample>> {
-        let stream_track = RtcMediaStreamTrack::new(MediaStreamTrackId::new(), MediaStreamId::new(), label.to_string(), RtpCodecKind::Audio, vec![]);
-        let local = TrackLocalStaticSample::new(Instant::now(), stream_track).map_err(|e| Error::Internal(format!("audio track: {e}")))?;
+    pub async fn register_local(
+        &self,
+        call_id: &str,
+        label: &str,
+    ) -> Result<Arc<TrackLocalStaticSample>> {
+        let stream_track = RtcMediaStreamTrack::new(
+            MediaStreamTrackId::new(),
+            MediaStreamId::new(),
+            label.to_string(),
+            RtpCodecKind::Audio,
+            vec![],
+        );
+        let local = TrackLocalStaticSample::new(Instant::now(), stream_track)
+            .map_err(|e| Error::Internal(format!("audio track: {e}")))?;
         let local = Arc::new(local);
-        self.local.lock().await.insert(call_id.to_string(), local.clone());
+        self.local
+            .lock()
+            .await
+            .insert(call_id.to_string(), local.clone());
         Ok(local)
     }
 
@@ -67,7 +83,9 @@ impl AudioTracks {
             let map = self.local.lock().await;
             map.get(call_id).cloned()
         };
-        let track = track.ok_or_else(|| Error::InvalidPayload(format!("no local audio track on call {call_id}")))?;
+        let track = track.ok_or_else(|| {
+            Error::InvalidPayload(format!("no local audio track on call {call_id}"))
+        })?;
         let sample = Sample {
             data: Bytes::from(data),
             timestamp: Instant::now(),
@@ -76,17 +94,32 @@ impl AudioTracks {
             prev_dropped_packets: 0,
             prev_padding_packets: 0,
         };
-        track.write_sample(0, 0, &sample, &[]).await.map_err(|e| Error::Internal(format!("audio write: {e}")))?;
+        track
+            .write_sample(0, 0, &sample, &[])
+            .await
+            .map_err(|e| Error::Internal(format!("audio write: {e}")))?;
         Ok(())
     }
 
-    pub async fn register_remote(&self, call_id: &str, track_id: String, track: Arc<dyn TrackRemote>) {
+    pub async fn register_remote(
+        &self,
+        call_id: &str,
+        track_id: String,
+        track: Arc<dyn TrackRemote>,
+    ) {
         let (tx, rx) = mpsc::channel::<Vec<u8>>(FRAME_BUFFER_DEPTH);
 
-        self.frames.lock().await.insert(call_id.to_string(), Arc::new(Mutex::new(rx)));
+        self.frames
+            .lock()
+            .await
+            .insert(call_id.to_string(), Arc::new(Mutex::new(rx)));
         self.remote.lock().await.insert(
             call_id.to_string(),
-            Arc::new(InboundAudioTrack { call_id: call_id.to_string(), track_id, track: track.clone() }),
+            Arc::new(InboundAudioTrack {
+                call_id: call_id.to_string(),
+                track_id,
+                track: track.clone(),
+            }),
         );
 
         let call = call_id.to_string();
@@ -137,8 +170,12 @@ impl AudioTracks {
         }
     }
 
-    pub async fn has_local(&self, call_id: &str) -> bool { self.local.lock().await.contains_key(call_id) }
-    pub async fn has_remote(&self, call_id: &str) -> bool { self.remote.lock().await.contains_key(call_id) }
+    pub async fn has_local(&self, call_id: &str) -> bool {
+        self.local.lock().await.contains_key(call_id)
+    }
+    pub async fn has_remote(&self, call_id: &str) -> bool {
+        self.remote.lock().await.contains_key(call_id)
+    }
 
     pub async fn drop_call(&self, call_id: &str) {
         self.local.lock().await.remove(call_id);
@@ -146,5 +183,7 @@ impl AudioTracks {
         self.frames.lock().await.remove(call_id);
     }
 
-    pub fn outgoing_mime() -> &'static str { MIME_OPUS }
+    pub fn outgoing_mime() -> &'static str {
+        MIME_OPUS
+    }
 }
