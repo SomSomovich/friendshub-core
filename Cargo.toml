@@ -11,7 +11,7 @@ publish = false
 
 [lib]
 name = "friendshub_core"
-crate-type = ["cdylib", "staticlib", "rlib"]
+crate-type = ["rlib", "cdylib", "staticlib"]
 
 [dependencies]
 # --- Async runtime ---

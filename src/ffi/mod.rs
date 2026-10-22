@@ -100,20 +100,24 @@ pub unsafe extern "C" fn fh_init(
         };
 
         crate::logging::init_once(&cfg.log_level, &cfg.log_format);
-        let db_path = cfg.db_path.clone();
-        let http = match HttpClient::new(&cfg) {
-            Ok(h) => h,
-            Err(e) => return write_error(out, &e),
-        };
 
         let actor = match Actor::spawn(move || {
             Box::pin(async move {
-                let db = db::pool::open(&db_path).await?;
+                // Resolve the backend URLs before anything touches the network.
+                // The discovery step is allowed to fail back to config-supplied
+                // URLs, so a missing discovery file is not fatal on its own.
+                let resolved = crate::discovery::resolve(&cfg).await?;
+                let mut config = cfg;
+                config.api_base = resolved.api_base;
+                config.ws_url = resolved.ws_url;
+
+                let http = HttpClient::new(&config)?;
+                let db = db::pool::open(&config.db_path).await?;
                 db::migrations::MIGRATOR
                     .run(&db)
                     .await
                     .map_err(|e| Error::Database(format!("migrations failed: {e}")))?;
-                Ok(ActorState::new(cfg, db, http))
+                Ok(ActorState::new(config, db, http))
             })
         }) {
             Ok(a) => a,

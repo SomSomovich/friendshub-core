@@ -24,3 +24,6 @@ project_dump.txt
 *.db
 *.sqlite
 *.sqlite3
+
+# Discovery cache. Written next to the database on first init; never committed.
+.friendshub-discovery.json

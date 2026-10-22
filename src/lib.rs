@@ -7,6 +7,7 @@ pub mod api;
 pub mod config;
 pub mod crypto;
 pub mod db;
+pub mod discovery;
 pub mod error;
 pub mod events;
 pub mod logging;
