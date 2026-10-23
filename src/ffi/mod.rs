@@ -31,7 +31,7 @@ use panic::guard;
 
 pub const ABI_VERSION: u32 = 3;
 
-const ABI_STRING: &[u8] = b"0.1.4\0";
+const ABI_STRING: &[u8] = concat!(env!("CARGO_PKG_VERSION"), "\0").as_bytes();
 
 const METHOD_ACK_EVENT: u32 = 0x0000_0004;
 

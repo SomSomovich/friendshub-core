@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -20,21 +19,10 @@ use serde_json::{Value, json};
 
 static NEXT_DATABASE_ID: AtomicU64 = AtomicU64::new(1);
 
-#[derive(Debug)]
-struct CapturedRequest {
-    method: String,
-    target: String,
-    headers: HashMap<String, String>,
-    body: Vec<u8>,
-}
+#[path = "support/http_fixture.rs"]
+mod http_fixture;
 
-impl CapturedRequest {
-    fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .get(&name.to_ascii_lowercase())
-            .map(String::as_str)
-    }
-}
+use http_fixture::CapturedRequest;
 
 #[tokio::test(flavor = "current_thread")]
 async fn authenticated_contact_wrapper_uses_protobuf_and_keeps_json_and_raw_fallbacks() {
@@ -224,40 +212,7 @@ fn accept_request(listener: &TcpListener) -> io::Result<(TcpStream, CapturedRequ
 }
 
 fn read_request(stream: &mut TcpStream) -> io::Result<CapturedRequest> {
-    let mut reader = BufReader::new(stream);
-    let mut request_line = String::new();
-    reader.read_line(&mut request_line)?;
-    let mut request_parts = request_line.split_whitespace();
-    let method = request_parts.next().unwrap_or_default().to_string();
-    let target = request_parts.next().unwrap_or_default().to_string();
-
-    let mut headers = HashMap::new();
-    loop {
-        let mut line = String::new();
-        reader.read_line(&mut line)?;
-        if line == "\r\n" || line.is_empty() {
-            break;
-        }
-        if let Some((name, value)) = line.split_once(':') {
-            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
-        }
-    }
-
-    let body_length = headers
-        .get("content-length")
-        .map(|value| value.parse::<usize>())
-        .transpose()
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
-        .unwrap_or(0);
-    let mut body = vec![0; body_length];
-    reader.read_exact(&mut body)?;
-
-    Ok(CapturedRequest {
-        method,
-        target,
-        headers,
-        body,
-    })
+    http_fixture::read_request(stream)
 }
 
 fn write_response(

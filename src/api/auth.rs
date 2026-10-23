@@ -134,18 +134,15 @@ pub async fn logout(state: &Arc<ActorState>) -> Result<Vec<u8>> {
 
     let token = auth.session_token.clone().ok_or(Error::NotAuthenticated)?;
 
-    // A 401 means the session is already gone on the server; the local
-    // state is cleared regardless. Only genuine transport failures surface.
-    if let Err(Error::Server { status, .. }) = state
+    // A 401 means the session is already gone on the server. Preserve the
+    // local token for every other failure so the caller can retry revocation.
+    match state
         .http
         .post_void("/api/v1/logout", &serde_json::json!({}), Some(&token))
         .await
-        && status != 401
     {
-        return Err(Error::Server {
-            status,
-            body: "logout failed".into(),
-        });
+        Ok(()) | Err(Error::Server { status: 401, .. }) => {}
+        Err(error) => return Err(error),
     }
 
     db_auth::clear(&state.db).await?;
@@ -220,5 +217,75 @@ async fn bearer(state: &Arc<ActorState>) -> Result<String> {
     match auth.session_token {
         Some(t) if !t.is_empty() => Ok(t),
         _ => Err(Error::NotAuthenticated),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Read;
+    use std::net::TcpListener;
+    use std::sync::Arc;
+    use std::thread;
+
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    use super::*;
+    use crate::config::{Config, DiscoveryConfig};
+    use crate::db::{auth::AuthState, migrations::MIGRATOR};
+    use crate::runtime::ActorState;
+    use crate::transport::HttpClient;
+
+    #[tokio::test]
+    async fn logout_preserves_local_session_when_server_revocation_fails_on_transport() {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+        let address = listener.local_addr().expect("fixture address");
+        let server = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept logout request");
+            let mut request = [0u8; 4096];
+            let _ = stream.read(&mut request);
+            // Closing without a status line represents a dropped response.
+        });
+
+        let config = Config {
+            db_path: "/tmp/friendshub-core-logout-test.db".into(),
+            api_base: format!("http://{address}"),
+            ws_url: format!("ws://{address}/ws"),
+            discovery: DiscoveryConfig {
+                enabled: false,
+                ..DiscoveryConfig::default()
+            },
+            log_level: "error".into(),
+            log_format: "text".into(),
+        };
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory database");
+        MIGRATOR.run(&db).await.expect("apply migrations");
+        db_auth::store(
+            &db,
+            &AuthState {
+                account_id: Some("account-1".into()),
+                session_token: Some("retryable-token".into()),
+                totp_enabled: Some(0),
+                ..AuthState::default()
+            },
+        )
+        .await
+        .expect("store session");
+        let http = HttpClient::new(&config).expect("build HTTP client");
+        let state = Arc::new(ActorState::new(config, db, http));
+
+        let result = logout(&state).await;
+        assert!(result.is_err(), "transport failure must reach the caller");
+        let auth = db_auth::load(&state.db)
+            .await
+            .expect("load retained auth state")
+            .expect("auth state remains present");
+        assert_eq!(auth.session_token.as_deref(), Some("retryable-token"));
+
+        drop(state);
+        server.join().expect("fixture server must exit");
     }
 }

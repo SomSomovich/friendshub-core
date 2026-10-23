@@ -1,5 +1,4 @@
-use std::collections::HashMap;
-use std::io::{self, BufRead, BufReader, Read, Write};
+use std::io::{self, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -14,7 +13,7 @@ use friendshub_core::config::{Config, DiscoveryConfig};
 use friendshub_core::events::{Event, EventHandler};
 use friendshub_core::proto::rest::identity;
 use friendshub_core::proto::{
-    ClientFrame, ServerFrame, ServerHello, TypingDelivery, client_frame, server_frame,
+    ClientFrame, NudgeResult, ServerFrame, ServerHello, TypingDelivery, client_frame, server_frame,
 };
 use prost::Message;
 use serde::Serialize;
@@ -28,21 +27,10 @@ const ACCOUNT_ID: &str = "123e4567-e89b-12d3-a456-426614174000";
 const CONVERSATION_ID: &str = "123e4567-e89b-12d3-a456-426614174001";
 const TYPING_ACCOUNT_ID: &str = "123e4567-e89b-12d3-a456-426614174002";
 
-#[derive(Debug)]
-struct CapturedRequest {
-    method: String,
-    target: String,
-    headers: HashMap<String, String>,
-    body: Vec<u8>,
-}
+#[path = "support/http_fixture.rs"]
+mod http_fixture;
 
-impl CapturedRequest {
-    fn header(&self, name: &str) -> Option<&str> {
-        self.headers
-            .get(&name.to_ascii_lowercase())
-            .map(String::as_str)
-    }
-}
+use http_fixture::CapturedRequest;
 
 #[derive(Serialize)]
 struct LoginRequest {
@@ -55,6 +43,7 @@ struct LoginRequest {
 enum CallbackNotice {
     Connected(Value),
     Typing { id: Option<u64>, payload: Value },
+    NudgeResult(Value),
     Unhandled(String),
 }
 
@@ -74,6 +63,12 @@ impl EventHandler for RecordingHandler {
             id: event.id,
             payload: event.payload.clone(),
         });
+    }
+
+    fn on_nudge_result(&self, event: &Event) {
+        let _ = self
+            .notices
+            .send(CallbackNotice::NudgeResult(event.payload.clone()));
     }
 
     fn on_unhandled(&self, event: &Event) {
@@ -183,6 +178,17 @@ fn websocket_typing_frame_reaches_distinct_push_callback_after_protobuf_hello() 
             .send(WebSocketMessage::Binary(typing.encode_to_vec().into()))
             .expect("send protobuf typing frame");
 
+        // A later recognized callback acts as a FIFO barrier: all callbacks
+        // produced while handling the typing frame must be delivered before it.
+        let barrier = ServerFrame {
+            kind: Some(server_frame::Kind::NudgeResult(NudgeResult {
+                delivered: true,
+            })),
+        };
+        socket
+            .send(WebSocketMessage::Binary(barrier.encode_to_vec().into()))
+            .expect("send callback barrier frame");
+
         match socket.read().expect("read client WebSocket stop") {
             WebSocketMessage::Close(_) => {}
             other => panic!("expected WebSocket close after Client stop, got {other:?}"),
@@ -245,9 +251,14 @@ fn websocket_typing_frame_reaches_distinct_push_callback_after_protobuf_hello() 
             }),
         }
     );
+    assert_eq!(
+        receive_notice(&notice_rx),
+        CallbackNotice::NudgeResult(json!({ "delivered": true })),
+        "the following callback must pass the queue after all callbacks from typing"
+    );
     assert!(
         notice_rx.try_recv().is_err(),
-        "recognized typing must not fall through to a generic callback"
+        "no callback should remain after the barrier"
     );
 
     let stopped: Value = client
@@ -274,40 +285,7 @@ fn uuid_bytes(value: &str) -> Vec<u8> {
 }
 
 fn read_request(stream: &mut TcpStream) -> io::Result<CapturedRequest> {
-    let mut reader = BufReader::new(stream);
-    let mut request_line = String::new();
-    reader.read_line(&mut request_line)?;
-    let mut request_parts = request_line.split_whitespace();
-    let method = request_parts.next().unwrap_or_default().to_string();
-    let target = request_parts.next().unwrap_or_default().to_string();
-
-    let mut headers = HashMap::new();
-    loop {
-        let mut line = String::new();
-        reader.read_line(&mut line)?;
-        if line == "\r\n" || line.is_empty() {
-            break;
-        }
-        if let Some((name, value)) = line.split_once(':') {
-            headers.insert(name.trim().to_ascii_lowercase(), value.trim().to_string());
-        }
-    }
-
-    let body_length = headers
-        .get("content-length")
-        .map(|value| value.parse::<usize>())
-        .transpose()
-        .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?
-        .unwrap_or(0);
-    let mut body = vec![0; body_length];
-    reader.read_exact(&mut body)?;
-
-    Ok(CapturedRequest {
-        method,
-        target,
-        headers,
-        body,
-    })
+    http_fixture::read_request(stream)
 }
 
 fn write_protobuf_response(stream: &mut TcpStream, body: &[u8]) -> io::Result<()> {

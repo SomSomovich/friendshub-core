@@ -7,19 +7,23 @@
 //! not go through the websocket; RTP/RTCP flow over the peer connection.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+#[cfg(test)]
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::{Arc, Weak};
 
 use async_trait::async_trait;
 use bytes::BytesMut;
 use serde::Serialize;
 use tokio::sync::Mutex;
+#[cfg(test)]
+use tokio::sync::Semaphore;
 use tokio::sync::mpsc;
 
-use webrtc::data_channel::{DataChannel, DataChannelEvent};
+use webrtc::data_channel::{DataChannel, DataChannelEvent, RTCDataChannelMessage};
 use webrtc::peer_connection::{
-    PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler, RTCConfigurationBuilder,
-    RTCIceConnectionState, RTCIceGatheringState, RTCIceServer, RTCPeerConnectionIceEvent,
-    RTCPeerConnectionState, RTCSessionDescription, RTCSignalingState,
+    MediaEngine, PeerConnection, PeerConnectionBuilder, PeerConnectionEventHandler,
+    RTCConfigurationBuilder, RTCIceConnectionState, RTCIceGatheringState, RTCIceServer,
+    RTCPeerConnectionIceEvent, RTCPeerConnectionState, RTCSessionDescription, RTCSignalingState,
 };
 
 use crate::error::{Error, Result};
@@ -204,11 +208,14 @@ impl PeerConnectionEventHandler for Handler {
 
 pub struct WebRtcManager {
     peers: Mutex<HashMap<String, Arc<dyn PeerConnection>>>,
+    call_locks: Mutex<HashMap<String, Weak<Mutex<()>>>>,
     channels: Mutex<HashMap<(String, String), Arc<dyn DataChannel>>>,
     pub video: Arc<VideoTracks>,
     pub audio: Arc<AudioTracks>,
     event_tx: mpsc::UnboundedSender<InternalEvent>,
     event_rx: Mutex<mpsc::UnboundedReceiver<InternalEvent>>,
+    #[cfg(test)]
+    offer_test_hooks: Option<Arc<OfferTestHooks>>,
 }
 
 impl WebRtcManager {
@@ -216,11 +223,14 @@ impl WebRtcManager {
         let (tx, rx) = mpsc::unbounded_channel();
         Self {
             peers: Mutex::new(HashMap::new()),
+            call_locks: Mutex::new(HashMap::new()),
             channels: Mutex::new(HashMap::new()),
             video: Arc::new(VideoTracks::new()),
             audio: Arc::new(AudioTracks::new()),
             event_tx: tx,
             event_rx: Mutex::new(rx),
+            #[cfg(test)]
+            offer_test_hooks: None,
         }
     }
 
@@ -367,7 +377,21 @@ impl WebRtcManager {
         call_id: &str,
         ice_servers: Vec<serde_json::Value>,
     ) -> Result<String> {
-        let pc = self.build_peer(call_id, ice_servers).await?;
+        #[cfg(test)]
+        if let Some(hooks) = &self.offer_test_hooks {
+            hooks.offers_started.add_permits(1);
+        }
+        let call_lock = self.call_operation_lock(call_id).await;
+        let _call_guard = call_lock.lock().await;
+
+        // The first call creates the connection. Later calls create a new
+        // offer on that same connection, which is required after the caller
+        // adds a track or data channel.
+        let existing = self.peers.lock().await.get(call_id).cloned();
+        let pc = match existing {
+            Some(pc) => pc,
+            None => self.build_peer(call_id, ice_servers).await?,
+        };
         let offer = pc
             .create_offer(None)
             .await
@@ -375,7 +399,11 @@ impl WebRtcManager {
         pc.set_local_description(offer.clone())
             .await
             .map_err(|e| Error::Internal(format!("set_local_description: {e}")))?;
-        self.peers.lock().await.insert(call_id.to_string(), pc);
+        self.peers
+            .lock()
+            .await
+            .entry(call_id.to_string())
+            .or_insert(pc);
         Ok(offer.sdp)
     }
 
@@ -385,7 +413,13 @@ impl WebRtcManager {
         remote_sdp: &str,
         ice_servers: Vec<serde_json::Value>,
     ) -> Result<String> {
-        let pc = self.build_peer(call_id, ice_servers).await?;
+        let call_lock = self.call_operation_lock(call_id).await;
+        let _call_guard = call_lock.lock().await;
+        let existing = self.peers.lock().await.get(call_id).cloned();
+        let pc = match existing {
+            Some(pc) => pc,
+            None => self.build_peer(call_id, ice_servers).await?,
+        };
         let remote = RTCSessionDescription::offer(remote_sdp.to_string())
             .map_err(|e| Error::Internal(format!("bad offer: {e}")))?;
         pc.set_remote_description(remote)
@@ -444,6 +478,8 @@ impl WebRtcManager {
     }
 
     pub async fn close(&self, call_id: &str) -> Result<()> {
+        let call_lock = self.call_operation_lock(call_id).await;
+        let _call_guard = call_lock.lock().await;
         let pc = {
             let mut peers = self.peers.lock().await;
             peers.remove(call_id)
@@ -467,6 +503,19 @@ impl WebRtcManager {
         self.peers.lock().await.keys().cloned().collect()
     }
 
+    async fn call_operation_lock(&self, call_id: &str) -> Arc<Mutex<()>> {
+        let mut locks = self.call_locks.lock().await;
+        // Weak entries do not keep idle call locks alive. Remove finished
+        // entries opportunistically so this map does not grow with call IDs.
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        if let Some(lock) = locks.get(call_id).and_then(Weak::upgrade) {
+            return lock;
+        }
+        let lock = Arc::new(Mutex::new(()));
+        locks.insert(call_id.to_owned(), Arc::downgrade(&lock));
+        lock
+    }
+
     async fn get(&self, call_id: &str) -> Result<Arc<dyn PeerConnection>> {
         self.peers
             .lock()
@@ -481,6 +530,17 @@ impl WebRtcManager {
         call_id: &str,
         ice_servers: Vec<serde_json::Value>,
     ) -> Result<Arc<dyn PeerConnection>> {
+        #[cfg(test)]
+        if let Some(hooks) = &self.offer_test_hooks {
+            hooks.builds_started.add_permits(1);
+            hooks.build_count.fetch_add(1, Ordering::SeqCst);
+            hooks
+                .release_build
+                .acquire()
+                .await
+                .expect("test must release gated peer build")
+                .forget();
+        }
         let servers = parse_ice_servers(ice_servers)?;
         let config = RTCConfigurationBuilder::default()
             .with_ice_servers(servers)
@@ -489,8 +549,13 @@ impl WebRtcManager {
             call_id: call_id.to_string(),
             tx: self.event_tx.clone(),
         });
+        let mut media_engine = MediaEngine::default();
+        media_engine
+            .register_default_codecs()
+            .map_err(|e| Error::Internal(format!("register WebRTC codecs: {e}")))?;
         let pc_impl = PeerConnectionBuilder::new()
             .with_configuration(config)
+            .with_media_engine(media_engine)
             .with_handler(handler)
             .with_udp_addrs(vec!["0.0.0.0:0"])
             .build()
@@ -541,7 +606,7 @@ async fn poll_data_channel(
         let Some(event) = dc.poll().await else { break };
         match event {
             DataChannelEvent::OnMessage(msg) => {
-                let is_text = std::str::from_utf8(&msg.data).is_ok();
+                let is_text = data_channel_message_is_text(&msg);
                 state.events.push(crate::events::types::Event::ephemeral(
                     "webrtc_event",
                     serde_json::json!({
@@ -573,7 +638,185 @@ async fn poll_data_channel(
     }
 }
 
+fn data_channel_message_is_text(message: &RTCDataChannelMessage) -> bool {
+    message.is_string
+}
+
 fn base64_standard(data: &[u8]) -> String {
     use base64::Engine;
     base64::engine::general_purpose::STANDARD.encode(data)
+}
+
+#[cfg(test)]
+struct OfferTestHooks {
+    offers_started: Semaphore,
+    builds_started: Semaphore,
+    release_build: Semaphore,
+    build_count: AtomicUsize,
+}
+
+#[cfg(test)]
+impl OfferTestHooks {
+    fn new() -> Self {
+        Self {
+            offers_started: Semaphore::new(0),
+            builds_started: Semaphore::new(0),
+            release_build: Semaphore::new(0),
+            build_count: AtomicUsize::new(0),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sdp_peer_identity(sdp: &str) -> (String, String) {
+        let origin = sdp
+            .lines()
+            .find(|line| line.starts_with("o="))
+            .expect("SDP should have an origin line");
+        let session_id = origin
+            .split_whitespace()
+            .nth(1)
+            .expect("SDP origin should have a session ID")
+            .to_owned();
+        let fingerprint = sdp
+            .lines()
+            .find(|line| line.starts_with("a=fingerprint:"))
+            .expect("SDP should have a DTLS fingerprint")
+            .to_owned();
+        (session_id, fingerprint)
+    }
+
+    #[tokio::test]
+    async fn idle_call_operation_locks_are_pruned_on_the_next_call() {
+        let manager = WebRtcManager::new();
+        drop(manager.call_operation_lock("closed-call").await);
+
+        let current_lock = manager.call_operation_lock("new-call").await;
+        let locks = manager.call_locks.lock().await;
+        assert_eq!(locks.len(), 1);
+        assert!(locks.contains_key("new-call"));
+        drop(locks);
+        drop(current_lock);
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_first_offers_share_the_retained_peer_connection() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let hooks = Arc::new(OfferTestHooks::new());
+                let mut manager = WebRtcManager::new();
+                manager.offer_test_hooks = Some(hooks.clone());
+                let manager = Arc::new(manager);
+
+                let first_manager = manager.clone();
+                let first = tokio::task::spawn_local(async move {
+                    first_manager
+                        .create_offer("concurrent-offer", Vec::new())
+                        .await
+                });
+                hooks
+                    .offers_started
+                    .acquire()
+                    .await
+                    .expect("first offer should start")
+                    .forget();
+                hooks
+                    .builds_started
+                    .acquire()
+                    .await
+                    .expect("first offer should start building a peer")
+                    .forget();
+
+                let second_manager = manager.clone();
+                let second = tokio::task::spawn_local(async move {
+                    second_manager
+                        .create_offer("concurrent-offer", Vec::new())
+                        .await
+                });
+                hooks
+                    .offers_started
+                    .acquire()
+                    .await
+                    .expect("second offer should start")
+                    .forget();
+
+                // The first build remains suspended until after the second
+                // call has reached its first await. Without per-call
+                // serialization, both calls observe the empty peer map and
+                // start separate builds here.
+                let builds_before_release = hooks.build_count.load(Ordering::SeqCst);
+                hooks.release_build.add_permits(2);
+
+                let first_offer = first.await.expect("first task should finish").unwrap();
+                let second_offer = second.await.expect("second task should finish").unwrap();
+                let retained = manager
+                    .get("concurrent-offer")
+                    .await
+                    .expect("a peer should be retained");
+                let retained_offer = retained
+                    .local_description()
+                    .await
+                    .expect("retained peer should have a local offer")
+                    .sdp;
+
+                assert_eq!(builds_before_release, 1, "only one peer may be built");
+                let retained_identity = sdp_peer_identity(&retained_offer);
+                assert_eq!(sdp_peer_identity(&first_offer), retained_identity);
+                assert_eq!(sdp_peer_identity(&second_offer), retained_identity);
+                assert_eq!(second_offer, retained_offer);
+                manager.close("concurrent-offer").await.unwrap();
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn creating_an_offer_after_adding_audio_reuses_the_peer_connection() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let manager = WebRtcManager::new();
+                let first_offer = manager
+                    .create_offer("renegotiate", Vec::new())
+                    .await
+                    .expect("create initial offer");
+                assert!(!first_offer.contains("m=audio"));
+
+                manager
+                    .add_audio_track("renegotiate", "microphone")
+                    .await
+                    .expect("add local audio track");
+                manager
+                    .create_data_channel("renegotiate", "chat")
+                    .await
+                    .expect("add data channel");
+                let renegotiated_offer = manager
+                    .create_offer("renegotiate", Vec::new())
+                    .await
+                    .expect("create renegotiation offer on existing peer");
+                assert!(
+                    renegotiated_offer.contains("m=audio"),
+                    "offer must describe the track added to this call"
+                );
+                assert!(
+                    renegotiated_offer.contains("m=application"),
+                    "offer must describe the data channel added to this call"
+                );
+
+                manager.close("renegotiate").await.expect("close peer");
+            })
+            .await;
+    }
+
+    #[test]
+    fn binary_data_channel_message_is_not_reclassified_by_utf8_validity() {
+        let message = RTCDataChannelMessage {
+            is_string: false,
+            data: bytes::BytesMut::from(&b"valid utf8 text"[..]),
+        };
+
+        assert!(std::str::from_utf8(&message.data).is_ok());
+        assert!(!data_channel_message_is_text(&message));
+    }
 }

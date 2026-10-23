@@ -4,7 +4,7 @@ use friendshub_core::transport::protobuf::{
 };
 use js_sys::{ArrayBuffer, Date, Error as JsError, Promise, Reflect, Uint8Array};
 use serde_json::Value;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use url::Url;
 use wasm_bindgen::JsCast;
@@ -377,7 +377,7 @@ impl BrowserRestClient {
         if !self.retry_on_rate_limit || external_signal.as_ref().is_some_and(AbortSignal::aborted) {
             return Err(error);
         }
-        wait_for_retry_after(delay_ms).await?;
+        wait_for_retry_after(delay_ms, external_signal.as_ref()).await?;
         if external_signal.as_ref().is_some_and(AbortSignal::aborted) {
             return Err(error);
         }
@@ -1101,8 +1101,14 @@ fn rate_limit_retry_delay_values(status: Option<u16>, retry_after_ms: Option<f64
     retry_after_ms.filter(|delay| delay.is_finite() && *delay >= 0.0)
 }
 
-async fn wait_for_retry_after(mut remaining_ms: f64) -> Result<(), JsValue> {
+async fn wait_for_retry_after(
+    mut remaining_ms: f64,
+    external_signal: Option<&AbortSignal>,
+) -> Result<(), JsValue> {
     while remaining_ms > 0.0 {
+        if external_signal.is_some_and(AbortSignal::aborted) {
+            return Err(aborted_retry_wait_error());
+        }
         let interval = remaining_ms.min(i32::MAX as f64).ceil() as i32;
         let window = web_sys::window().ok_or_else(|| {
             RestError::new(
@@ -1113,22 +1119,113 @@ async fn wait_for_retry_after(mut remaining_ms: f64) -> Result<(), JsValue> {
             )
             .into_js()
         })?;
-        let timer_window = window.clone();
-        let promise = Promise::new(&mut move |resolve, reject| {
-            let callback = Closure::once_into_js(move || {
-                let _ = resolve.call0(&JsValue::UNDEFINED);
+        if let Some(signal) = external_signal {
+            wait_for_retry_interval(interval, window, signal).await?;
+        } else {
+            let timer_window = window.clone();
+            let promise = Promise::new(&mut move |resolve, reject| {
+                let callback = Closure::once_into_js(move || {
+                    let _ = resolve.call0(&JsValue::UNDEFINED);
+                });
+                if let Err(error) = timer_window
+                    .set_timeout_with_callback_and_timeout_and_arguments_0(
+                        callback.unchecked_ref(),
+                        interval,
+                    )
+                {
+                    let _ = reject.call1(&JsValue::UNDEFINED, &error);
+                }
             });
-            if let Err(error) = timer_window.set_timeout_with_callback_and_timeout_and_arguments_0(
-                callback.unchecked_ref(),
-                interval,
-            ) {
-                let _ = reject.call1(&JsValue::UNDEFINED, &error);
-            }
-        });
-        JsFuture::from(promise).await?;
+            JsFuture::from(promise).await?;
+        }
         remaining_ms = (remaining_ms - f64::from(interval)).max(0.0);
     }
     Ok(())
+}
+
+async fn wait_for_retry_interval(
+    interval_ms: i32,
+    window: Window,
+    signal: &AbortSignal,
+) -> Result<(), JsValue> {
+    let signal = signal.clone();
+    let signal_for_cleanup = signal.clone();
+    let timer_handle = Rc::new(Cell::new(None));
+    let abort_listener: Rc<RefCell<Option<Closure<dyn FnMut(Event)>>>> =
+        Rc::new(RefCell::new(None));
+
+    let timer_for_executor = Rc::clone(&timer_handle);
+    let listener_for_executor = Rc::clone(&abort_listener);
+    let promise = Promise::new(&mut move |resolve, reject| {
+        let timer_for_abort = Rc::clone(&timer_for_executor);
+        let window_for_abort = window.clone();
+        let reject_for_abort = reject.clone();
+        let abort_callback = Closure::wrap(Box::new(move |_event: Event| {
+            if let Some(handle) = timer_for_abort.take() {
+                window_for_abort.clear_timeout_with_handle(handle);
+            }
+            let _ = reject_for_abort.call1(&JsValue::UNDEFINED, &aborted_retry_wait_error());
+        }) as Box<dyn FnMut(Event)>);
+
+        if let Err(error) = signal
+            .add_event_listener_with_callback("abort", abort_callback.as_ref().unchecked_ref())
+        {
+            let _ = reject.call1(&JsValue::UNDEFINED, &error);
+            return;
+        }
+        *listener_for_executor.borrow_mut() = Some(abort_callback);
+
+        // AbortSignal events run on the browser thread, but this second check
+        // closes the race between the initial check and listener installation.
+        if signal.aborted() {
+            let _ = reject.call1(&JsValue::UNDEFINED, &aborted_retry_wait_error());
+            return;
+        }
+
+        let signal_for_timer = signal.clone();
+        let listeners_for_timer = Rc::clone(&listener_for_executor);
+        let timer_callback = Closure::once_into_js(move || {
+            if let Some(listener) = listeners_for_timer.borrow().as_ref() {
+                let _ = signal_for_timer.remove_event_listener_with_callback(
+                    "abort",
+                    listener.as_ref().unchecked_ref(),
+                );
+            }
+            let _ = resolve.call0(&JsValue::UNDEFINED);
+        });
+        match window.set_timeout_with_callback_and_timeout_and_arguments_0(
+            timer_callback.unchecked_ref(),
+            interval_ms,
+        ) {
+            Ok(handle) => timer_for_executor.set(Some(handle)),
+            Err(error) => {
+                if let Some(listener) = listener_for_executor.borrow().as_ref() {
+                    let _ = signal.remove_event_listener_with_callback(
+                        "abort",
+                        listener.as_ref().unchecked_ref(),
+                    );
+                }
+                let _ = reject.call1(&JsValue::UNDEFINED, &error);
+            }
+        }
+    });
+
+    let result = JsFuture::from(promise).await;
+    if let Some(listener) = abort_listener.borrow_mut().take() {
+        let _ = signal_for_cleanup
+            .remove_event_listener_with_callback("abort", listener.as_ref().unchecked_ref());
+    }
+    result.map(|_| ())
+}
+
+fn aborted_retry_wait_error() -> JsValue {
+    RestError::new(
+        "aborted",
+        0,
+        "request was aborted during the rate-limit retry delay".into(),
+        String::new(),
+    )
+    .into_js()
 }
 
 fn js_runtime_error(context: &str, cause: JsValue) -> JsValue {

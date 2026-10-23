@@ -14,8 +14,22 @@ fn config_parses_minimal_json() {
 
 #[test]
 fn config_rejects_missing_required_fields() {
+    let raw = br#"{"api_base":"https://x","ws_url":"wss://x/ws","discovery":{"enabled":false}}"#;
+    let error = Config::from_json(raw).expect_err("missing db_path must be rejected");
+    assert!(
+        error.to_string().contains("db_path"),
+        "unexpected error: {error}"
+    );
+}
+
+#[test]
+fn config_rejects_empty_api_urls_when_discovery_is_disabled() {
     let raw = br#"{"api_base":"","ws_url":"wss://x/ws","db_path":"/tmp/x.db","discovery":{"enabled":false}}"#;
-    assert!(Config::from_json(raw).is_err());
+    let error = Config::from_json(raw).expect_err("empty api_base must be rejected");
+    assert!(
+        error.to_string().contains("discovery disabled"),
+        "unexpected error: {error}"
+    );
 }
 
 #[test]

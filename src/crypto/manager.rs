@@ -19,6 +19,18 @@ use crate::crypto::stores::Store;
 use crate::db::auth as db_auth;
 use crate::runtime::ActorState;
 
+fn device_id_from_i64(value: i64, field: &str) -> CryptoResult<DeviceId> {
+    let value = u32::try_from(value)
+        .map_err(|_| CryptoError::Invalid(format!("{field} is out of range")))?;
+    DeviceId::try_from(value).map_err(|e| CryptoError::Invalid(format!("{field}: {e}")))
+}
+
+fn device_id_from_u64(value: u64, field: &str) -> CryptoResult<DeviceId> {
+    let value = u32::try_from(value)
+        .map_err(|_| CryptoError::Invalid(format!("{field} is out of range")))?;
+    DeviceId::try_from(value).map_err(|e| CryptoError::Invalid(format!("{field}: {e}")))
+}
+
 async fn local_address(state: &ActorState) -> CryptoResult<ProtocolAddress> {
     let auth = db_auth::load(&state.db)
         .await
@@ -26,12 +38,60 @@ async fn local_address(state: &ActorState) -> CryptoResult<ProtocolAddress> {
         .ok_or(CryptoError::NoIdentity)?;
 
     let account_id = auth.account_id.ok_or(CryptoError::NoIdentity)?;
-    let device_number = auth.device_number.unwrap_or(1) as u32;
-
-    let device = DeviceId::try_from(device_number)
-        .map_err(|e| CryptoError::Invalid(format!("device id: {e}")))?;
+    let device = device_id_from_i64(auth.device_number.unwrap_or(1), "local device_number")?;
 
     Ok(ProtocolAddress::new(account_id, device))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[tokio::test]
+    async fn establish_session_rejects_unrepresentable_request_device_number_first() {
+        let database = sqlx::sqlite::SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory database");
+        let config = crate::config::Config {
+            db_path: std::path::PathBuf::from(":memory:"),
+            api_base: "http://127.0.0.1".into(),
+            ws_url: "ws://127.0.0.1".into(),
+            discovery: crate::config::DiscoveryConfig {
+                enabled: false,
+                ..crate::config::DiscoveryConfig::default()
+            },
+            log_level: "off".into(),
+            log_format: "text".into(),
+        };
+        let http = crate::transport::HttpClient::new(&config).expect("build HTTP client");
+        let state = ActorState::new(config, database.clone(), http);
+
+        let error = establish_outbound_session(&state, "peer", 4_294_967_297, &json!({}))
+            .await
+            .expect_err("out-of-range device numbers must be rejected before use");
+        assert!(matches!(
+            &error,
+            CryptoError::Invalid(message) if message.contains("device_number")
+        ));
+
+        database.close().await;
+    }
+
+    #[test]
+    fn bundle_rejects_unrepresentable_device_number_before_other_fields() {
+        let result = bundle_from_json(&json!({
+            "registration_id": 1,
+            "device_number": 4_294_967_297_u64
+        }));
+
+        assert!(matches!(
+            &result,
+            Err(CryptoError::Invalid(message)) if message.contains("device_number")
+        ));
+    }
 }
 
 /// True when a session already exists for the given peer device.
@@ -57,12 +117,11 @@ fn bundle_from_json(v: &serde_json::Value) -> CryptoResult<PreKeyBundle> {
             .and_then(|x| x.as_u64())
             .ok_or_else(|| CryptoError::Invalid("registration_id missing".into()))? as u32;
 
-    let device_number =
-        v.get("device_number")
-            .and_then(|x| x.as_u64())
-            .ok_or_else(|| CryptoError::Invalid("device_number missing".into()))? as u32;
-    let device_id = DeviceId::try_from(device_number)
-        .map_err(|e| CryptoError::Invalid(format!("device_id: {e}")))?;
+    let device_number = v
+        .get("device_number")
+        .and_then(|x| x.as_u64())
+        .ok_or_else(|| CryptoError::Invalid("device_number missing or invalid".into()))?;
+    let device_id = device_id_from_u64(device_number, "device_number")?;
 
     let identity_key_hex = v
         .get("identity_key_pub")
@@ -148,9 +207,8 @@ pub async fn establish_outbound_session(
     device_number: i64,
     bundle_json: &serde_json::Value,
 ) -> CryptoResult<()> {
+    let device = device_id_from_i64(device_number, "device_number")?;
     let local = local_address(state).await?;
-    let device = DeviceId::try_from(device_number as u32)
-        .map_err(|e| CryptoError::Invalid(format!("device id: {e}")))?;
     let remote = ProtocolAddress::new(recipient_account_id.to_string(), device);
 
     let bundle = bundle_from_json(bundle_json)?;
@@ -185,9 +243,8 @@ pub async fn encrypt_for_device(
     device_number: i64,
     plaintext: &[u8],
 ) -> CryptoResult<(Vec<u8>, bool)> {
+    let device = device_id_from_i64(device_number, "device_number")?;
     let local = local_address(state).await?;
-    let device = DeviceId::try_from(device_number as u32)
-        .map_err(|e| CryptoError::Invalid(format!("device id: {e}")))?;
     let remote = ProtocolAddress::new(recipient_account_id.to_string(), device);
 
     let mut session_store = Store::new(state.db.clone());
@@ -227,8 +284,8 @@ pub async fn decrypt_envelope(
     let sender_device = envelope
         .get("sender_device_number")
         .and_then(|x| x.as_u64())
-        .ok_or_else(|| CryptoError::Invalid("sender_device_number missing".into()))?
-        as u32;
+        .ok_or_else(|| CryptoError::Invalid("sender_device_number missing or invalid".into()))?;
+    let sender_device = device_id_from_u64(sender_device, "sender_device_number")?;
     let is_prekey = envelope
         .get("is_prekey_message")
         .and_then(|x| x.as_bool())
@@ -252,9 +309,7 @@ pub async fn decrypt_envelope(
     };
 
     let local = local_address(state).await?;
-    let device = DeviceId::try_from(sender_device)
-        .map_err(|e| CryptoError::Invalid(format!("device id: {e}")))?;
-    let remote = ProtocolAddress::new(sender_account_id.to_string(), device);
+    let remote = ProtocolAddress::new(sender_account_id.to_string(), sender_device);
 
     let mut session_store = Store::new(state.db.clone());
     let mut identity_store = Store::new(state.db.clone());

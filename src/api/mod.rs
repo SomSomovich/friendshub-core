@@ -371,10 +371,11 @@ async fn version(state: &Arc<ActorState>) -> Result<Vec<u8>> {
     Ok(serde_json::to_vec(&v)?)
 }
 
-/// Moves un-notified identity changes into the event queue and marks them
-/// notified. The event is ephemeral: the consumer is expected to show it
-/// immediately and the durable copy is not replayed after a crash. If the
-/// UI is not running, the warning would arrive too late to matter anyway.
+/// Claims un-notified identity changes before moving them into the event
+/// queue. The conditional update and returned rows are one SQLite statement,
+/// so concurrent API dispatches cannot enqueue the same warning twice. The
+/// event is ephemeral: the consumer is expected to show it immediately and
+/// the durable copy is not replayed after a crash.
 pub(crate) async fn emit_pending_identity_changes(state: &Arc<ActorState>) {
     #[derive(sqlx::FromRow)]
     struct Row {
@@ -386,8 +387,12 @@ pub(crate) async fn emit_pending_identity_changes(state: &Arc<ActorState>) {
         changed_at: i64,
     }
 
-    let rows: Vec<Row> = match sqlx::query_as::<_, Row>(
-        "SELECT id, account_id, device_number, old_key, new_key, changed_at FROM identity_changes WHERE notified = 0 ORDER BY id ASC LIMIT 64",
+    let mut rows: Vec<Row> = match sqlx::query_as::<_, Row>(
+        "UPDATE identity_changes SET notified = 1
+          WHERE id IN (
+              SELECT id FROM identity_changes WHERE notified = 0 ORDER BY id ASC LIMIT 64
+          )
+          RETURNING id, account_id, device_number, old_key, new_key, changed_at",
     )
     .fetch_all(&state.db)
     .await
@@ -403,7 +408,7 @@ pub(crate) async fn emit_pending_identity_changes(state: &Arc<ActorState>) {
         return;
     }
 
-    let mut acked: Vec<i64> = Vec::with_capacity(rows.len());
+    rows.sort_by_key(|row| row.id);
     for r in rows {
         state.events.push(crate::events::types::Event::ephemeral(
             "identity_changed",
@@ -415,13 +420,86 @@ pub(crate) async fn emit_pending_identity_changes(state: &Arc<ActorState>) {
                 "changed_at": r.changed_at,
             }),
         ));
-        acked.push(r.id);
+    }
+}
+
+#[cfg(test)]
+mod identity_change_tests {
+    use std::sync::{Arc, mpsc};
+    use std::time::Duration;
+
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    use super::*;
+    use crate::config::{Config, DiscoveryConfig};
+    use crate::events::{EventHandler, types::Event};
+    use crate::runtime::ActorState;
+    use crate::transport::HttpClient;
+
+    struct IdentityChangeCounter(mpsc::Sender<()>);
+
+    impl EventHandler for IdentityChangeCounter {
+        fn on_identity_changed(&self, _event: &Event) {
+            let _ = self.0.send(());
+        }
     }
 
-    for id in acked {
-        let _ = sqlx::query("UPDATE identity_changes SET notified = 1 WHERE id = ?")
-            .bind(id)
-            .execute(&state.db)
-            .await;
+    #[tokio::test(flavor = "current_thread")]
+    async fn concurrent_dispatches_emit_each_identity_change_once() {
+        let config = Config {
+            db_path: "/tmp/friendshub-core-identity-event-test.db".into(),
+            api_base: "http://127.0.0.1".into(),
+            ws_url: "ws://127.0.0.1/ws".into(),
+            discovery: DiscoveryConfig {
+                enabled: false,
+                ..DiscoveryConfig::default()
+            },
+            log_level: "error".into(),
+            log_format: "text".into(),
+        };
+        let db = SqlitePoolOptions::new()
+            .max_connections(4)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory database");
+        crate::db::migrations::MIGRATOR
+            .run(&db)
+            .await
+            .expect("apply migrations");
+        sqlx::query(
+            "INSERT INTO identity_changes (account_id, device_number, old_key, new_key, changed_at) VALUES ('peer', 2, x'01', x'02', 1)",
+        )
+        .execute(&db)
+        .await
+        .expect("seed pending identity change");
+
+        let events = Arc::new(crate::events::EventQueue::new());
+        let (tx, rx) = mpsc::channel();
+        events
+            .set_handler(Arc::new(IdentityChangeCounter(tx)))
+            .expect("install callback handler");
+        events
+            .drain_backlog_to_handler()
+            .expect("activate callback handler");
+        let http = HttpClient::new(&config).expect("build HTTP client");
+        let state = Arc::new(ActorState::new_with_events(
+            config,
+            db,
+            http,
+            events.clone(),
+        ));
+
+        tokio::join!(
+            emit_pending_identity_changes(&state),
+            emit_pending_identity_changes(&state),
+        );
+
+        rx.recv_timeout(Duration::from_secs(1))
+            .expect("the warning must be emitted");
+        assert!(
+            rx.recv_timeout(Duration::from_millis(50)).is_err(),
+            "a concurrent dispatch must not enqueue a duplicate warning"
+        );
+        events.clear_handler_and_wait();
     }
 }

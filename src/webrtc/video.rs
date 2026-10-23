@@ -6,12 +6,8 @@
 //!
 //! Receiving: when a remote peer attaches a video track, on_track fires with
 //! a TrackRemote. A poller is spawned for it; the poller reassembles RTP
-//! packets into frames and pushes them into a bounded channel. Frames are
-//! read out through read_frame.
-//!
-//! The channel is small on purpose. If the consumer falls behind, the right
-//! behaviour for video is to drop frames, not to queue them and drift
-//! further behind real time.
+//! packets into frames and stores only the newest frame. Frames are read out
+//! through read_frame; a slow consumer never builds a stale playback backlog.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,9 +16,9 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use rtc::media_stream::MediaStreamTrack as RtcMediaStreamTrack;
 use rtc::media_stream::{MediaStreamId, MediaStreamTrackId};
-use rtc::rtp_transceiver::rtp_sender::RtpCodecKind;
+use rtc::rtp_transceiver::rtp_sender::{RTCRtpCodec, RTCRtpEncodingParameters, RtpCodecKind};
 use rtc_media::Sample;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, watch};
 use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
 use webrtc::media_stream::track_remote::{TrackRemote, TrackRemoteEvent};
 
@@ -33,14 +29,9 @@ use crate::webrtc::vp8::Vp8Depacketizer;
 /// negotiation tricks.
 pub const MIME_VP8: &str = "video/VP8";
 
-/// Maximum number of frames waiting to be read. Small: video does not want
-/// a backlog, it wants the newest frame.
-const FRAME_BUFFER_DEPTH: usize = 5;
-
-/// Inbound frame queue per call. A reader takes the Arc out of the map,
-/// releases the outer lock, and then waits on the inner one, so reads on
-/// different calls do not serialize on a single mutex.
-type FrameReceiverMap = Mutex<HashMap<String, Arc<Mutex<mpsc::Receiver<Vec<u8>>>>>>;
+/// Per-call latest-frame receiver. Readers hold a separate mutex while
+/// waiting, so reads on different calls do not serialize on one lock.
+type FrameReceiverMap = Mutex<HashMap<String, Arc<Mutex<watch::Receiver<Option<Vec<u8>>>>>>>;
 
 pub struct InboundVideoTrack {
     pub call_id: String,
@@ -70,7 +61,16 @@ impl VideoTracks {
             MediaStreamId::new(),
             label.to_string(),
             RtpCodecKind::Video,
-            vec![],
+            vec![RTCRtpEncodingParameters {
+                codec: RTCRtpCodec {
+                    mime_type: MIME_VP8.to_owned(),
+                    clock_rate: 90_000,
+                    channels: 0,
+                    sdp_fmtp_line: String::new(),
+                    rtcp_feedback: vec![],
+                },
+                ..Default::default()
+            }],
         );
         let local = TrackLocalStaticSample::new(Instant::now(), stream_track)
             .map_err(|e| Error::Internal(format!("video track: {e}")))?;
@@ -111,7 +111,7 @@ impl VideoTracks {
         track_id: String,
         track: Arc<dyn TrackRemote>,
     ) {
-        let (tx, rx) = mpsc::channel::<Vec<u8>>(FRAME_BUFFER_DEPTH);
+        let (tx, rx) = watch::channel::<Option<Vec<u8>>>(None);
 
         self.frames
             .lock()
@@ -132,10 +132,10 @@ impl VideoTracks {
             while let Some(event) = track.poll().await {
                 match event {
                     TrackRemoteEvent::OnRtpPacket(pkt) => {
-                        if let Some(frame) = depack.push(&pkt)
-                            && tx.try_send(frame).is_err()
-                        {
-                            tracing::trace!(call_id = %call, "video frame dropped: buffer full or closed");
+                        if let Some(frame) = depack.push(&pkt) {
+                            // A watch channel stores only the newest frame;
+                            // a slow reader never has to drain stale backlog.
+                            tx.send_replace(Some(frame));
                         }
                     }
                     TrackRemoteEvent::OnEnding | TrackRemoteEvent::OnEnded => {
@@ -161,10 +161,9 @@ impl VideoTracks {
         let rx_arc = rx_arc?;
 
         let mut rx = rx_arc.lock().await;
-        match tokio::time::timeout(timeout, rx.recv()).await {
-            Ok(Some(frame)) => Some(frame),
-            Ok(None) => None,
-            Err(_) => None,
+        match tokio::time::timeout(timeout, rx.changed()).await {
+            Ok(Ok(())) => rx.borrow_and_update().clone(),
+            Ok(Err(_)) | Err(_) => None,
         }
     }
 
@@ -183,5 +182,21 @@ impl VideoTracks {
 
     pub fn outgoing_mime() -> &'static str {
         MIME_VP8
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unread_video_frames_are_coalesced_to_the_newest_frame() {
+        let (tx, mut rx) = watch::channel::<Option<Vec<u8>>>(None);
+        tx.send_replace(Some(vec![1]));
+        tx.send_replace(Some(vec![2]));
+        tx.send_replace(Some(vec![3]));
+
+        rx.changed().await.expect("a frame should be available");
+        assert_eq!(rx.borrow_and_update().as_deref(), Some([3].as_slice()));
     }
 }

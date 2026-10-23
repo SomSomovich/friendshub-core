@@ -3,6 +3,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::api::common::bearer;
+use crate::api::conversations::ConversationDetail;
 use crate::crypto::device_cache;
 use crate::crypto::groups;
 use crate::crypto::send::send_one;
@@ -162,11 +163,12 @@ pub async fn send_group_message(state: &Arc<ActorState>, payload: Vec<u8>) -> Re
     let plaintext = hex::decode(&req.plaintext_hex)
         .map_err(|e| Error::InvalidPayload(format!("plaintext hex: {e}")))?;
 
+    // Resolve authoritative membership before advancing the sender-key ratchet.
+    // A failed server read must leave the local group key state untouched.
+    let members = member_account_ids(state, &req.conversation_id).await?;
     let skm = groups::encrypt_for_group(state, &req.conversation_id, &plaintext)
         .await
         .map_err(Error::from)?;
-
-    let members = member_account_ids(state, &req.conversation_id).await?;
 
     let auth = db_auth::load(&state.db)
         .await?
@@ -281,14 +283,11 @@ pub async fn send_group_message(state: &Arc<ActorState>, payload: Vec<u8>) -> Re
 // ---------------------------------------------------------------
 
 /// Returns the account ids of everyone in the conversation, including the
-/// caller. Only accounts, not bots. Order is not guaranteed.
+/// caller. Membership is authoritative on the server; it is not duplicated in
+/// the local client database.
 async fn member_account_ids(state: &Arc<ActorState>, conversation_id: &str) -> Result<Vec<String>> {
-    let rows: Vec<(String,)> = sqlx::query_as(
-        "SELECT account_id FROM conversation_members WHERE conversation_id = ? AND left_at IS NULL",
-    )
-    .bind(conversation_id)
-    .fetch_all(&state.db)
-    .await?;
-
-    Ok(rows.into_iter().map(|(a,)| a).collect())
+    let token = bearer(state).await?;
+    let path = format!("/api/v1/conversations/{conversation_id}");
+    let detail: ConversationDetail = state.http.get(&path, Some(&token)).await?;
+    Ok(detail.members)
 }

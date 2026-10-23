@@ -12,9 +12,8 @@ pub struct InitRequest {
     pub name: String,
 }
 
-/// Generates the local identity, registers the device with the server, and
-/// provisions the initial prekey material. Idempotent only in the failure
-/// sense: a second call once identity exists returns a conflict.
+/// Starts or resumes local identity creation, server registration, and initial
+/// prekey provisioning. A completed setup cannot be initialized a second time.
 pub async fn initialize(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
     let req: InitRequest = serde_json::from_slice(&payload)?;
     let result = init::initialize(state, &req.name)
@@ -31,12 +30,15 @@ pub async fn status(state: &Arc<ActorState>, _payload: Vec<u8>) -> Result<Vec<u8
     let available_otk: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM pre_keys")
         .fetch_one(&state.db)
         .await
-        .unwrap_or(0);
+        .map_err(|e| Error::Database(e.to_string()))?;
 
-    let available_kyber: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM kyber_pre_keys")
-        .fetch_one(&state.db)
-        .await
-        .unwrap_or(0);
+    let available_kyber: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM kyber_pre_keys
+          WHERE key_kind = 'one_time' AND used = 0",
+    )
+    .fetch_one(&state.db)
+    .await
+    .map_err(|e| Error::Database(e.to_string()))?;
 
     Ok(serde_json::to_vec(&serde_json::json!({
         "initialized": initialized,

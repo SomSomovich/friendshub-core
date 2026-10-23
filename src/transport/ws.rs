@@ -1112,15 +1112,19 @@ fn parse_uuid_bytes(v: &serde_json::Value, key: &str) -> Result<Vec<u8>> {
 fn get_u32(v: &serde_json::Value, key: &str) -> Result<u32> {
     v.get(key)
         .and_then(|x| x.as_u64())
-        .map(|n| n as u32)
-        .ok_or_else(|| Error::InvalidPayload(format!("{key} is missing or not a number")))
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(|| {
+            Error::InvalidPayload(format!("{key} is missing, not a number, or out of range"))
+        })
 }
 
 fn get_i32(v: &serde_json::Value, key: &str) -> Result<i32> {
     v.get(key)
         .and_then(|x| x.as_i64())
-        .map(|n| n as i32)
-        .ok_or_else(|| Error::InvalidPayload(format!("{key} is missing or not a number")))
+        .and_then(|n| i32::try_from(n).ok())
+        .ok_or_else(|| {
+            Error::InvalidPayload(format!("{key} is missing, not a number, or out of range"))
+        })
 }
 
 fn get_i64(v: &serde_json::Value, key: &str) -> i64 {
@@ -1267,6 +1271,17 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn envelope_numeric_fields_reject_values_outside_the_protobuf_ranges() {
+        assert!(get_u32(&json!({ "value": 4_294_967_295_u64 }), "value").is_ok());
+        assert!(get_u32(&json!({ "value": 4_294_967_296_u64 }), "value").is_err());
+        assert!(get_u32(&json!({ "value": 4_294_967_297_u64 }), "value").is_err());
+        assert!(get_i32(&json!({ "value": i32::MIN }), "value").is_ok());
+        assert!(get_i32(&json!({ "value": i32::MAX }), "value").is_ok());
+        assert!(get_i32(&json!({ "value": i64::from(i32::MAX) + 1 }), "value").is_err());
+        assert!(get_i32(&json!({ "value": i64::from(i32::MIN) - 1 }), "value").is_err());
     }
 
     #[tokio::test]

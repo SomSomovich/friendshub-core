@@ -5,10 +5,9 @@
 //! only routes them.
 //!
 //! Receiving: an Opus RTP stream arrives as a sequence of packets, one Opus
-//! frame per packet for the common case of 20 ms frames. A frame that spans
-//! more than one packet is reassembled by concatenating payloads until the
-//! RTP marker bit, which is the same rule VP8 uses but without the codec-
-//! specific descriptor.
+//! frame per packet for the common case of 20 ms frames. Every Opus RTP
+//! payload is delivered as one complete Opus packet; the marker identifies a
+//! talkspurt boundary, not an Opus packet boundary.
 //!
 //! The frame channel is deeper than video's: audio glitches are worse than a
 //! dropped video frame, and the audio stream is a fifth of the bitrate.
@@ -20,7 +19,7 @@ use std::time::{Duration, Instant};
 use bytes::Bytes;
 use rtc::media_stream::MediaStreamTrack as RtcMediaStreamTrack;
 use rtc::media_stream::{MediaStreamId, MediaStreamTrackId};
-use rtc::rtp_transceiver::rtp_sender::RtpCodecKind;
+use rtc::rtp_transceiver::rtp_sender::{RTCRtpCodec, RTCRtpEncodingParameters, RtpCodecKind};
 use rtc_media::Sample;
 use tokio::sync::{Mutex, mpsc};
 use webrtc::media_stream::track_local::static_sample::TrackLocalStaticSample;
@@ -66,7 +65,16 @@ impl AudioTracks {
             MediaStreamId::new(),
             label.to_string(),
             RtpCodecKind::Audio,
-            vec![],
+            vec![RTCRtpEncodingParameters {
+                codec: RTCRtpCodec {
+                    mime_type: MIME_OPUS.to_owned(),
+                    clock_rate: 48_000,
+                    channels: 2,
+                    sdp_fmtp_line: "minptime=10;useinbandfec=1".to_owned(),
+                    rtcp_feedback: vec![],
+                },
+                ..Default::default()
+            }],
         );
         let local = TrackLocalStaticSample::new(Instant::now(), stream_track)
             .map_err(|e| Error::Internal(format!("audio track: {e}")))?;
@@ -124,22 +132,12 @@ impl AudioTracks {
 
         let call = call_id.to_string();
         tokio::task::spawn_local(async move {
-            let mut pending: Vec<u8> = Vec::new();
-            let mut have_frame = false;
             while let Some(event) = track.poll().await {
                 match event {
                     TrackRemoteEvent::OnRtpPacket(pkt) => {
-                        // Opus has no codec-specific RTP descriptor: the entire
-                        // payload is the compressed frame (or the next slice of
-                        // one). A frame ends at the RTP marker bit.
-                        if !pkt.payload.is_empty() {
-                            pending.extend_from_slice(&pkt.payload);
-                            have_frame = true;
-                        }
-
-                        if have_frame && pkt.header.marker {
-                            let frame = std::mem::take(&mut pending);
-                            have_frame = false;
+                        // Each RTP payload is already one complete Opus packet;
+                        // marker only marks a talkspurt start.
+                        if let Some(frame) = opus_packet_frame(&pkt.payload) {
                             if tx.try_send(frame).is_err() {
                                 tracing::trace!(call_id = %call, "audio frame dropped: buffer full or closed");
                             }
@@ -185,5 +183,21 @@ impl AudioTracks {
 
     pub fn outgoing_mime() -> &'static str {
         MIME_OPUS
+    }
+}
+
+fn opus_packet_frame(payload: &[u8]) -> Option<Vec<u8>> {
+    (!payload.is_empty()).then(|| payload.to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn every_nonempty_opus_rtp_payload_is_a_separate_packet() {
+        assert_eq!(opus_packet_frame(&[0x11, 0x22]), Some(vec![0x11, 0x22]));
+        assert_eq!(opus_packet_frame(&[0x33]), Some(vec![0x33]));
+        assert_eq!(opus_packet_frame(&[]), None);
     }
 }

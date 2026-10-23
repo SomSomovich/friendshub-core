@@ -11,7 +11,12 @@
 //!
 //! Reference: RFC 7741 section 4.2.
 
+use std::time::{Duration, Instant};
+
 use rtc::rtp;
+
+const MAX_FRAME_SIZE: usize = 16 * 1024 * 1024;
+const MAX_FRAME_AGE: Duration = Duration::from_secs(1);
 
 pub struct Vp8Depacketizer {
     buffer: Vec<u8>,
@@ -19,6 +24,7 @@ pub struct Vp8Depacketizer {
     /// Set when a frame was started but never finished, so a later packet
     /// from a fresh frame does not silently glue onto the leftovers.
     last_sequence: Option<u16>,
+    frame_started_at: Option<Instant>,
 }
 
 impl Vp8Depacketizer {
@@ -27,12 +33,17 @@ impl Vp8Depacketizer {
             buffer: Vec::new(),
             in_frame: false,
             last_sequence: None,
+            frame_started_at: None,
         }
     }
 
     /// Feeds one RTP packet. Returns a complete frame when the packet
     /// terminates one, otherwise `None`.
     pub fn push(&mut self, packet: &rtp::Packet) -> Option<Vec<u8>> {
+        self.push_at(packet, Instant::now())
+    }
+
+    fn push_at(&mut self, packet: &rtp::Packet, now: Instant) -> Option<Vec<u8>> {
         let payload = packet.payload.as_ref();
         if payload.is_empty() {
             return None;
@@ -44,37 +55,59 @@ impl Vp8Depacketizer {
         if let Some(prev) = self.last_sequence
             && packet.header.sequence_number != prev.wrapping_add(1)
         {
-            self.buffer.clear();
-            self.in_frame = false;
+            self.reset_frame();
         }
         self.last_sequence = Some(packet.header.sequence_number);
 
-        let descriptor_len = parse_descriptor_len(payload)?;
+        let Some(descriptor_len) = parse_descriptor_len(payload) else {
+            self.reset_frame();
+            return None;
+        };
 
         let first = payload[0];
         let s_bit = (first & 0x10) != 0;
+        let partition_id = first & 0x0f;
 
-        if s_bit {
-            // New frame starts. Discard anything pending: the sender would
-            // not begin a new frame without having marked the previous one.
-            self.buffer.clear();
+        if self
+            .frame_started_at
+            .is_some_and(|started| now.saturating_duration_since(started) > MAX_FRAME_AGE)
+        {
+            self.reset_frame();
+        }
+
+        if s_bit && partition_id == 0 {
+            // Only partition zero begins a frame. Other S-bit packets start
+            // another partition within the current frame and must preserve
+            // the bytes already collected from partition zero.
+            self.reset_frame();
             self.in_frame = true;
+            self.frame_started_at = Some(now);
         } else if !self.in_frame {
             // Continuation of a frame we never saw start (we joined late, or
             // lost the opening packet). Ignore.
             return None;
         }
 
-        if descriptor_len <= payload.len() {
-            self.buffer.extend_from_slice(&payload[descriptor_len..]);
+        let frame_data = &payload[descriptor_len..];
+        if frame_data.len() > MAX_FRAME_SIZE.saturating_sub(self.buffer.len()) {
+            self.reset_frame();
+            return None;
         }
+        self.buffer.extend_from_slice(frame_data);
 
         if packet.header.marker && self.in_frame {
             self.in_frame = false;
+            self.frame_started_at = None;
             return Some(std::mem::take(&mut self.buffer));
         }
 
         None
+    }
+
+    fn reset_frame(&mut self) {
+        self.buffer.clear();
+        self.in_frame = false;
+        self.frame_started_at = None;
     }
 }
 
@@ -161,6 +194,59 @@ mod tests {
         assert_eq!(d.push(&first), None);
         assert_eq!(d.push(&mid), None);
         assert_eq!(d.push(&last), Some(b"abcd".to_vec()));
+    }
+
+    #[test]
+    fn later_partition_start_does_not_discard_the_base_partition() {
+        let mut d = Vp8Depacketizer::new();
+        assert_eq!(d.push(&packet(1, false, vec![0x10, b'a', b'b'])), None);
+        // S=1 and PID=1 means the start of a later partition, not a new frame.
+        assert_eq!(
+            d.push(&packet(2, true, vec![0x11, b'c', b'd'])),
+            Some(b"abcd".to_vec())
+        );
+    }
+
+    #[test]
+    fn oversized_incomplete_frame_is_discarded_and_does_not_block_the_next_frame() {
+        let mut d = Vp8Depacketizer::new();
+        // A single packet larger than the reassembly cap must not become an
+        // indefinitely retained incomplete frame.
+        let mut oversized = vec![0x10];
+        oversized.resize(16 * 1024 * 1024 + 2, 0x00);
+        assert_eq!(d.push(&packet(1, false, oversized)), None);
+        assert!(!d.in_frame);
+        assert_eq!(d.buffer.len(), 0);
+
+        assert_eq!(
+            d.push(&packet(2, true, vec![0x10, b'x'])),
+            Some(b"x".to_vec())
+        );
+    }
+
+    #[test]
+    fn incomplete_frame_expires_and_a_later_base_partition_recovers() {
+        let mut d = Vp8Depacketizer::new();
+        let start = Instant::now();
+        assert_eq!(d.push_at(&packet(1, false, vec![0x10, b'a']), start), None);
+        // An expired continuation is ignored rather than extending stale
+        // frame storage indefinitely.
+        assert_eq!(
+            d.push_at(
+                &packet(2, false, vec![0x00, b'b']),
+                start + MAX_FRAME_AGE + Duration::from_millis(1)
+            ),
+            None
+        );
+        assert!(!d.in_frame);
+        assert!(d.buffer.is_empty());
+        assert_eq!(
+            d.push_at(
+                &packet(3, true, vec![0x10, b'x']),
+                start + MAX_FRAME_AGE + Duration::from_millis(2)
+            ),
+            Some(b"x".to_vec())
+        );
     }
 
     #[test]

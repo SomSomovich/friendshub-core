@@ -159,13 +159,20 @@ pub async fn initiate_call(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<
     let req: InitiateCallRequest = serde_json::from_slice(&payload)?;
     let ice = fetch_ice(state).await?;
     let sdp = state.webrtc.create_offer(&req.call_id, ice).await?;
-    let sent = crate::webrtc::signal::send_call_offer(
+    let sent = match crate::webrtc::signal::send_call_offer(
         state,
         &req.recipient_account_id,
         &req.call_id,
         &sdp,
     )
-    .await?;
+    .await
+    {
+        Ok(sent) => sent,
+        Err(error) => {
+            let _ = state.webrtc.close(&req.call_id).await;
+            return Err(error);
+        }
+    };
     Ok(serde_json::to_vec(&serde_json::json!({
         "call_id": req.call_id,
         "sdp": sdp,
@@ -187,13 +194,20 @@ pub async fn accept_call(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Ve
         .webrtc
         .accept_offer(&req.call_id, &req.remote_sdp, ice)
         .await?;
-    let sent = crate::webrtc::signal::send_call_answer(
+    let sent = match crate::webrtc::signal::send_call_answer(
         state,
         &req.recipient_account_id,
         &req.call_id,
         &sdp,
     )
-    .await?;
+    .await
+    {
+        Ok(sent) => sent,
+        Err(error) => {
+            let _ = state.webrtc.close(&req.call_id).await;
+            return Err(error);
+        }
+    };
     Ok(serde_json::to_vec(&serde_json::json!({
         "call_id": req.call_id,
         "sdp": sdp,
@@ -263,4 +277,105 @@ pub async fn reject(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>
     Ok(serde_json::to_vec(&serde_json::json!({
         "envelopes_sent": sent.len(),
     }))?)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::{Read, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::Arc;
+    use std::thread;
+
+    use prost::Message;
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    use super::*;
+    use crate::config::{Config, DiscoveryConfig};
+    use crate::db::{auth::AuthState, migrations::MIGRATOR};
+    use crate::runtime::ActorState;
+    use crate::transport::HttpClient;
+
+    fn respond(mut stream: &TcpStream, body: &[u8]) {
+        write!(
+            stream,
+            "HTTP/1.1 200 OK\r\nContent-Type: application/x-protobuf\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .expect("write response headers");
+        stream.write_all(body).expect("write response body");
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn initiate_call_closes_peer_when_signal_delivery_fails() {
+        tokio::task::LocalSet::new()
+            .run_until(async {
+                let listener = TcpListener::bind("127.0.0.1:0").expect("bind fixture");
+                let address = listener.local_addr().expect("fixture address");
+                let server = thread::spawn(move || {
+                    let (mut stream, _) = listener.accept().expect("accept ICE request");
+                    let mut request = [0u8; 4096];
+                    let _ = stream.read(&mut request);
+                    let body = crate::proto::rest::community::IceServersResponse {
+                        ice_servers: Vec::new(),
+                        ttl_seconds: 60,
+                    }
+                    .encode_to_vec();
+                    respond(&stream, &body);
+                });
+
+                let config = Config {
+                    db_path: "/tmp/friendshub-core-webrtc-test.db".into(),
+                    api_base: format!("http://{address}"),
+                    ws_url: format!("ws://{address}/ws"),
+                    discovery: DiscoveryConfig {
+                        enabled: false,
+                        ..DiscoveryConfig::default()
+                    },
+                    log_level: "error".into(),
+                    log_format: "text".into(),
+                };
+                let db = SqlitePoolOptions::new()
+                    .max_connections(2)
+                    .connect("sqlite::memory:")
+                    .await
+                    .expect("open in-memory database");
+                MIGRATOR.run(&db).await.expect("apply migrations");
+                crate::db::auth::store(
+                    &db,
+                    &AuthState {
+                        account_id: Some("sender".into()),
+                        session_token: Some("session-token".into()),
+                        device_number: Some(1),
+                        totp_enabled: Some(0),
+                        ..AuthState::default()
+                    },
+                )
+                .await
+                .expect("store session");
+                sqlx::query(
+                    "INSERT INTO device_cache (account_id, devices_json, fetched_at) VALUES ('recipient', '[]', ?)",
+                )
+                .bind(crate::util::time::now_unix())
+                .execute(&db)
+                .await
+                .expect("seed an empty recipient device list");
+                let http = HttpClient::new(&config).expect("build HTTP client");
+                let state = Arc::new(ActorState::new(config, db, http));
+
+                let result = initiate_call(
+                    &state,
+                    br#"{"recipient_account_id":"recipient","call_id":"call-1"}"#.to_vec(),
+                )
+                .await;
+                assert!(result.is_err(), "missing recipient devices must fail signaling");
+                assert!(
+                    state.webrtc.list_active().await.is_empty(),
+                    "failed signaling must not retain the newly created peer"
+                );
+
+                drop(state);
+                server.join().expect("fixture server must exit");
+            })
+            .await;
+    }
 }

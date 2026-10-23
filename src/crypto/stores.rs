@@ -56,21 +56,20 @@ fn kyber_u32(id: KyberPreKeyId) -> u32 {
     u32::from(id)
 }
 
-/// Rebuilds an `IdentityKeyPair` from the byte layout `serialize` produces:
-/// a 33-byte public key followed by a 32-byte private key.
+/// Rebuilds an `IdentityKeyPair` from libsignal's serialized protobuf form.
+/// A 65-byte raw public/private layout is also accepted for databases produced
+/// by early development snapshots that used that representation.
 pub fn decode_identity_key_pair(
     blob: &[u8],
 ) -> std::result::Result<IdentityKeyPair, SignalProtocolError> {
-    if blob.len() != 65 {
-        return Err(SignalProtocolError::InvalidArgument(format!(
-            "identity key pair blob is {} bytes, expected 65",
-            blob.len()
-        )));
-    }
-
-    let public = PublicKey::deserialize(&blob[..33]).map_err(store_err)?;
-    let private = PrivateKey::deserialize(&blob[33..]).map_err(store_err)?;
-    Ok(IdentityKeyPair::new(IdentityKey::new(public), private))
+    IdentityKeyPair::try_from(blob).or_else(|protobuf_error| {
+        if blob.len() != 65 {
+            return Err(protobuf_error);
+        }
+        let public = PublicKey::deserialize(&blob[..33]).map_err(store_err)?;
+        let private = PrivateKey::deserialize(&blob[33..]).map_err(store_err)?;
+        Ok(IdentityKeyPair::new(IdentityKey::new(public), private))
+    })
 }
 
 // ---------------------------------------------------------------
@@ -115,12 +114,13 @@ impl IdentityKeyStore for Store {
         let blob = identity.serialize().to_vec();
         let now = now_unix();
 
+        let mut tx = self.db.begin().await.map_err(store_err)?;
         let existing: Option<(Vec<u8>,)> = sqlx::query_as(
             "SELECT identity_key FROM peer_identities WHERE account_id = ? AND device_number = ?",
         )
         .bind(&account_id)
         .bind(device_number)
-        .fetch_optional(&self.db)
+        .fetch_optional(&mut *tx)
         .await
         .map_err(store_err)?;
 
@@ -140,16 +140,15 @@ impl IdentityKeyStore for Store {
         .bind(device_number)
         .bind(&blob)
         .bind(now)
-        .execute(&self.db)
+        .execute(&mut *tx)
         .await
         .map_err(store_err)?;
 
-        // Record the change so the push callback can surface it. The new key is
-        // stored either way -- rejecting it outright would make the client
-        // unable to decrypt legitimate re-registrations -- but the user is
-        // told, and can decide whether to trust the peer again.
+        // The identity replacement and the warning are one durable change.
+        // If event persistence fails, roll back the replacement so a later
+        // retry can still detect and report the changed key.
         if changed && let Some((old,)) = &existing {
-            let _ = sqlx::query(
+            sqlx::query(
                     "INSERT INTO identity_changes (account_id, device_number, old_key, new_key, changed_at) VALUES (?, ?, ?, ?, ?)",
                 )
                 .bind(&account_id)
@@ -157,9 +156,14 @@ impl IdentityKeyStore for Store {
                 .bind(old)
                 .bind(&blob)
                 .bind(now)
-                .execute(&self.db)
-                .await;
+                .execute(&mut *tx)
+                .await
+                // Preserve the database error from the insert instead of
+                // acknowledging a change that cannot be surfaced.
+                .map_err(store_err)?;
         }
+
+        tx.commit().await.map_err(store_err)?;
 
         Ok(if changed {
             IdentityChange::ReplacedExisting

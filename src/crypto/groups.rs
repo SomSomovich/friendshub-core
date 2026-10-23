@@ -51,7 +51,18 @@ pub async fn distribution_id_for(state: &ActorState, conversation_id: &str) -> C
         .await
         .map_err(|e| CryptoError::Database(e.to_string()))?;
 
-    Ok(id)
+    // The insert is intentionally conflict tolerant, because simultaneous
+    // first use by distribution and send operations is valid. A caller that
+    // loses that uniqueness race must use the winner's stored namespace,
+    // never its own unpersisted candidate UUID.
+    let (persisted,): (Vec<u8>,) = sqlx::query_as(SQL_GET_DIST)
+        .bind(conversation_id)
+        .fetch_one(&state.db)
+        .await
+        .map_err(|e| CryptoError::Database(e.to_string()))?;
+
+    Uuid::from_slice(&persisted)
+        .map_err(|e| CryptoError::Invalid(format!("stored distribution id: {e}")))
 }
 
 /// Forces a new distribution id for a conversation. Used after a member is

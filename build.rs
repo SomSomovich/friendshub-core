@@ -12,6 +12,7 @@
 // step; a developer needs it locally.
 
 use std::env;
+use std::fs;
 use std::path::PathBuf;
 
 fn main() {
@@ -68,17 +69,40 @@ fn main() {
         "#[serde(rename_all = \"camelCase\", deny_unknown_fields)]",
     );
     config.field_attribute(".fh.rest", "#[serde(default)]");
+    // The backend keeps its canonical schema under `proto/`, while its
+    // imports are repository-relative (`proto/rest/...`). Keep `proto_dir`
+    // as the direct include root for the vendored core schema and add its
+    // parent so the backend's repository-relative imports resolve too.
+    let schema_source = fs::read_to_string(&proto_file)
+        .unwrap_or_else(|e| panic!("failed to read {}: {e}", proto_file.display()));
+
+    let rest_files = [
+        "common.proto",
+        "identity.proto",
+        "chat.proto",
+        "community.proto",
+    ];
+    let rest_sources = rest_files
+        .iter()
+        .filter(|file| {
+            let short_import = format!("import \"rest/{file}\"");
+            let repository_import = format!("import \"proto/rest/{file}\"");
+            !schema_source.contains(&short_import) && !schema_source.contains(&repository_import)
+        })
+        .map(|file| proto_dir.join("rest").join(file));
+
+    let mut proto_files = vec![proto_file.clone()];
+    proto_files.extend(rest_sources);
+
+    let mut include_dirs = vec![proto_dir.clone()];
+    if let Some(repository_root) = proto_dir.parent() {
+        if !repository_root.as_os_str().is_empty() && repository_root != proto_dir {
+            include_dirs.push(repository_root.to_path_buf());
+        }
+    }
+
     config
-        .compile_protos(
-            &[
-                proto_file.as_path(),
-                proto_dir.join("rest/common.proto").as_path(),
-                proto_dir.join("rest/identity.proto").as_path(),
-                proto_dir.join("rest/chat.proto").as_path(),
-                proto_dir.join("rest/community.proto").as_path(),
-            ],
-            &[proto_dir.as_path()],
-        )
+        .compile_protos(&proto_files, &include_dirs)
         .unwrap_or_else(|e| panic!("prost-build failed to compile friendshub.proto: {e}"));
 
     let generated = out_dir.join("fh.rs");
