@@ -401,6 +401,24 @@ mod tests {
             uuid_field(CONVERSATION_ID, "conversation_id").unwrap(),
             CONVERSATION_ID
         );
+        assert_eq!(
+            group_id(&json!({"conversation_id": CONVERSATION_ID})).unwrap(),
+            CONVERSATION_ID
+        );
+        assert_eq!(
+            channel_id(&json!({"conversation_id": CONVERSATION_ID})).unwrap(),
+            CONVERSATION_ID
+        );
+        assert_eq!(
+            account_id(
+                &json!({"account_id": "11111111-1111-4111-8111-111111111111"}),
+                "account_id"
+            )
+            .unwrap(),
+            "11111111-1111-4111-8111-111111111111"
+        );
+        assert!(group_id(&json!({})).is_err());
+        assert!(channel_id(&json!({"conversation_id": "bad"})).is_err());
         assert!(uuid_field("not-an-id", "conversation_id").is_err());
         assert!(uuid_field("", "conversation_id").is_err());
     }
@@ -470,5 +488,54 @@ mod tests {
         assert_eq!(json, json!({"title":"new", "is_public":false}));
         assert!(optional_string(&json!({"title": 1}), "title").is_err());
         assert!(optional_bool(&json!({"is_public": "false"}), "is_public").is_err());
+    }
+
+    #[test]
+    fn mutation_bodies_match_frontend_rest_fields() {
+        assert_eq!(
+            serde_json::to_value(TransferOwnerRequest {
+                new_owner_account_id: "11111111-1111-4111-8111-111111111111".into(),
+            })
+            .unwrap(),
+            json!({"new_owner_account_id": "11111111-1111-4111-8111-111111111111"})
+        );
+        assert_eq!(
+            serde_json::to_value(AddGroupMemberRequest {
+                account_id: "11111111-1111-4111-8111-111111111111".into(),
+            })
+            .unwrap(),
+            json!({"account_id": "11111111-1111-4111-8111-111111111111"})
+        );
+        assert_eq!(
+            serde_json::to_value(SetGroupTagRequest {
+                tag: "moderator".into(),
+            })
+            .unwrap(),
+            json!({"tag": "moderator"})
+        );
+        assert_eq!(
+            serde_json::to_value(BanGroupMemberRequest {
+                account_id: "11111111-1111-4111-8111-111111111111".into(),
+                reason: None,
+            })
+            .unwrap(),
+            json!({"account_id": "11111111-1111-4111-8111-111111111111"})
+        );
+        assert_eq!(
+            serde_json::to_value(BanGroupMemberRequest {
+                account_id: "11111111-1111-4111-8111-111111111111".into(),
+                reason: Some("spam".into()),
+            })
+            .unwrap(),
+            json!({"account_id": "11111111-1111-4111-8111-111111111111", "reason": "spam"})
+        );
+    }
+
+    #[test]
+    fn public_channel_payload_accepts_empty_object_only() {
+        assert_eq!(parse_optional_object(b"").unwrap(), json!({}));
+        assert_eq!(parse_optional_object(b"{}").unwrap(), json!({}));
+        assert!(parse_optional_object(b"[]").is_err());
+        assert!(parse_optional_object(b"not-json").is_err());
     }
 }

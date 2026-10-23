@@ -94,17 +94,70 @@ pub async fn ack_event(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<
     if ev.event_type == "envelope_received" {
         let parsed: serde_json::Value = serde_json::from_str(&ev.payload)?;
         if let Some(env_id) = parsed.get("envelope_id").and_then(|x| x.as_str()) {
-            // The consumer has already persisted the event before calling
-            // ack_event, so release the local durable row even if the
-            // best-effort server receipt cannot be sent. The server may
-            // redeliver that envelope; consumers should deduplicate it by
-            // envelope ID.
-            if let Err(e) = ack_envelopes(state, &[env_id.to_string()]).await {
-                tracing::warn!(error = %e, "failed to send envelope receipt");
-            }
+            // Keep the durable row until the receipt is accepted by the
+            // websocket sender. If the send fails, the caller can retry this
+            // ACK and the envelope remains available for crash recovery.
+            ack_envelopes(state, &[env_id.to_string()]).await?;
         }
     }
 
     pending_events::ack(&state.db, id).await?;
     Ok(br#"{"acked":true}"#.to_vec())
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use crate::config::Config;
+    use crate::db::{self, pending_events};
+    use crate::runtime::ActorState;
+    use crate::transport::HttpClient;
+
+    use super::ack_event;
+
+    #[tokio::test]
+    async fn failed_envelope_receipt_keeps_the_durable_event_for_retry() {
+        let db_path = std::env::temp_dir().join(format!(
+            "friendshub-core-ack-retry-{}.sqlite",
+            uuid::Uuid::new_v4()
+        ));
+        let config: Config = serde_json::from_value(serde_json::json!({
+            "db_path": db_path,
+            "api_base": "http://127.0.0.1:1",
+            "ws_url": "ws://127.0.0.1:1",
+            "discovery": { "enabled": false },
+            "log_level": "off",
+            "log_format": "text"
+        }))
+        .unwrap();
+        let db = db::pool::open(&config.db_path).await.unwrap();
+        db::migrations::MIGRATOR.run(&db).await.unwrap();
+        let http = HttpClient::new(&config).unwrap();
+        let state = Arc::new(ActorState::new(config, db, http));
+        let envelope_id = uuid::Uuid::new_v4().to_string();
+        let event_id = pending_events::push(
+            &state.db,
+            "envelope_received",
+            &serde_json::json!({ "envelope_id": envelope_id }).to_string(),
+        )
+        .await
+        .unwrap();
+
+        let error = ack_event(&state, (event_id as u64).to_le_bytes().to_vec())
+            .await
+            .expect_err("a stopped websocket must reject the receipt");
+        assert!(error.to_string().contains("websocket is not running"));
+        assert!(
+            pending_events::get(&state.db, event_id)
+                .await
+                .unwrap()
+                .is_some(),
+            "failed receipt must leave the durable event available for retry"
+        );
+
+        state.db.close().await;
+        drop(state);
+        let _ = std::fs::remove_file(db_path);
+    }
 }

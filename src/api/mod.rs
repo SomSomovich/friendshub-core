@@ -118,6 +118,12 @@ pub async fn dispatch(state: Arc<ActorState>, method: u32, payload: Vec<u8>) -> 
         0x0007_0001 => avatars::upload(&state, payload).await,
         0x0007_0002 => avatars::delete(&state, payload).await,
         0x0007_0003 => avatars::serve(&state, payload).await,
+        0x0007_0004 => avatars::init_upload(&state, payload).await,
+        0x0007_0005 => avatars::finalize_upload(&state, payload).await,
+        0x0007_0006 => avatars::upload_group(&state, payload).await,
+        0x0007_0007 => avatars::delete_group(&state, payload).await,
+        0x0007_0008 => avatars::upload_channel(&state, payload).await,
+        0x0007_0009 => avatars::delete_channel(&state, payload).await,
 
         // bots
         0x0008_0001 => bots::list(&state, payload).await,
@@ -129,6 +135,7 @@ pub async fn dispatch(state: Arc<ActorState>, method: u32, payload: Vec<u8>) -> 
         0x0008_0007 => bots::get_bot_info(&state, payload).await,
         0x0008_0008 => bots::get_history(&state, payload).await,
         0x0008_0009 => bots::send_to_bot(&state, payload).await,
+        0x0008_000A => crate::bot_api::dispatch_answer_callback_query(&state, payload).await,
 
         // channels
         0x0009_0001 => channels::create(&state, payload).await,
@@ -159,6 +166,7 @@ pub async fn dispatch(state: Arc<ActorState>, method: u32, payload: Vec<u8>) -> 
         0x0009_001A => channel_posts::get_discussion(&state, payload).await,
         0x0009_001B => community_extras::transfer_channel_owner(&state, payload).await,
         0x0009_001C => community_extras::get_channel_analytics(&state, payload).await,
+        0x0009_001D => channel_posts::get_one(&state, payload).await,
 
         // groups
         0x000A_0001 => groups::create(&state, payload).await,
@@ -231,6 +239,7 @@ pub async fn dispatch(state: Arc<ActorState>, method: u32, payload: Vec<u8>) -> 
         0x000D_0027 => profile_extras::subscribe_push(&state, payload).await,
         0x000D_0028 => profile_extras::unsubscribe_push(&state, payload).await,
         0x000D_0029 => profile_extras::list_security_events(&state, payload).await,
+        0x000D_002A => profile::get_invisible_mode(&state, payload).await,
 
         // account deletion
         0x000E_0001 => account_deletion::initiate(&state, payload).await,

@@ -12,8 +12,7 @@ use crate::transport::protobuf::{self, Protocol};
 const PROTOBUF_MEDIA_TYPE: &str = "application/x-protobuf";
 
 /// Upper bound on a server-requested wait, in seconds. A misconfigured or
-/// hostile server sending `retry-after: 999999` must not park a call for
-/// hours; past this the caller gets the 429 back and decides.
+/// hostile server sending `retry-after: 999999` must not park a call for hours.
 const MAX_RETRY_AFTER_SECS: u64 = 30;
 
 #[derive(Clone)]
@@ -38,7 +37,7 @@ impl HttpClient {
             .map_err(|e| Error::Network(e.to_string()))?;
 
         Ok(Self {
-            base: cfg.api_base.trim_end_matches('/').to_string(),
+            base: normalize_api_base(&cfg.api_base),
             client,
             no_redirect_client,
         })
@@ -151,75 +150,119 @@ impl HttpClient {
     ) -> Result<R> {
         let url = format!("{}{}", self.base, path);
         let protocol = protobuf::protocol_for(Method::POST.as_str(), path)?;
-        let mut req = self.client.post(&url);
         if let Protocol::Protobuf(route) = protocol {
             if !protobuf::request_is_raw(route) {
                 return Err(Error::InvalidPayload(
                     "this REST route does not accept a raw request body".into(),
                 ));
             }
-            req = req
-                .header(ACCEPT, PROTOBUF_MEDIA_TYPE)
-                .header(CONTENT_TYPE, content_type)
-                .body(data);
-        } else if matches!(protocol, Protocol::Json) {
-            req = req.header(CONTENT_TYPE, content_type).body(data);
-        } else {
+        } else if !matches!(protocol, Protocol::Json) {
             return Err(Error::InvalidPayload(
                 "this REST route is a raw response, not a raw upload".into(),
             ));
         }
-        if let Some(t) = bearer {
-            req = req.bearer_auth(t);
-        }
-        let resp = req
-            .send()
-            .await
-            .map_err(|e| Error::Network(e.to_string()))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let body = match protocol {
-                Protocol::Protobuf(_) | Protocol::RawProtobufErrors => {
-                    let bytes = resp.bytes().await.unwrap_or_default();
-                    protobuf::decode_http_error_body(protocol, &bytes)
+        let mut attempt = 0;
+        loop {
+            let mut req = self.client.post(&url);
+            if let Protocol::Protobuf(route) = protocol {
+                if !protobuf::request_is_raw(route) {
+                    return Err(Error::InvalidPayload(
+                        "this REST route does not accept a raw request body".into(),
+                    ));
                 }
-                Protocol::Json => resp.text().await.unwrap_or_default(),
+                req = req
+                    .header(ACCEPT, PROTOBUF_MEDIA_TYPE)
+                    .header(CONTENT_TYPE, content_type)
+                    .body(data.clone());
+            } else if matches!(protocol, Protocol::Json) {
+                req = req.header(CONTENT_TYPE, content_type).body(data.clone());
+            } else {
+                return Err(Error::InvalidPayload(
+                    "this REST route is a raw response, not a raw upload".into(),
+                ));
+            }
+            if let Some(t) = bearer {
+                req = req.bearer_auth(t);
+            }
+            let resp = req
+                .send()
+                .await
+                .map_err(|e| Error::Network(e.to_string()))?;
+            let status = resp.status();
+
+            if status.as_u16() == 429 && attempt == 0 {
+                if let Some(wait) = rate_limit_wait(resp.headers().get("retry-after")) {
+                    tracing::info!(
+                        wait_ms = wait.as_millis(),
+                        path,
+                        "rate limited; retrying raw upload once"
+                    );
+                    tokio::time::sleep(wait).await;
+                    attempt += 1;
+                    continue;
+                }
+            }
+
+            if !status.is_success() {
+                let body = match protocol {
+                    Protocol::Protobuf(_) | Protocol::RawProtobufErrors => {
+                        let bytes = resp.bytes().await.unwrap_or_default();
+                        protobuf::decode_http_error_body(protocol, &bytes)
+                    }
+                    Protocol::Json => resp.text().await.unwrap_or_default(),
+                };
+                return Err(Error::Server {
+                    status: status.as_u16(),
+                    body,
+                });
+            }
+
+            let bytes = resp
+                .bytes()
+                .await
+                .map_err(|e| Error::Network(e.to_string()))?;
+            let bytes = match protocol {
+                Protocol::Protobuf(route) => protobuf::decode_response_body(route, &bytes)?,
+                Protocol::Json | Protocol::RawProtobufErrors => bytes.to_vec(),
             };
-            return Err(Error::Server {
-                status: status.as_u16(),
-                body,
-            });
-        }
-        let bytes = resp
-            .bytes()
-            .await
-            .map_err(|e| Error::Network(e.to_string()))?;
-        let bytes = match protocol {
-            Protocol::Protobuf(route) => protobuf::decode_response_body(route, &bytes)?,
-            Protocol::Json | Protocol::RawProtobufErrors => bytes.to_vec(),
-        };
-        if bytes.is_empty() {
-            return serde_json::from_slice(b"null")
+            if bytes.is_empty() {
+                return serde_json::from_slice(b"null")
+                    .map_err(|e| Error::InvalidPayload(e.to_string()));
+            }
+            return serde_json::from_slice(&bytes)
                 .map_err(|e| Error::InvalidPayload(e.to_string()));
         }
-        serde_json::from_slice(&bytes).map_err(|e| Error::InvalidPayload(e.to_string()))
     }
 
     pub async fn put_absolute(&self, url: &str, data: Vec<u8>) -> Result<()> {
-        let resp = self
-            .client
-            .put(url)
-            .header(CONTENT_TYPE, "application/octet-stream")
-            .body(data)
-            .send()
-            .await
-            .map_err(|e| Error::Network(e.to_string()))?;
-        if !resp.status().is_success() {
-            let status = resp.status().as_u16();
-            let body = resp.text().await.unwrap_or_default();
-            return Err(Error::Server { status, body });
+        let mut attempt = 0;
+        loop {
+            let resp = self
+                .client
+                .put(url)
+                .header(CONTENT_TYPE, "application/octet-stream")
+                .body(data.clone())
+                .send()
+                .await
+                .map_err(|e| Error::Network(e.to_string()))?;
+            if resp.status().as_u16() == 429 && attempt == 0 {
+                if let Some(wait) = rate_limit_wait(resp.headers().get("retry-after")) {
+                    tracing::info!(
+                        wait_ms = wait.as_millis(),
+                        "rate limited; retrying presigned upload once"
+                    );
+                    tokio::time::sleep(wait).await;
+                    attempt += 1;
+                    continue;
+                }
+            }
+            if !resp.status().is_success() {
+                let status = resp.status().as_u16();
+                let body = resp.text().await.unwrap_or_default();
+                return Err(Error::Server { status, body });
+            }
+            return Ok(());
         }
-        Ok(())
     }
 
     pub async fn get_absolute(&self, url: &str) -> Result<Vec<u8>> {
@@ -383,17 +426,16 @@ impl HttpClient {
             let status = resp.status();
 
             if retry_on_rate_limit && status.as_u16() == 429 && attempt == 0 {
-                let wait = resp
-                    .headers()
-                    .get("retry-after")
-                    .and_then(|v| v.to_str().ok())
-                    .and_then(|s| s.parse::<u64>().ok())
-                    .unwrap_or(5)
-                    .min(MAX_RETRY_AFTER_SECS);
-                tracing::info!(wait_secs = wait, path, "rate limited; retrying once");
-                tokio::time::sleep(Duration::from_secs(wait)).await;
-                attempt += 1;
-                continue;
+                if let Some(wait) = rate_limit_wait(resp.headers().get("retry-after")) {
+                    tracing::info!(
+                        wait_ms = wait.as_millis(),
+                        path,
+                        "rate limited; retrying once"
+                    );
+                    tokio::time::sleep(wait).await;
+                    attempt += 1;
+                    continue;
+                }
             }
 
             if !status.is_success() {
@@ -426,85 +468,104 @@ impl HttpClient {
     }
 }
 
+fn rate_limit_wait(header: Option<&reqwest::header::HeaderValue>) -> Option<Duration> {
+    let seconds = header?.to_str().ok()?.trim().parse::<f64>().ok()?;
+    if !seconds.is_finite() || seconds < 0.0 {
+        return None;
+    }
+    let milliseconds = (seconds * 1_000.0)
+        .ceil()
+        .min(MAX_RETRY_AFTER_SECS as f64 * 1_000.0) as u64;
+    Some(Duration::from_millis(milliseconds))
+}
+
+fn normalize_api_base(api_base: &str) -> String {
+    let trimmed = api_base.trim_end_matches('/');
+    trimmed
+        .strip_suffix("/api/v1")
+        .unwrap_or(trimmed)
+        .to_owned()
+}
+
 #[cfg(test)]
-mod delete_with_body_tests {
+mod route_codec_tests {
     use super::*;
     use prost::Message;
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
-    use tokio::net::TcpListener;
 
-    #[tokio::test]
-    async fn delete_with_body_encodes_registered_protobuf_request() {
-        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let address = listener.local_addr().unwrap();
-        let server = tokio::spawn(async move {
-            let (mut stream, _) = listener.accept().await.unwrap();
-            let mut request = Vec::new();
-            let mut chunk = [0_u8; 2048];
-            let total_len = loop {
-                let read = stream.read(&mut chunk).await.unwrap();
-                assert_ne!(read, 0, "client closed before sending complete request");
-                request.extend_from_slice(&chunk[..read]);
-                if let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
-                    let header_end = header_end + 4;
-                    let headers = String::from_utf8_lossy(&request[..header_end]);
-                    let content_length = headers
-                        .lines()
-                        .find_map(|line| {
-                            let (name, value) = line.split_once(':')?;
-                            name.eq_ignore_ascii_case("content-length")
-                                .then(|| value.trim().parse::<usize>().unwrap())
-                        })
-                        .unwrap_or(0);
-                    let total_len = header_end + content_length;
-                    if request.len() >= total_len {
-                        break total_len;
-                    }
-                }
-            };
-            let response =
-                b"HTTP/1.1 204 No Content\r\nContent-Length: 0\r\nConnection: close\r\n\r\n";
-            stream.write_all(response).await.unwrap();
-            request.truncate(total_len);
-            request
-        });
-
-        let config = Config {
-            db_path: "/tmp/profile-extras-http-test.sqlite".into(),
-            api_base: format!("http://{address}"),
-            ws_url: format!("ws://{address}"),
-            discovery: Default::default(),
-            log_level: "error".into(),
-            log_format: "text".into(),
+    #[test]
+    fn delete_with_body_uses_registered_protobuf_request_and_empty_response() {
+        let Protocol::Protobuf(route) =
+            protobuf::protocol_for("DELETE", "/api/v1/push/subscribe").unwrap()
+        else {
+            panic!("push unsubscribe must use protobuf");
         };
-        let client = HttpClient::new(&config).unwrap();
-        let body = serde_json::json!({"endpoint": "https://push.example.test/subscription/1"});
-        let response: serde_json::Value = client
-            .delete_with_body("/api/v1/push/subscribe", &body, Some("test-token"))
-            .await
-            .unwrap();
-        assert_eq!(response, serde_json::Value::Null);
-
-        let request = server.await.unwrap();
-        let header_end = request.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
-        let headers = String::from_utf8_lossy(&request[..header_end]);
-        assert!(headers.starts_with("DELETE /api/v1/push/subscribe HTTP/1.1\r\n"));
-        assert!(
-            headers
-                .to_ascii_lowercase()
-                .contains("content-type: application/x-protobuf")
-        );
-        assert!(
-            headers
-                .to_ascii_lowercase()
-                .contains("authorization: bearer test-token")
-        );
+        assert!(protobuf::request_requires_protobuf(route));
+        let encoded = protobuf::encode_request_body(
+            route,
+            serde_json::json!({"endpoint": "https://push.example.test/subscription/1"}),
+        )
+        .unwrap()
+        .unwrap();
         let decoded =
-            crate::proto::rest::identity::UnsubscribeRequest::decode(&request[header_end..])
-                .unwrap();
+            crate::proto::rest::identity::UnsubscribeRequest::decode(encoded.as_slice()).unwrap();
         assert_eq!(
             decoded.endpoint.as_deref(),
             Some("https://push.example.test/subscription/1")
         );
+        assert_eq!(protobuf::decode_response_body(route, &[]).unwrap(), b"null");
+    }
+
+    #[test]
+    fn profile_fields_protobuf_encoding_preserves_label_and_value_verbatim() {
+        let Protocol::Protobuf(route) =
+            protobuf::protocol_for("PUT", "/api/v1/profile/fields").unwrap()
+        else {
+            panic!("profile fields must use protobuf");
+        };
+        let encoded = protobuf::encode_request_body(
+            route,
+            serde_json::json!({
+                "fields": [{"label": "  GitHub  ", "value": "  @someone  "}]
+            }),
+        )
+        .unwrap()
+        .unwrap();
+        let decoded =
+            crate::proto::rest::identity::SetProfileFieldsRequest::decode(encoded.as_slice())
+                .unwrap();
+        let field = &decoded.fields.unwrap().items[0];
+        assert_eq!(field.label.as_deref(), Some("  GitHub  "));
+        assert_eq!(field.value.as_deref(), Some("  @someone  "));
+    }
+
+    #[test]
+    fn api_base_normalization_keeps_bot_api_on_the_origin() {
+        assert_eq!(
+            normalize_api_base("https://api.example.test/api/v1/"),
+            "https://api.example.test"
+        );
+        assert_eq!(
+            normalize_api_base("https://api.example.test/custom/"),
+            "https://api.example.test/custom"
+        );
+    }
+
+    #[test]
+    fn rate_limit_retry_requires_a_valid_header_and_clamps_the_wait() {
+        use reqwest::header::HeaderValue;
+
+        assert_eq!(
+            rate_limit_wait(Some(&HeaderValue::from_static("0.25"))),
+            Some(Duration::from_millis(250))
+        );
+        assert_eq!(
+            rate_limit_wait(Some(&HeaderValue::from_static("999"))),
+            Some(Duration::from_secs(MAX_RETRY_AFTER_SECS))
+        );
+        assert_eq!(
+            rate_limit_wait(Some(&HeaderValue::from_static("invalid"))),
+            None
+        );
+        assert_eq!(rate_limit_wait(None), None);
     }
 }

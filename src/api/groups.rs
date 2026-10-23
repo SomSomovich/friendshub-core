@@ -3,7 +3,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::api::common::{bearer, id_from, str_field};
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::runtime::ActorState;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -14,6 +14,8 @@ pub struct CreateGroupRequest {
     #[serde(default)]
     pub is_public: bool,
     pub description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_in_seconds: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -42,7 +44,9 @@ pub struct MemberItem {
     pub role: String,
     pub permissions: i64,
     pub muted_until: Option<i64>,
+    pub moderator_muted_until: Option<i64>,
     pub joined_at: i64,
+    pub group_tag: Option<String>,
 }
 
 pub async fn list_members(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
@@ -155,11 +159,113 @@ pub struct HandleToGroupResponse {
 pub async fn lookup_by_handle(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
     let token = bearer(state).await?;
     let v: serde_json::Value = serde_json::from_slice(&payload)?;
-    let handle = str_field(&v, "handle")?;
+    let handle = validate_group_handle(str_field(&v, "handle")?)?;
     let path = format!("/api/v1/groups/by-handle/{handle}");
     let resp: HandleToGroupResponse = state.http.get(&path, Some(&token)).await?;
     Ok(serde_json::to_vec(&resp)?)
 }
 
+/// Validates a regular group handle before it is inserted into a URL path.
+/// Reserved-name and existence checks remain server-owned.
+fn validate_group_handle(handle: String) -> Result<String> {
+    let mut chars = handle.chars();
+    let valid_first = chars.next().is_some_and(|ch| ch.is_ascii_alphabetic());
+    let valid_rest = chars.all(|ch| ch.is_ascii_alphanumeric() || ch == '_');
+    let length = handle.chars().count();
+    if !(5..=32).contains(&length) || !valid_first || !valid_rest {
+        return Err(Error::InvalidPayload(
+            "handle must be 5-32 characters, start with a letter, and contain only ASCII letters, digits, or underscores".into(),
+        ));
+    }
+    Ok(handle)
+}
+
 #[allow(dead_code)]
 fn _unused(_: MemberItem, _: GroupResponse, _: PublicGroupItem) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn create_request_preserves_optional_expiration() {
+        let with_expiration: CreateGroupRequest = serde_json::from_value(json!({
+            "title": "temporary",
+            "member_ids": [],
+            "is_public": false,
+            "description": null,
+            "expires_in_seconds": 3600
+        }))
+        .unwrap();
+        assert_eq!(with_expiration.expires_in_seconds, Some(3600));
+        assert_eq!(
+            serde_json::to_value(with_expiration).unwrap()["expires_in_seconds"],
+            3600
+        );
+
+        let without_expiration: CreateGroupRequest = serde_json::from_value(json!({
+            "title": "ordinary",
+            "member_ids": [],
+            "is_public": false,
+            "description": null
+        }))
+        .unwrap();
+        assert_eq!(without_expiration.expires_in_seconds, None);
+        assert!(
+            serde_json::to_value(without_expiration)
+                .unwrap()
+                .get("expires_in_seconds")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn member_response_preserves_all_web_fields() {
+        let item: MemberItem = serde_json::from_value(json!({
+            "account_id": "11111111-1111-4111-8111-111111111111",
+            "role": "member",
+            "permissions": 0,
+            "muted_until": null,
+            "moderator_muted_until": 123,
+            "joined_at": 456,
+            "group_tag": "helper"
+        }))
+        .unwrap();
+        assert_eq!(item.moderator_muted_until, Some(123));
+        assert_eq!(item.group_tag.as_deref(), Some("helper"));
+        assert_eq!(
+            serde_json::to_value(item).unwrap(),
+            json!({
+                "account_id": "11111111-1111-4111-8111-111111111111",
+                "role": "member",
+                "permissions": 0,
+                "muted_until": null,
+                "moderator_muted_until": 123,
+                "joined_at": 456,
+                "group_tag": "helper"
+            })
+        );
+    }
+
+    #[test]
+    fn group_handle_validation_matches_web_route_shape() {
+        assert_eq!(
+            validate_group_handle("Group_42".into()).unwrap(),
+            "Group_42"
+        );
+        for invalid in [
+            "abcd",
+            "4group",
+            "bad-handle",
+            "bad/handle",
+            "group?x=1",
+            &"a".repeat(33),
+        ] {
+            assert!(
+                validate_group_handle(invalid.into()).is_err(),
+                "accepted {invalid:?}"
+            );
+        }
+    }
+}

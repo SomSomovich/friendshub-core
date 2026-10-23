@@ -29,7 +29,7 @@ use panic::guard;
 
 pub const ABI_VERSION: u32 = 1;
 
-const ABI_STRING: &[u8] = b"0.1.1\0";
+const ABI_STRING: &[u8] = b"0.1.2\0";
 
 const METHOD_ACK_EVENT: u32 = 0x0000_0004;
 
@@ -155,10 +155,17 @@ pub unsafe extern "C" fn fh_destroy(handle: *mut FhHandle) {
         if handle.is_null() {
             return;
         }
+        // Clone the shared inner state before shutdown. A callback already in
+        // flight may also call `fh_destroy`, so this local Arc must keep the
+        // actor and event queue alive until cleanup finishes.
         // SAFETY: the caller promises `handle` came from `fh_init` and has
         // not been destroyed.
+        let inner = unsafe { (&*handle).inner_arc() };
+        if !inner.begin_destroy() {
+            return;
+        }
         unsafe {
-            (*handle).clear_event_callbacks();
+            inner.clear_event_callbacks();
             drop(Box::from_raw(handle));
         }
     });
@@ -193,21 +200,23 @@ pub unsafe extern "C" fn fh_set_event_callbacks(
         if handle.is_null() {
             return -1;
         }
+        // Clone the state before any operation that can wait for callbacks;
+        // a callback may destroy the public handle while it is waiting.
         // SAFETY: the caller promises a live handle.
-        let h = unsafe { &*handle };
+        let inner = unsafe { (&*handle).inner_arc() };
         if callbacks.is_null() {
-            h.clear_event_callbacks();
+            inner.clear_event_callbacks();
             return 0;
         }
         // SAFETY: the caller promises a readable callback table; it is Copy,
         // so no pointer to the caller's table is retained.
         let callbacks = unsafe { *callbacks };
         let handler = Arc::new(events::FfiEventHandler::new(callbacks, user_data));
-        if let Err(error) = h.set_event_callbacks(Some(handler)) {
+        if let Err(error) = inner.set_event_callbacks(Some(handler)) {
             tracing::warn!(%error, "could not start callback worker");
             return 1;
         }
-        if let Err(error) = h.activate_event_push() {
+        if let Err(error) = inner.activate_event_push() {
             tracing::warn!(%error, "could not activate event callbacks");
             return 1;
         }
@@ -249,9 +258,11 @@ pub unsafe extern "C" fn fh_call(
             unsafe { std::slice::from_raw_parts(req, req_len) }.to_vec()
         };
 
+        // Clone the shared state so callbacks may destroy the opaque handle
+        // while this actor request is in flight.
         // SAFETY: `handle` is a live pointer, per the caller's contract.
-        let h = unsafe { &*handle };
-        match h.call(method_id, payload) {
+        let inner = unsafe { (&*handle).inner_arc() };
+        match inner.call(method_id, payload) {
             Ok(bytes) => {
                 // SAFETY: `out` was checked non-null.
                 unsafe {
@@ -289,9 +300,11 @@ pub unsafe extern "C" fn fh_poll_event(
             *out = FhBuffer::EMPTY;
         }
 
+        // Clone the shared state before the blocking pull wait. A callback
+        // may destroy the public handle while this call is waiting.
         // SAFETY: `handle` is a live pointer, per the caller's contract.
-        let h = unsafe { &*handle };
-        match h.poll_event(Duration::from_millis(timeout_ms as u64)) {
+        let inner = unsafe { (&*handle).inner_arc() };
+        match inner.poll_event(Duration::from_millis(timeout_ms as u64)) {
             Ok(event) => {
                 let bytes = match event {
                     Some(event) => match serde_json::to_vec(&event) {
@@ -323,10 +336,12 @@ pub unsafe extern "C" fn fh_ack_event(handle: *mut FhHandle, event_id: u64) -> i
         if handle.is_null() {
             return -1;
         }
+        // Clone the shared state before the actor call; delivery callbacks may
+        // destroy the public handle while the ACK request is in flight.
         // SAFETY: `handle` is a live pointer, per the caller's contract.
-        let h = unsafe { &*handle };
+        let inner = unsafe { (&*handle).inner_arc() };
         let payload = event_id.to_le_bytes().to_vec();
-        match h.call(METHOD_ACK_EVENT, payload) {
+        match inner.call(METHOD_ACK_EVENT, payload) {
             Ok(_) => 0,
             Err(e) => {
                 tracing::warn!(error = %e, event_id, "fh_ack_event failed");

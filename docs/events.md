@@ -50,12 +50,13 @@ restart. The library does not re-decrypt: the plaintext is already stored.
 
 | Kind | Durable | Payload |
 |---|---|---|
-| `ws_connected` | no | `{"device_number":N}` |
-| `ws_disconnected` | no | `{"reason":"..."}` |
+| `ws_connected` | no | session/account IDs, device number, server timestamp and negotiated protocol version |
+| `ws_disconnected` | no | `{"reason":"...","final":bool}`; `final` is false while reconnecting |
 | `ws_stopped` | no | `{}` |
 | `envelope_received` | yes | decrypted and persisted envelope; see below |
 | `receipt` | no | delivery receipt |
-| `server_error` | no | `{"code":"...","message":"...","fatal":bool}` |
+| `server_error` | no | `{"code":"...","message":"...","fatal":bool,"reference":string|null}` |
+| `fatal_error` callback | no | same `server_error` event, additionally sent to `on_fatal_error` when fatal except `flood` |
 | `typing` | no | conversation, account, and typing state |
 | `read_receipt` | no | conversation and read marker |
 | `conversation_updated` | no | updated conversation metadata |
@@ -70,11 +71,11 @@ restart. The library does not re-decrypt: the plaintext is already stored.
 | `bot_message` | no | bot_id, text, reply_to_message_id, created_at |
 | `bot_message_edited` | no | edited bot message |
 | `bot_message_deleted` | no | deleted bot message |
-| `bot_callback_answered` | no | bot callback result |
+| `bot_callback_answered` | no | callback query ID, optional text/message ID and `show_alert` |
 | `channel_post` | no | post_id, channel_id, author, text, attachments, reply |
 | `poll_updated` | no | poll data changed |
 | `poll_deleted` | no | poll removed |
-| `call_signal` | no | signaling frame for a call |
+| `call_signal` | no | call IDs, peer device, signal kind and base64 payload |
 | `identity_changed` | no | peer identity key changed |
 | `webrtc_event` | no | see below |
 

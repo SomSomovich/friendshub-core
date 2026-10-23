@@ -3,6 +3,7 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 
 use crate::api::common::{bearer, id_from, str_field};
+use crate::api::profile_extras::ProfileField;
 use crate::error::Result;
 use crate::runtime::ActorState;
 
@@ -52,6 +53,11 @@ pub struct InvisibleModeRequest {
     pub enabled: bool,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct InvisibleModeResponse {
+    pub enabled: bool,
+}
+
 pub async fn set_invisible_mode(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
     let token = bearer(state).await?;
     let req: InvisibleModeRequest = serde_json::from_slice(&payload)?;
@@ -60,6 +66,16 @@ pub async fn set_invisible_mode(state: &Arc<ActorState>, payload: Vec<u8>) -> Re
         .put("/api/v1/profile/invisible", &req, Some(&token))
         .await?;
     Ok(br#"{"updated":true}"#.to_vec())
+}
+
+/// Reads the stored invisibility setting, as used by the web settings screen.
+pub async fn get_invisible_mode(state: &Arc<ActorState>, _payload: Vec<u8>) -> Result<Vec<u8>> {
+    let token = bearer(state).await?;
+    let response: InvisibleModeResponse = state
+        .http
+        .get("/api/v1/profile/invisible", Some(&token))
+        .await?;
+    Ok(serde_json::to_vec(&response)?)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,6 +136,8 @@ pub struct PublicProfile {
     pub custom_status_expires_at: Option<i64>,
     pub is_blocked_by_me: bool,
     pub is_contact: bool,
+    #[serde(default)]
+    pub profile_fields: Vec<ProfileField>,
 }
 
 pub async fn get_public_profile(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
@@ -153,4 +171,67 @@ pub async fn get_presence(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<V
 
 #[allow(dead_code)]
 fn _unused(_: PublicProfile, _: PresenceResponse, _: UpdateStatusRequest, _: InvisibleModeRequest) {
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn invisible_mode_response_matches_web_contract() {
+        let response = InvisibleModeResponse { enabled: true };
+        assert_eq!(
+            serde_json::to_value(&response).unwrap(),
+            json!({"enabled": true})
+        );
+        assert_eq!(
+            serde_json::from_value::<InvisibleModeResponse>(json!({"enabled": false})).unwrap(),
+            InvisibleModeResponse { enabled: false }
+        );
+    }
+
+    #[test]
+    fn public_profile_keeps_profile_fields_and_defaults_legacy_responses() {
+        let profile: PublicProfile = serde_json::from_value(json!({
+            "id": "account-id",
+            "user_id": 7,
+            "fh_number": "FH-000007",
+            "username": "alice",
+            "avatar_url": null,
+            "custom_status_text": null,
+            "custom_status_emoji": null,
+            "custom_status_expires_at": null,
+            "is_blocked_by_me": false,
+            "is_contact": true,
+            "profile_fields": [{"label": "Website", "value": "example.test"}]
+        }))
+        .unwrap();
+        assert_eq!(
+            profile.profile_fields,
+            [ProfileField {
+                label: "Website".into(),
+                value: "example.test".into(),
+            }]
+        );
+        assert_eq!(
+            serde_json::to_value(profile).unwrap()["profile_fields"],
+            json!([{"label": "Website", "value": "example.test"}])
+        );
+
+        let legacy: PublicProfile = serde_json::from_value(json!({
+            "id": "account-id",
+            "user_id": 7,
+            "fh_number": "FH-000007",
+            "username": "alice",
+            "avatar_url": null,
+            "custom_status_text": null,
+            "custom_status_emoji": null,
+            "custom_status_expires_at": null,
+            "is_blocked_by_me": false,
+            "is_contact": true
+        }))
+        .unwrap();
+        assert!(legacy.profile_fields.is_empty());
+    }
 }

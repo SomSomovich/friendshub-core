@@ -30,7 +30,36 @@ AGPL-3.0-only.
 
 ## Building
 
+The default command builds the native core only:
+
+```sh
 cargo build --release
+```
+
+The repository workspace keeps `friendshub-core` as its default member, so
+this command does not try to build the browser binding.
+
+The helper script provides explicit release builds:
+
+```sh
+./scripts/build.sh native  # Native release; Apple targets use cargo-zigbuild
+./scripts/build.sh wasm    # Browser-ready wasm-bindgen package
+./scripts/build.sh all     # Native first, then browser WASM
+```
+
+By default the native helper targets the host triple reported by `rustc`;
+override it with `NATIVE_TARGET` to cross-compile. Apple targets use
+`cargo-zigbuild` and require Zig (`cargo install cargo-zigbuild`); all other
+targets use ordinary `cargo build --release`. Install the corresponding Rust
+target with `rustup target add` before cross-compiling.
+
+For the browser binding, install `wasm-pack` (for example,
+`cargo install wasm-pack`) and the Rust target with
+`rustup target add wasm32-unknown-unknown`. The WASM command runs
+`wasm-pack build bindings/wasm --target web --release`, so it compiles the
+binding and generates the browser ES module glue and package metadata. The
+ready-to-import package is written to `target/wasm-browser/`. `all` runs this
+step only after the native `cargo zigbuild` release succeeds.
 
 ## C header
 

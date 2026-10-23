@@ -1118,7 +1118,7 @@ dependencies = [
 
 [[package]]
 name = "friendshub-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1155,6 +1155,20 @@ dependencies = [
  "webpki-roots 1.0.9",
  "webrtc",
  "zeroize",
+]
+
+[[package]]
+name = "friendshub-core-wasm"
+version = "0.1.2"
+dependencies = [
+ "friendshub-core",
+ "js-sys",
+ "prost",
+ "serde_json",
+ "url",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

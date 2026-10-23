@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -27,6 +28,9 @@ const PROTOCOL_MAJOR: u32 = 0;
 const PROTOCOL_MINOR: u32 = 1;
 const PROTOCOL_PATCH: u32 = 0;
 const PING_INTERVAL_SECS: u64 = 30;
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+const HELLO_TIMEOUT: Duration = Duration::from_secs(10);
+const MAX_RECONNECT_BACKOFF_SECS: u64 = 30;
 const CLIENT_NAME: &str = "friendshub-core";
 
 const ENVELOPE_TYPE_MESSAGE: i32 = 1;
@@ -183,7 +187,15 @@ async fn run_loop(
     let mut backoff_secs: u64 = 1;
 
     while self_ref.is_running() {
-        match run_once(&state, &mut cmd_rx).await {
+        let mut connected_this_attempt = false;
+        match run_once(
+            &state,
+            &mut cmd_rx,
+            &mut backoff_secs,
+            &mut connected_this_attempt,
+        )
+        .await
+        {
             Ok(stopped) => {
                 if stopped {
                     break;
@@ -191,10 +203,12 @@ async fn run_loop(
             }
             Err(e) => {
                 tracing::warn!(error = %e, "websocket disconnected");
-                state.events.push(Event::ephemeral(
-                    "ws_disconnected",
-                    json!({ "reason": e.to_string() }),
-                ));
+                if connected_this_attempt {
+                    state.events.push(Event::ephemeral(
+                        "ws_disconnected",
+                        disconnected_payload(e.to_string(), false),
+                    ));
+                }
             }
         }
 
@@ -205,7 +219,7 @@ async fn run_loop(
         if !wait_before_reconnect(Duration::from_secs(backoff_secs), &mut stop_rx).await {
             break;
         }
-        backoff_secs = (backoff_secs * 2).min(60);
+        backoff_secs = next_reconnect_backoff(backoff_secs);
     }
 
     self_ref.inner.running.store(false, Ordering::SeqCst);
@@ -227,6 +241,8 @@ async fn wait_before_reconnect(delay: Duration, stop_rx: &mut watch::Receiver<bo
 async fn run_once(
     state: &Arc<ActorState>,
     cmd_rx: &mut mpsc::UnboundedReceiver<Cmd>,
+    backoff_secs: &mut u64,
+    connected_this_attempt: &mut bool,
 ) -> Result<bool> {
     let auth = db_auth::load(&state.db)
         .await?
@@ -239,9 +255,12 @@ async fn run_once(
         .ok_or(Error::NotAuthenticated)?;
     let device_number = auth.device_number.unwrap_or(1);
 
-    let (ws, _resp) = connect_async(&state.config.ws_url)
-        .await
-        .map_err(|e| Error::Network(format!("ws connect failed: {e}")))?;
+    let (ws, _resp) = with_ws_timeout("ws connect", CONNECT_TIMEOUT, async {
+        connect_async(&state.config.ws_url)
+            .await
+            .map_err(|e| Error::Network(format!("ws connect failed: {e}")))
+    })
+    .await?;
 
     let (mut sink, mut stream) = ws.split();
 
@@ -256,15 +275,19 @@ async fn run_once(
             client_version: env!("CARGO_PKG_VERSION").to_string(),
         })),
     };
-    send_proto(&mut sink, &hello).await?;
-
     let mut ping = tokio::time::interval(Duration::from_secs(PING_INTERVAL_SECS));
     ping.tick().await;
     let mut pending_pings: HashMap<u64, (Instant, oneshot::Sender<Result<u64>>)> = HashMap::new();
 
-    let first = next_frame(&mut stream).await?;
+    let first = with_ws_timeout("ws hello", HELLO_TIMEOUT, async {
+        send_proto(&mut sink, &hello).await?;
+        next_frame(&mut stream).await
+    })
+    .await?;
     match first.kind {
         Some(server_frame::Kind::Hello(hello)) => {
+            *connected_this_attempt = true;
+            *backoff_secs = 1;
             state.events.push(Event::ephemeral(
                 "ws_connected",
                 json!({
@@ -311,6 +334,10 @@ async fn run_once(
                         pending_pings.remove(&client_timestamp);
                     }
                     Some(Cmd::Shutdown) | None => {
+                        state.events.push(Event::ephemeral(
+                            "ws_disconnected",
+                            disconnected_payload("client closed", true),
+                        ));
                         let _ = sink.close().await;
                         return Ok(true);
                     }
@@ -328,7 +355,7 @@ async fn run_once(
                 match msg {
                     Some(Ok(Message::Binary(bytes))) => {
                         let frame = match ServerFrame::decode(&bytes[..]) {
-                            Ok(f) => f,
+                            Ok(frame) => frame,
                             Err(e) => {
                                 tracing::warn!(error = %e, "failed to decode server frame");
                                 continue;
@@ -342,7 +369,7 @@ async fn run_once(
                         match action {
                             FrameAction::Continue => {}
                             FrameAction::Reconnect => {
-                                return Err(Error::Network("server requested websocket reconnect".into()));
+                                return Ok(false);
                             }
                             FrameAction::Stop => return Ok(true),
                         }
@@ -387,9 +414,8 @@ where
     loop {
         match stream.next().await {
             Some(Ok(Message::Binary(bytes))) => {
-                let frame = ServerFrame::decode(&bytes[..])
-                    .map_err(|e| Error::Network(format!("decode failed: {e}")))?;
-                return Ok(frame);
+                return ServerFrame::decode(&bytes[..])
+                    .map_err(|e| Error::Network(format!("decode failed: {e}")));
             }
             Some(Ok(Message::Close(_))) | None => {
                 return Err(Error::Network("connection closed before frame".into()));
@@ -443,7 +469,24 @@ async fn handle_frame(state: &Arc<ActorState>, frame: ServerFrame) -> FrameActio
         server_frame::Kind::Pong(_) => {}
 
         server_frame::Kind::Error(e) => {
-            return handle_server_error(state, e);
+            let reason = if e.code == "internal" {
+                "internal server error".to_owned()
+            } else {
+                e.message.clone()
+            };
+            let action = handle_server_error(state, e);
+            if action == FrameAction::Stop {
+                state.events.push(Event::ephemeral(
+                    "ws_disconnected",
+                    disconnected_payload(reason, true),
+                ));
+            } else if action == FrameAction::Reconnect {
+                state.events.push(Event::ephemeral(
+                    "ws_disconnected",
+                    disconnected_payload(reason, false),
+                ));
+            }
+            return action;
         }
 
         server_frame::Kind::Presence(p) => {
@@ -656,13 +699,60 @@ fn handle_server_error(state: &Arc<ActorState>, error: ErrorFrame) -> FrameActio
     let action = server_error_action(&error.code, error.fatal);
     state.events.push(Event::ephemeral(
         "server_error",
-        json!({
-            "code": error.code,
-            "message": error.message,
-            "fatal": error.fatal,
-        }),
+        server_error_payload(&error),
     ));
     action
+}
+
+fn server_error_payload(error: &ErrorFrame) -> serde_json::Value {
+    let reference = error
+        .reference
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .or_else(|| reference_from_legacy_message(&error.message));
+    let message = if error.code == "internal" {
+        "internal server error"
+    } else {
+        &error.message
+    };
+    json!({
+        "code": error.code,
+        "message": message,
+        "fatal": error.fatal,
+        "reference": reference,
+    })
+}
+
+fn reference_from_legacy_message(message: &str) -> Option<String> {
+    let reference = message
+        .strip_prefix("internal server error (reference: ")?
+        .strip_suffix(')')?
+        .trim();
+    (!reference.is_empty()).then(|| reference.to_owned())
+}
+
+fn disconnected_payload(reason: impl Into<String>, final_disconnect: bool) -> serde_json::Value {
+    json!({ "reason": reason.into(), "final": final_disconnect })
+}
+
+fn next_reconnect_backoff(current_secs: u64) -> u64 {
+    current_secs
+        .saturating_mul(2)
+        .min(MAX_RECONNECT_BACKOFF_SECS)
+}
+
+async fn with_ws_timeout<T, F>(operation: &'static str, timeout: Duration, future: F) -> Result<T>
+where
+    F: Future<Output = Result<T>>,
+{
+    tokio::time::timeout(timeout, future).await.map_err(|_| {
+        Error::Network(format!(
+            "{operation} timed out after {} ms",
+            timeout.as_millis()
+        ))
+    })?
 }
 
 fn server_error_action(code: &str, fatal: bool) -> FrameAction {
@@ -1222,6 +1312,132 @@ mod tests {
         assert_eq!(
             server_error_action("internal", false),
             FrameAction::Continue
+        );
+    }
+
+    #[test]
+    fn server_error_payload_matches_web_reference_and_internal_sanitization() {
+        let error = ErrorFrame {
+            code: "internal".into(),
+            message: "database password must not escape".into(),
+            fatal: true,
+            reference: Some("  req-123  ".into()),
+        };
+
+        assert_eq!(
+            server_error_payload(&error),
+            json!({
+                "code": "internal",
+                "message": "internal server error",
+                "fatal": true,
+                "reference": "req-123",
+            })
+        );
+    }
+
+    #[test]
+    fn server_error_payload_falls_back_to_legacy_reference_or_null() {
+        let legacy = ErrorFrame {
+            code: "internal".into(),
+            message: "internal server error (reference: req-legacy)".into(),
+            fatal: false,
+            reference: None,
+        };
+        assert_eq!(
+            server_error_payload(&legacy),
+            json!({
+                "code": "internal",
+                "message": "internal server error",
+                "fatal": false,
+                "reference": "req-legacy",
+            })
+        );
+
+        let without_reference = ErrorFrame {
+            code: "permission_denied".into(),
+            message: "not allowed".into(),
+            fatal: false,
+            reference: None,
+        };
+        assert_eq!(
+            server_error_payload(&without_reference),
+            json!({
+                "code": "permission_denied",
+                "message": "not allowed",
+                "fatal": false,
+                "reference": null,
+            })
+        );
+    }
+
+    #[test]
+    fn error_reference_survives_protobuf_server_frame_decode() {
+        let frame = ServerFrame {
+            kind: Some(server_frame::Kind::Error(ErrorFrame {
+                code: "internal".into(),
+                message: "opaque".into(),
+                fatal: true,
+                reference: Some("req-wire".into()),
+            })),
+        };
+        let bytes = frame.encode_to_vec();
+        let decoded = ServerFrame::decode(bytes.as_slice()).unwrap();
+        let Some(server_frame::Kind::Error(error)) = decoded.kind else {
+            panic!("expected error frame");
+        };
+        assert_eq!(error.reference.as_deref(), Some("req-wire"));
+    }
+
+    #[test]
+    fn disconnected_payload_marks_retryable_and_final_closes() {
+        assert_eq!(
+            disconnected_payload("connection lost", false),
+            json!({ "reason": "connection lost", "final": false })
+        );
+        assert_eq!(
+            disconnected_payload("client closed", true),
+            json!({ "reason": "client closed", "final": true })
+        );
+    }
+
+    #[test]
+    fn reconnect_delay_follows_web_sequence_and_stays_capped() {
+        let mut delay = 1;
+        let mut observed = Vec::new();
+        for _ in 0..8 {
+            observed.push(delay);
+            delay = next_reconnect_backoff(delay);
+        }
+        assert_eq!(observed, [1, 2, 4, 8, 16, 30, 30, 30]);
+    }
+
+    #[tokio::test]
+    async fn connect_deadline_matches_web_and_times_out_a_stalled_attempt() {
+        assert_eq!(CONNECT_TIMEOUT, Duration::from_secs(30));
+        let error = with_ws_timeout(
+            "ws connect",
+            Duration::from_millis(1),
+            std::future::pending::<Result<()>>(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, Error::Network(message) if message == "ws connect timed out after 1 ms")
+        );
+    }
+
+    #[tokio::test]
+    async fn hello_deadline_matches_web_and_times_out_a_stalled_handshake() {
+        assert_eq!(HELLO_TIMEOUT, Duration::from_secs(10));
+        let error = with_ws_timeout(
+            "ws hello",
+            Duration::from_millis(1),
+            std::future::pending::<Result<()>>(),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            matches!(error, Error::Network(message) if message == "ws hello timed out after 1 ms")
         );
     }
 }

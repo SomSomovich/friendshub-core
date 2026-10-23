@@ -12,6 +12,24 @@ use crate::error::{Error, Result};
 use crate::proto::rest::{chat, community, identity};
 
 const API_PREFIX: &str = "/api/v1";
+const PROTOBUF_MEDIA_TYPE: &str = "application/x-protobuf";
+
+/// Wire protocol selected for a REST endpoint.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RestProtocol {
+    Json,
+    Protobuf,
+    RawProtobufErrors,
+}
+
+/// Encoded request ready to send over a platform-specific HTTP adapter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestRequest {
+    pub protocol: RestProtocol,
+    pub accept: Option<&'static str>,
+    pub content_type: Option<String>,
+    pub body: Option<Vec<u8>>,
+}
 
 type RequestEncoder = fn(Value) -> Result<Vec<u8>>;
 type ResponseDecoder = fn(&[u8], ResponseShape) -> Result<Value>;
@@ -439,6 +457,7 @@ pub(super) enum Protocol {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg(feature = "native")]
 pub(super) enum AvatarInitialResponse {
     RawBytes,
     ApiProtobufError,
@@ -446,6 +465,7 @@ pub(super) enum AvatarInitialResponse {
     RawRedirectError,
 }
 
+#[cfg(feature = "native")]
 pub(super) fn classify_avatar_initial_response(
     status: u16,
     has_location: bool,
@@ -492,14 +512,158 @@ pub(super) fn protocol_for(method: &str, path_and_query: &str) -> Result<Protoco
         })
 }
 
+/// Selects the same request encoding used by the native HTTP transport.
+///
+/// `json_body` is a structured request for JSON or protobuf endpoints;
+/// `raw_body` is reserved for routes whose contract accepts file bytes. The
+/// body arguments are mutually exclusive. `raw_content_type` is used only for
+/// a raw upload and defaults to `application/octet-stream`.
+pub fn prepare_rest_request(
+    method: &str,
+    path_and_query: &str,
+    json_body: Option<Value>,
+    raw_body: Option<Vec<u8>>,
+    raw_content_type: Option<&str>,
+) -> Result<RestRequest> {
+    if json_body.is_some() && raw_body.is_some() {
+        return Err(Error::InvalidPayload(
+            "JSON and raw request bodies cannot be used together".into(),
+        ));
+    }
+
+    let protocol = protocol_for(method, path_and_query)?;
+    match protocol {
+        Protocol::Json => {
+            let (body, content_type) = if let Some(body) = raw_body {
+                (
+                    Some(body),
+                    Some(
+                        raw_content_type
+                            .unwrap_or("application/octet-stream")
+                            .to_owned(),
+                    ),
+                )
+            } else if let Some(body) = json_body {
+                (
+                    Some(serde_json::to_vec(&body)?),
+                    Some("application/json".into()),
+                )
+            } else {
+                (None, None)
+            };
+            Ok(RestRequest {
+                protocol: RestProtocol::Json,
+                accept: None,
+                content_type,
+                body,
+            })
+        }
+        Protocol::Protobuf(route) => match route.request {
+            RequestBody::None => {
+                if json_body.is_some() || raw_body.is_some() {
+                    return Err(Error::InvalidPayload(
+                        "this REST endpoint does not accept a request body".into(),
+                    ));
+                }
+                Ok(RestRequest {
+                    protocol: RestProtocol::Protobuf,
+                    accept: Some(PROTOBUF_MEDIA_TYPE),
+                    content_type: None,
+                    body: None,
+                })
+            }
+            RequestBody::Protobuf(encode) => {
+                if raw_body.is_some() {
+                    return Err(Error::InvalidPayload(
+                        "this REST endpoint requires a structured protobuf request".into(),
+                    ));
+                }
+                let value = json_body.unwrap_or_else(|| Value::Object(Map::new()));
+                let body = encode(value)?;
+                Ok(RestRequest {
+                    protocol: RestProtocol::Protobuf,
+                    accept: Some(PROTOBUF_MEDIA_TYPE),
+                    content_type: Some(PROTOBUF_MEDIA_TYPE.into()),
+                    body: Some(body),
+                })
+            }
+            RequestBody::Raw => {
+                if json_body.is_some() {
+                    return Err(Error::InvalidPayload(
+                        "this REST endpoint requires a raw request body".into(),
+                    ));
+                }
+                let body = raw_body.ok_or_else(|| {
+                    Error::InvalidPayload("this REST endpoint requires a raw request body".into())
+                })?;
+                Ok(RestRequest {
+                    protocol: RestProtocol::Protobuf,
+                    accept: Some(PROTOBUF_MEDIA_TYPE),
+                    content_type: raw_content_type.map(str::to_owned),
+                    body: Some(body),
+                })
+            }
+        },
+        Protocol::RawProtobufErrors => {
+            if json_body.is_some() || raw_body.is_some() {
+                return Err(Error::InvalidPayload(
+                    "this REST endpoint does not accept a request body".into(),
+                ));
+            }
+            Ok(RestRequest {
+                protocol: RestProtocol::RawProtobufErrors,
+                accept: Some(PROTOBUF_MEDIA_TYPE),
+                content_type: None,
+                body: None,
+            })
+        }
+    }
+}
+
+/// Decodes a successful HTTP response using the endpoint's registered wire
+/// contract. Raw media responses remain raw bytes; structured responses become
+/// JSON bytes suitable for conversion by the platform binding.
+pub fn finish_rest_response(
+    method: &str,
+    path_and_query: &str,
+    status: u16,
+    body: &[u8],
+) -> Result<Vec<u8>> {
+    let protocol = protocol_for(method, path_and_query)?;
+    if !(200..300).contains(&status) {
+        return Err(Error::Server {
+            status,
+            body: decode_http_error_body(protocol, body),
+        });
+    }
+
+    match protocol {
+        Protocol::Json if body.is_empty() => Ok(b"null".to_vec()),
+        Protocol::Json | Protocol::RawProtobufErrors => Ok(body.to_vec()),
+        Protocol::Protobuf(route) => decode_response_body(route, body),
+    }
+}
+
+/// Converts an HTTP error body into the same text representation surfaced by
+/// the native HTTP transport.
+pub fn format_rest_error_body(method: &str, path_and_query: &str, body: &[u8]) -> String {
+    match protocol_for(method, path_and_query) {
+        Ok(protocol) => decode_http_error_body(protocol, body),
+        Err(_) => String::from_utf8_lossy(body).into_owned(),
+    }
+}
+
+#[cfg(feature = "native")]
 pub(super) fn request_is_raw(route: &RouteSpec) -> bool {
     matches!(route.request, RequestBody::Raw)
 }
 
+#[cfg(feature = "native")]
 pub(super) fn request_requires_protobuf(route: &RouteSpec) -> bool {
     matches!(route.request, RequestBody::Protobuf(_))
 }
 
+#[cfg(feature = "native")]
 pub(super) fn encode_request_body(route: &RouteSpec, value: Value) -> Result<Option<Vec<u8>>> {
     match route.request {
         RequestBody::None => Ok(None),
@@ -762,6 +926,79 @@ mod tests {
             .unwrap();
         let decoded = identity::RegisterRequest::decode(encoded.as_slice()).unwrap();
         assert_eq!(decoded.password.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn public_rest_request_api_uses_the_registered_protobuf_contract() {
+        let request = prepare_rest_request(
+            "POST",
+            "/api/v1/register",
+            Some(serde_json::json!({"password": "secret"})),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(request.protocol, RestProtocol::Protobuf);
+        assert_eq!(request.accept, Some(PROTOBUF_MEDIA_TYPE));
+        assert_eq!(request.content_type.as_deref(), Some(PROTOBUF_MEDIA_TYPE));
+        let encoded = request.body.unwrap();
+        let decoded = identity::RegisterRequest::decode(encoded.as_slice()).unwrap();
+        assert_eq!(decoded.password.as_deref(), Some("secret"));
+    }
+
+    #[test]
+    fn public_rest_request_api_preserves_json_routes_and_raw_downloads() {
+        let bot_request = prepare_rest_request(
+            "POST",
+            "/api/bot/v1/answerCallbackQuery",
+            Some(serde_json::json!({"callback_query_id": "callback"})),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(bot_request.protocol, RestProtocol::Json);
+        assert_eq!(bot_request.accept, None);
+        assert_eq!(
+            bot_request.content_type.as_deref(),
+            Some("application/json")
+        );
+        assert_eq!(
+            serde_json::from_slice::<Value>(bot_request.body.as_deref().unwrap()).unwrap(),
+            serde_json::json!({"callback_query_id": "callback"})
+        );
+
+        let avatar_request =
+            prepare_rest_request("GET", "/api/v1/avatars/account", None, None, None).unwrap();
+        assert_eq!(avatar_request.protocol, RestProtocol::RawProtobufErrors);
+        assert_eq!(avatar_request.accept, Some(PROTOBUF_MEDIA_TYPE));
+        assert_eq!(avatar_request.body, None);
+    }
+
+    #[test]
+    fn public_rest_response_api_decodes_protobuf_and_keeps_raw_bytes() {
+        let me = identity::MeResponse {
+            id: "account".into(),
+            user_id: 17,
+            ..Default::default()
+        }
+        .encode_to_vec();
+        let decoded: Value =
+            serde_json::from_slice(&finish_rest_response("GET", "/api/v1/me", 200, &me).unwrap())
+                .unwrap();
+        assert_eq!(decoded["id"], "account");
+        // Native and portable Rust DTOs use snake_case after decoding; the
+        // browser binding maps this portable shape back to WEB camelCase.
+        assert_eq!(decoded["user_id"], 17);
+
+        let raw = b"image bytes";
+        assert_eq!(
+            finish_rest_response("GET", "/api/v1/avatars/account", 200, raw).unwrap(),
+            raw
+        );
+        assert_eq!(
+            finish_rest_response("POST", "/api/bot/v1/answerCallbackQuery", 204, &[]).unwrap(),
+            b"null"
+        );
     }
 
     #[test]

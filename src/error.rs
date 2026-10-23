@@ -73,6 +73,7 @@ impl Error {
     }
 }
 
+#[cfg(feature = "native")]
 impl From<sqlx::Error> for Error {
     fn from(e: sqlx::Error) -> Self {
         Error::Database(e.to_string())

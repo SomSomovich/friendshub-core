@@ -444,13 +444,9 @@ pub async fn subscribe_push(state: &Arc<ActorState>, payload: Vec<u8>) -> Result
     let token = bearer(state).await?;
     let request: SubscribePushRequest = serde_json::from_slice(&payload)?;
     validate_push_endpoint(&request.subscription.endpoint)?;
-    if request
-        .user_agent
-        .as_ref()
-        .is_some_and(|value| value.chars().count() > 512)
-    {
-        return Err(invalid("user_agent must not exceed 512 characters"));
-    }
+    validate_push_key(&request.subscription.keys.p256dh, "p256dh")?;
+    validate_push_key(&request.subscription.keys.auth, "auth")?;
+    validate_user_agent(request.user_agent.as_deref())?;
     let _: serde_json::Value = state
         .http
         .post("/api/v1/push/subscribe", &request, Some(&token))
@@ -503,7 +499,7 @@ fn invalid(message: impl Into<String>) -> Error {
 }
 
 fn validate_identifier(value: &str, field: &str) -> Result<()> {
-    if value.is_empty() || value.chars().count() > 128 || value.chars().any(char::is_control) {
+    if value.is_empty() || value.len() > 128 || value.chars().any(char::is_control) {
         return Err(invalid(format!(
             "{field} must be a non-empty identifier of at most 128 characters"
         )));
@@ -540,10 +536,8 @@ fn validate_profile_fields(fields: &[ProfileField]) -> Result<()> {
         let label_len = field.label.chars().count();
         let value_len = field.value.chars().count();
         if field.label.trim().is_empty()
-            || label_len == 0
             || label_len > 64
             || field.value.trim().is_empty()
-            || value_len == 0
             || value_len > 128
         {
             return Err(invalid(format!(
@@ -628,13 +622,17 @@ fn discover_query(request: &ListDiscoverProfilesRequest) -> Result<String> {
         }
     }
     if let Some(gender) = filters.gender.as_deref() {
-        if !matches!(gender, "male" | "female" | "other") {
+        let normalized = gender.trim();
+        if !matches!(normalized, "male" | "female" | "other") {
             return Err(invalid("gender filter must be male, female, or other"));
         }
         query.append_pair("gender", gender);
     }
     if let Some(looking_for) = filters.looking_for.as_deref() {
-        if !matches!(looking_for, "friendship" | "relationship" | "chat" | "all") {
+        if !matches!(
+            looking_for.trim(),
+            "friendship" | "relationship" | "chat" | "all"
+        ) {
             return Err(invalid("looking_for filter is invalid"));
         }
         query.append_pair("looking_for", looking_for);
@@ -657,15 +655,25 @@ fn discover_query(request: &ListDiscoverProfilesRequest) -> Result<String> {
         }
     }
     if let Some(interests) = filters.interests.as_ref() {
-        if interests.len() > 10
-            || interests.iter().any(|interest| {
-                let length = interest.chars().count();
-                length == 0 || length > 32 || interest.contains(',')
-            })
+        let mut unique = std::collections::HashSet::new();
+        let mut count = 0;
+        let joined_interests = interests.join(",");
+        for interest in joined_interests
+            .split(',')
+            .map(str::trim)
+            .filter(|tag| !tag.is_empty())
         {
-            return Err(invalid(
-                "interests must contain at most 10 non-empty values of at most 32 characters",
-            ));
+            if interest.chars().count() > 32 {
+                return Err(invalid(
+                    "each interest filter must be at most 32 characters",
+                ));
+            }
+            if unique.insert(interest.to_lowercase()) {
+                count += 1;
+            }
+            if count > 10 {
+                return Err(invalid("interests filter may contain at most 10 tags"));
+            }
         }
         if !interests.is_empty() {
             query.append_pair("interests", &interests.join(","));
@@ -684,8 +692,8 @@ fn discover_query(request: &ListDiscoverProfilesRequest) -> Result<String> {
         }
     }
     let limit = request.limit.unwrap_or(20);
-    if limit < 1 {
-        return Err(invalid("limit must be at least 1"));
+    if !(1..=50).contains(&limit) {
+        return Err(invalid("limit must be between 1 and 50"));
     }
     query.append_pair("limit", &limit.to_string());
     if let Some(cursor) = request.cursor.as_ref() {
@@ -700,6 +708,10 @@ fn discover_query(request: &ListDiscoverProfilesRequest) -> Result<String> {
 }
 
 fn validate_push_endpoint(endpoint: &str) -> Result<()> {
+    let endpoint = endpoint.trim();
+    if endpoint.is_empty() || endpoint.len() > 2048 {
+        return Err(invalid("endpoint must be 1-2048 characters"));
+    }
     let parsed =
         Url::parse(endpoint).map_err(|_| invalid("endpoint must be an absolute HTTPS URL"))?;
     if parsed.scheme() != "https"
@@ -710,6 +722,22 @@ fn validate_push_endpoint(endpoint: &str) -> Result<()> {
         return Err(invalid(
             "endpoint must be an absolute HTTPS URL without credentials",
         ));
+    }
+    Ok(())
+}
+
+fn validate_user_agent(user_agent: Option<&str>) -> Result<()> {
+    if user_agent.is_some_and(|value| value.len() > 512) {
+        return Err(invalid("user_agent must be at most 512 bytes"));
+    }
+    Ok(())
+}
+
+fn validate_push_key(value: &str, field: &str) -> Result<()> {
+    if value.is_empty() || value.len() > 256 {
+        return Err(invalid(format!(
+            "subscription key {field} must be 1-256 bytes"
+        )));
     }
     Ok(())
 }
@@ -817,6 +845,45 @@ mod tests {
             }])
             .is_err()
         );
+        assert!(
+            validate_profile_fields(&vec![
+                ProfileField {
+                    label: "Site".into(),
+                    value: "example.com".into(),
+                };
+                11
+            ])
+            .is_err()
+        );
+        assert!(
+            validate_profile_fields(&[ProfileField {
+                label: "x".repeat(65),
+                value: "value".into(),
+            }])
+            .is_err()
+        );
+        assert!(
+            validate_profile_fields(&[ProfileField {
+                label: "label".into(),
+                value: "x".repeat(129),
+            }])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn profile_field_validation_preserves_exact_values_for_the_wire_request() {
+        let request = SetProfileFieldsRequest {
+            fields: vec![ProfileField {
+                label: "  GitHub  ".into(),
+                value: "  @someone  ".into(),
+            }],
+        };
+        validate_profile_fields(&request.fields).unwrap();
+        assert_eq!(
+            serde_json::to_value(request).unwrap(),
+            json!({"fields": [{"label": "  GitHub  ", "value": "  @someone  "}]})
+        );
     }
 
     #[test]
@@ -824,6 +891,35 @@ mod tests {
         assert!(validate_push_endpoint("https://push.example.test/subscription/1").is_ok());
         assert!(validate_push_endpoint("http://push.example.test/subscription/1").is_err());
         assert!(validate_push_endpoint("https://user:pass@push.example.test/path").is_err());
+        assert!(validate_push_endpoint(" https://push.example.test/subscription/1 ").is_ok());
+        assert!(validate_push_endpoint("   ").is_err());
+    }
+
+    #[test]
+    fn push_limits_match_backend_byte_constraints() {
+        assert!(validate_push_key("k", "p256dh").is_ok());
+        assert!(validate_push_key(&"k".repeat(256), "auth").is_ok());
+        assert!(validate_push_key("", "auth").is_err());
+        assert!(validate_push_key(&"k".repeat(257), "auth").is_err());
+        assert!(validate_user_agent(Some(&"é".repeat(257))).is_err());
+        assert!(validate_user_agent(Some(&"x".repeat(512))).is_ok());
+    }
+
+    #[test]
+    fn discover_filter_interest_and_page_limits_match_backend() {
+        let request: ListDiscoverProfilesRequest = serde_json::from_value(json!({
+            "filters": {"interests": [" music ", "", "MUSIC", "hiking"]},
+            "limit": 50
+        }))
+        .unwrap();
+        assert_eq!(
+            discover_query(&request).unwrap(),
+            "interests=+music+%2C%2CMUSIC%2Chiking&limit=50"
+        );
+
+        let too_many: ListDiscoverProfilesRequest =
+            serde_json::from_value(json!({"limit": 51})).unwrap();
+        assert!(discover_query(&too_many).is_err());
     }
 
     #[test]

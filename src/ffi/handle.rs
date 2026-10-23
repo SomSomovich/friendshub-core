@@ -1,5 +1,6 @@
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crate::error::Result;
@@ -18,6 +19,7 @@ pub(crate) struct HandleInner {
     pub actor: Actor,
     pub events: Arc<EventQueue>,
     ffi_callbacks: Mutex<Option<Arc<FfiEventHandler>>>,
+    destroy_started: AtomicBool,
 }
 
 impl FhHandle {
@@ -27,19 +29,42 @@ impl FhHandle {
                 actor,
                 events,
                 ffi_callbacks: Mutex::new(None),
+                destroy_started: AtomicBool::new(false),
             }),
         }
     }
 
     pub fn call(&self, method: u32, payload: Vec<u8>) -> Result<Vec<u8>> {
-        self.inner.actor.call(method, payload)
+        self.inner.call(method, payload)
     }
 
     pub fn poll_event(&self, timeout: Duration) -> Result<Option<Event>> {
+        self.inner.poll_event(timeout)
+    }
+
+    /// Clones the owned state out of an opaque FFI handle before a blocking
+    /// actor call or event wait. A callback may destroy the public handle
+    /// reentrantly while that operation is in progress.
+    pub(crate) fn inner_arc(&self) -> Arc<HandleInner> {
+        self.inner.clone()
+    }
+}
+
+impl HandleInner {
+    pub(crate) fn begin_destroy(&self) -> bool {
+        self.destroy_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub(crate) fn call(&self, method: u32, payload: Vec<u8>) -> Result<Vec<u8>> {
+        self.actor.call(method, payload)
+    }
+
+    pub(crate) fn poll_event(&self, timeout: Duration) -> Result<Option<Event>> {
         // Hold the shared state through the direct queue wait so a callback
         // that destroys the public C handle cannot tear down this operation.
-        let inner = self.inner.clone();
-        let bytes = inner.actor.call(
+        let bytes = self.actor.call(
             crate::client::method_ids::POLL_EVENT,
             0_u32.to_le_bytes().to_vec(),
         )?;
@@ -48,7 +73,7 @@ impl FhHandle {
                 .map(Some)
                 .map_err(crate::error::Error::from);
         }
-        Ok(inner.events.poll(timeout))
+        Ok(self.events.poll(timeout))
     }
 
     pub(crate) fn set_event_callbacks(
@@ -59,9 +84,8 @@ impl FhHandle {
         let Some(handler) = handler else {
             return Ok(());
         };
-        self.inner.events.set_handler(handler.clone())?;
+        self.events.set_handler(handler.clone())?;
         *self
-            .inner
             .ffi_callbacks
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(handler);
@@ -69,26 +93,17 @@ impl FhHandle {
     }
 
     pub(crate) fn activate_event_push(&self) -> Result<()> {
-        // Keep the actor and event queue alive if a callback reentrantly
-        // destroys the opaque C handle while startup backlog is dispatched.
-        let inner = self.inner.clone();
-        let result = inner
+        let result = self
             .actor
             .call(crate::client::method_ids::ACTIVATE_EVENT_PUSH, Vec::new())
             .map(|_| ());
         if result.is_err() {
-            inner.clear_event_callbacks();
+            self.clear_event_callbacks();
         }
         result
     }
 
     pub(crate) fn clear_event_callbacks(&self) {
-        self.inner.clear_event_callbacks();
-    }
-}
-
-impl HandleInner {
-    fn clear_event_callbacks(&self) {
         let old = self
             .ffi_callbacks
             .lock()

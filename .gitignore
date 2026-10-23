@@ -27,3 +27,6 @@ project_dump.txt
 
 # Discovery cache. Written next to the database on first init; never committed.
 .friendshub-discovery.json
+.aws
+.agents
+.codex

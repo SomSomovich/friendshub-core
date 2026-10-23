@@ -210,10 +210,6 @@ pub struct SendIceRequest {
 
 pub async fn send_ice(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
     let req: SendIceRequest = serde_json::from_slice(&payload)?;
-    state
-        .webrtc
-        .add_ice_candidate(&req.call_id, req.candidate.clone())
-        .await?;
     let sent = crate::webrtc::signal::send_call_ice(
         state,
         &req.recipient_account_id,

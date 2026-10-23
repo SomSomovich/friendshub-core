@@ -1,9 +1,8 @@
+use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Arc, Mutex, mpsc as std_mpsc};
+use std::sync::{Arc, Condvar, Mutex, mpsc as std_mpsc};
 use std::thread;
-use std::time::Duration;
-
-use crossbeam_channel::{Receiver, Sender, TryRecvError};
+use std::time::{Duration, Instant};
 
 use crate::events::types::{Event, EventHandler};
 
@@ -46,37 +45,36 @@ impl CallbackWorker {
 }
 
 pub struct EventQueue {
-    tx: Sender<Event>,
-    rx: Receiver<Event>,
-    callback: Mutex<CallbackState>,
+    state: Mutex<QueueState>,
+    changed: Condvar,
 }
 
 #[derive(Default)]
-struct CallbackState {
+struct QueueState {
+    backlog: VecDeque<Event>,
     worker: Option<CallbackWorker>,
     active: bool,
 }
 
 impl EventQueue {
     pub fn new() -> Self {
-        let (tx, rx) = crossbeam_channel::unbounded();
         Self {
-            tx,
-            rx,
-            callback: Mutex::new(CallbackState::default()),
+            state: Mutex::new(QueueState::default()),
+            changed: Condvar::new(),
         }
     }
 
     pub fn push(&self, ev: Event) {
-        let mut callback = self
-            .callback
+        let mut state = self
+            .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        if callback.active {
-            let Some(worker) = callback.worker.as_ref() else {
-                callback.active = false;
-                let _ = self.tx.send(ev);
+        if state.active {
+            let Some(worker) = state.worker.as_ref() else {
+                state.active = false;
+                state.backlog.push_back(ev);
+                self.changed.notify_all();
                 return;
             };
             match worker.tx.send(ev) {
@@ -84,15 +82,17 @@ impl EventQueue {
                 Err(error) => {
                     // If the callback thread exited unexpectedly, discard the
                     // stale registration and preserve the event in PULL mode.
-                    callback.worker.take();
-                    callback.active = false;
-                    let _ = self.tx.send(error.0);
+                    state.worker.take();
+                    state.active = false;
+                    state.backlog.push_back(error.0);
+                    self.changed.notify_all();
                     return;
                 }
             }
         }
 
-        let _ = self.tx.send(ev);
+        state.backlog.push_back(ev);
+        self.changed.notify_one();
     }
 
     /// Registers a handler whose methods run on one dedicated callback
@@ -107,12 +107,14 @@ impl EventQueue {
     pub fn set_handler(&self, handler: Arc<dyn EventHandler>) -> std::io::Result<()> {
         let worker = CallbackWorker::spawn(handler)?;
         let previous = {
-            let mut callback = self
-                .callback
+            let mut state = self
+                .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            callback.active = false;
-            callback.worker.replace(worker)
+            state.active = false;
+            let previous = state.worker.replace(worker);
+            self.changed.notify_all();
+            previous
         };
         drop(previous);
         Ok(())
@@ -123,12 +125,14 @@ impl EventQueue {
     /// worker and may complete after this returns.
     pub fn clear_handler(&self) {
         let previous = {
-            let mut callback = self
-                .callback
+            let mut state = self
+                .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            callback.active = false;
-            callback.worker.take()
+            state.active = false;
+            let previous = state.worker.take();
+            self.changed.notify_all();
+            previous
         };
         drop(previous);
     }
@@ -138,12 +142,14 @@ impl EventQueue {
     /// joining the current thread.
     pub fn clear_handler_and_wait(&self) {
         let previous = {
-            let mut callback = self
-                .callback
+            let mut state = self
+                .state
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            callback.active = false;
-            callback.worker.take()
+            state.active = false;
+            let previous = state.worker.take();
+            self.changed.notify_all();
+            previous
         };
         if let Some(worker) = previous {
             worker.stop_and_wait();
@@ -155,38 +161,31 @@ impl EventQueue {
     /// The actor calls this after installing a handler, so events delivered
     /// before registration are not stranded in the pull queue.
     pub fn drain_backlog_to_handler(&self) -> std::io::Result<()> {
-        let mut callback = self
-            .callback
+        let mut state = self
+            .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if callback.worker.is_none() {
+        if state.worker.is_none() {
             return Ok(());
         }
 
-        // Keep the callback state locked while draining and sending. Producers
-        // queue into PULL until this complete backlog is enqueued, so a new
-        // event cannot overtake an older queued event.
-        let worker_tx = callback
+        // Keep producer routing locked while draining and sending. Producers
+        // append to `backlog` until every older event has been enqueued on the
+        // callback worker, so live events cannot overtake replayed events.
+        let worker_tx = state
             .worker
             .as_ref()
             .expect("worker was checked above")
             .tx
             .clone();
-        loop {
-            let event = match self.rx.try_recv() {
-                Ok(event) => event,
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
-            };
+        while let Some(event) = state.backlog.pop_front() {
             match worker_tx.send(event) {
                 Ok(()) => {}
                 Err(error) => {
-                    let failed_event = error.0;
-                    callback.worker.take();
-                    callback.active = false;
-                    let _ = self.tx.send(failed_event);
-                    while let Ok(event) = self.rx.try_recv() {
-                        let _ = self.tx.send(event);
-                    }
+                    state.backlog.push_front(error.0);
+                    state.worker.take();
+                    state.active = false;
+                    self.changed.notify_all();
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::BrokenPipe,
                         "event callback worker stopped while draining the pull queue",
@@ -194,23 +193,56 @@ impl EventQueue {
                 }
             }
         }
-        callback.active = true;
+        state.active = true;
+        self.changed.notify_all();
         Ok(())
     }
 
     pub fn has_handler(&self) -> bool {
-        self.callback
+        self.state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .active
     }
 
-    /// Waits up to `timeout` for an event. Returns `None` on timeout.
+    /// Waits up to `timeout` for an event. Returns `None` on timeout or while
+    /// a callback handler is registered, including during backlog activation.
     pub fn poll(&self, timeout: Duration) -> Option<Event> {
-        if timeout.is_zero() {
-            return self.rx.try_recv().ok();
+        let deadline = Instant::now().checked_add(timeout);
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        loop {
+            // Once a handler is installed, including while it is being
+            // activated, pull callers must not race the replay drain.
+            if state.worker.is_some() {
+                return None;
+            }
+            if let Some(event) = state.backlog.pop_front() {
+                return Some(event);
+            }
+            if timeout.is_zero() {
+                return None;
+            }
+
+            let remaining = match deadline {
+                Some(deadline) => deadline.saturating_duration_since(Instant::now()),
+                None => timeout,
+            };
+            if remaining.is_zero() {
+                return None;
+            }
+            let (next_state, wait) = self
+                .changed
+                .wait_timeout(state, remaining)
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            state = next_state;
+            if wait.timed_out() && state.backlog.is_empty() {
+                return None;
+            }
         }
-        self.rx.recv_timeout(timeout).ok()
     }
 }
 
@@ -634,6 +666,10 @@ mod tests {
         queue
             .set_handler(handler)
             .expect("callback thread must start");
+        assert!(
+            queue.poll(Duration::ZERO).is_none(),
+            "pull must not steal events after callback registration begins"
+        );
         queue.push(event("receipt", Some(813), json!({"sequence":2})));
         queue
             .drain_backlog_to_handler()
