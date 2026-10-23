@@ -1,6 +1,6 @@
 [package]
 name = "friendshub-core-wasm"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 rust-version = "1.98"
 publish = false
@@ -41,6 +41,7 @@ web-sys = { version = "0.3", features = [
     "CloseEvent",
     "MessageEvent",
     "Request",
+    "RequestCache",
     "RequestInit",
     "Response",
     "Window",

@@ -4,10 +4,11 @@
 //! field conversion before delegating to [`super::BrowserRestClient`].
 
 use super::BrowserRestClient;
-use js_sys::{Array, Error as JsError, Reflect, Uint8Array};
+use js_sys::{Array, Error as JsError, Function, Promise, Reflect, Uint8Array};
 use serde_json::{Map, Number, Value};
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
+use wasm_bindgen_futures::JsFuture;
 use web_sys::AbortSignal;
 
 #[wasm_bindgen]
@@ -17,6 +18,8 @@ pub struct BrowserApi {
     session_token: Option<String>,
     device_number: Option<u32>,
     timeout_ms: u32,
+    retry_on_rate_limit: bool,
+    mutation_callback: Option<Function>,
 }
 
 #[wasm_bindgen]
@@ -31,6 +34,8 @@ impl BrowserApi {
             session_token: None,
             device_number: None,
             timeout_ms: super::DEFAULT_TIMEOUT_MS,
+            retry_on_rate_limit: true,
+            mutation_callback: None,
         })
     }
 
@@ -57,6 +62,22 @@ impl BrowserApi {
         self.rest.set_timeout_ms(timeout_ms)?;
         self.timeout_ms = timeout_ms;
         Ok(())
+    }
+
+    /// Retries one 429 response when the server provides a valid
+    /// `Retry-After` value. Enabled by default.
+    #[wasm_bindgen(js_name = setRetryOnRateLimit)]
+    pub fn set_retry_on_rate_limit(&mut self, enabled: bool) {
+        self.retry_on_rate_limit = enabled;
+        self.rest.set_retry_on_rate_limit(enabled);
+    }
+
+    /// Registers an optional zero-argument notification called after each
+    /// successful authenticated mutation. Callback failures do not turn an
+    /// already successful server mutation into an API failure.
+    #[wasm_bindgen(js_name = setMutationCallback)]
+    pub fn set_mutation_callback(&mut self, callback: Option<Function>) {
+        self.mutation_callback = callback;
     }
 }
 
@@ -98,7 +119,8 @@ impl BrowserApi {
             flatten_query_groups(&mut params);
             alias_query_keys(&mut params, query_aliases);
             let url = append_query(&path, params)?;
-            self.rest
+            let response = self
+                .rest
                 .request_with_options(
                     method.to_owned(),
                     url,
@@ -109,7 +131,9 @@ impl BrowserApi {
                     extra_headers,
                     authenticated,
                 )
-                .await
+                .await?;
+            self.notify_mutation_success(method, authenticated);
+            Ok(response)
         } else {
             remove_transport_fields(&mut params);
             let body = if params.is_empty() {
@@ -118,7 +142,8 @@ impl BrowserApi {
                 let json = camel_to_snake_json(Value::Object(params));
                 Some(super::json_to_js_value(&json).map_err(|error| error.into_js())?)
             };
-            self.rest
+            let response = self
+                .rest
                 .request_with_options(
                     method.to_owned(),
                     path,
@@ -129,7 +154,9 @@ impl BrowserApi {
                     extra_headers,
                     authenticated,
                 )
-                .await
+                .await?;
+            self.notify_mutation_success(method, authenticated);
+            Ok(response)
         }
     }
 
@@ -166,19 +193,31 @@ impl BrowserApi {
     ) -> Result<JsValue, JsValue> {
         let mut rest = BrowserRestClient::new(self.api_base.clone())?;
         rest.set_timeout_ms(self.timeout_ms)?;
+        rest.set_retry_on_rate_limit(self.retry_on_rate_limit);
         if include_device_number {
             rest.set_device_number(self.device_number);
         }
-        rest.request_raw(
-            method.to_owned(),
-            path,
-            body,
-            content_type,
-            authenticated.then(|| self.session_token.clone()).flatten(),
-            None,
-            response_type.map(str::to_owned),
-        )
-        .await
+        let response = rest
+            .request_raw(
+                method.to_owned(),
+                path,
+                body,
+                content_type,
+                authenticated.then(|| self.session_token.clone()).flatten(),
+                None,
+                response_type.map(str::to_owned),
+            )
+            .await?;
+        self.notify_mutation_success(method, authenticated);
+        Ok(response)
+    }
+
+    fn notify_mutation_success(&self, method: &str, authenticated: bool) {
+        if should_notify_mutation(method, authenticated, self.session_token.is_some()) {
+            if let Some(callback) = self.mutation_callback.as_ref() {
+                let _ = callback.call0(&JsValue::UNDEFINED);
+            }
+        }
     }
 
     async fn invoke_with_token(
@@ -197,8 +236,17 @@ impl BrowserApi {
         if let Some(timeout_ms) = timeout_ms {
             rest.set_timeout_ms(timeout_ms)?;
         }
-        rest.request(method.to_owned(), url, None, token, external_signal, None)
-            .await
+        rest.set_retry_on_rate_limit(self.retry_on_rate_limit);
+        rest.request_with_cache(
+            method.to_owned(),
+            url,
+            None,
+            token,
+            external_signal,
+            None,
+            true,
+        )
+        .await
     }
 }
 
@@ -232,6 +280,8 @@ macro_rules! browser_api_methods {
 // JS argument objects contain only operation fields; session credentials are
 // held on BrowserApi and never copied into request bodies.
 browser_api_methods! {
+    // The backend health endpoint is mounted at the root (outside `/api/v1`).
+    (getHealth, "GET", "/health", none, false, &[]),
     (register, "POST", "/register", input, false, &[]),
     (login, "POST", "/login", input, false, &[]),
     (loginWithTotp, "POST", "/login/2fa", input, false, &[]),
@@ -285,6 +335,7 @@ browser_api_methods! {
     (markConversationRead, "POST", "/conversations/{conversationId}/read", input, true, &[]),
     (getConversationReads, "GET", "/conversations/{conversationId}/reads", input, true, &[]),
     (getConversation, "GET", "/conversations/{conversationId}", input, true, &[]),
+    (setConversationNotificationLevel, "PUT", "/conversations/{conversationId}/notification-level", input, true, &[]),
     (leaveConversation, "POST", "/conversations/{conversationId}/leave", input, true, &[]),
     (archiveConversation, "POST", "/conversations/{conversationId}/archive", input, true, &[]),
     (unarchiveConversation, "DELETE", "/conversations/{conversationId}/archive", input, true, &[]),
@@ -521,18 +572,23 @@ impl BrowserApi {
     pub async fn register_device(&self, input: JsValue) -> Result<JsValue, JsValue> {
         let params = input_to_object(input)?;
         let body = json_to_js(&camel_to_snake_json(Value::Object(params)))?;
-        let rest = BrowserRestClient::new(self.api_base.clone())?;
-        rest.request_with_options(
-            "POST".to_owned(),
-            "/devices".to_owned(),
-            Some(body),
-            self.session_token.clone(),
-            None,
-            None,
-            Vec::new(),
-            false,
-        )
-        .await
+        let mut rest = BrowserRestClient::new(self.api_base.clone())?;
+        rest.set_timeout_ms(self.timeout_ms)?;
+        rest.set_retry_on_rate_limit(self.retry_on_rate_limit);
+        let response = rest
+            .request_with_options(
+                "POST".to_owned(),
+                "/devices".to_owned(),
+                Some(body),
+                self.session_token.clone(),
+                None,
+                None,
+                Vec::new(),
+                false,
+            )
+            .await?;
+        self.notify_mutation_success("POST", true);
+        Ok(response)
     }
 
     /// Resolves up to 200 handles and returns the WEB-compatible items array.
@@ -709,12 +765,23 @@ impl BrowserApi {
                 .and_then(Value::as_str)
                 .ok_or_else(|| js_error("avatar upload response is missing uploadId"))?;
             let path = format!("/avatars/me/uploads/{}/finalize", encode_segment(upload_id));
-            match self
+            let finalize = self
                 .invoke("POST", &path, JsValue::UNDEFINED, true, &[])
-                .await
-            {
+                .await;
+            let finalize = match finalize {
+                Err(error) if should_retry_avatar_finalize_status(error_status(&error)) => {
+                    self.invoke("POST", &path, JsValue::UNDEFINED, true, &[])
+                        .await
+                }
+                other => other,
+            };
+            match finalize {
                 Ok(result) => return Ok(result),
-                Err(error) if restart && error_status(&error) == Some(404) => restart = false,
+                Err(error)
+                    if restart && should_restart_avatar_upload_status(error_status(&error)) =>
+                {
+                    restart = false
+                }
                 Err(error) => return Err(error),
             }
         }
@@ -784,6 +851,7 @@ impl BrowserApi {
     pub async fn fetch_attachment_chunk(&self, download_url: String) -> Result<JsValue, JsValue> {
         let mut rest = BrowserRestClient::new(self.api_base.clone())?;
         rest.set_timeout_ms(self.timeout_ms)?;
+        rest.set_retry_on_rate_limit(self.retry_on_rate_limit);
         rest.request(
             "GET".to_owned(),
             download_url,
@@ -795,22 +863,156 @@ impl BrowserApi {
         .await
     }
 
+    /// Fetches an account or conversation image as bytes without browser caching.
+    /// The BrowserRestClient only attaches session headers to a relative path
+    /// or a same-origin URL normalized to one; cross-origin signed URLs remain
+    /// credential-free.
+    #[wasm_bindgen(js_name = getAvatarImage)]
+    pub async fn get_avatar_image(&self, input: JsValue) -> Result<JsValue, JsValue> {
+        let account_id = Reflect::get(&input, &JsValue::from_str("accountId"))
+            .map_err(|error| js_error(&format!("avatar image input is invalid: {error:?}")))?
+            .as_string();
+        let path = if let Some(account_id) = account_id {
+            account_avatar_image_path(&account_id).map_err(|error| js_error(error))?
+        } else {
+            Reflect::get(&input, &JsValue::from_str("url"))
+                .map_err(|error| js_error(&format!("avatar image input is invalid: {error:?}")))?
+                .as_string()
+                .filter(|url| !url.trim().is_empty())
+                .ok_or_else(|| {
+                    js_error("avatar image input requires accountId or a non-empty url")
+                })?
+        };
+        let signal = signal_from_input(&input);
+        let mut rest = BrowserRestClient::new(self.api_base.clone())?;
+        rest.set_timeout_ms(self.timeout_ms)?;
+        rest.set_device_number(self.device_number);
+        rest.set_retry_on_rate_limit(self.retry_on_rate_limit);
+        rest.request_bytes_no_store(path, self.session_token.clone(), signal)
+            .await
+    }
+
     /// Calls the JSON-only Bot API endpoint using its bot token.
     #[wasm_bindgen(js_name = getBotUpdates)]
     pub async fn get_bot_updates(&self, token: String, input: JsValue) -> Result<JsValue, JsValue> {
         let signal = signal_from_input(&input);
         let mut params = input_to_object(input)?;
-        remove_transport_fields(&mut params);
-        let timeout = bot_query_integer(&mut params, "timeout", 60, 0, 60);
-        bot_query_integer(&mut params, "offset", 0, 0, u32::MAX);
-        bot_query_integer(&mut params, "limit", 100, 1, 500);
-        self.invoke_with_token(
-            "GET",
-            "/api/bot/v1/getUpdates",
-            json_to_js(&Value::Object(params))?,
-            Some(token),
-            Some((timeout + 5) * 1000),
-            signal,
+        let (_, _, timeout) = normalize_bot_updates_params(&mut params);
+        let response = self
+            .invoke_with_token(
+                "GET",
+                "/api/bot/v1/getUpdates",
+                json_to_js(&Value::Object(params))?,
+                Some(token),
+                Some((timeout + 5) * 1000),
+                signal,
+            )
+            .await?;
+        camelize_bot_response(response)
+    }
+
+    /// Repeatedly long-polls JSON bot updates. Each update is acknowledged by
+    /// advancing `offset` only after the awaited callback succeeds. Aborting
+    /// the supplied signal resolves with the last fully handled update ID.
+    #[wasm_bindgen(js_name = pollBotUpdates)]
+    pub async fn poll_bot_updates(
+        &self,
+        token: String,
+        input: JsValue,
+        on_update: Function,
+        on_offset: Option<Function>,
+    ) -> Result<JsValue, JsValue> {
+        let signal = signal_from_input(&input);
+        let mut params = input_to_object(input)?;
+        let (mut offset, _, timeout) = normalize_bot_updates_params(&mut params);
+        let timeout_ms = (timeout + 5) * 1000;
+
+        loop {
+            if signal.as_ref().is_some_and(AbortSignal::aborted) {
+                return Ok(JsValue::from_f64(offset as f64));
+            }
+            params.insert("offset".to_owned(), Value::Number(Number::from(offset)));
+            let result = self
+                .invoke_with_token(
+                    "GET",
+                    "/api/bot/v1/getUpdates",
+                    json_to_js(&Value::Object(params.clone()))?,
+                    Some(token.clone()),
+                    Some(timeout_ms),
+                    signal.clone(),
+                )
+                .await;
+            let response = match result {
+                Ok(response) => camelize_bot_response(response)?,
+                Err(_error) if signal.as_ref().is_some_and(AbortSignal::aborted) => {
+                    return Ok(JsValue::from_f64(offset as f64));
+                }
+                Err(error) => return Err(error),
+            };
+            let updates = property(&response, "updates")
+                .ok_or_else(|| js_error("bot updates response is missing updates"))?;
+            let updates = Array::from(&updates);
+            for update in updates.iter() {
+                if signal.as_ref().is_some_and(AbortSignal::aborted) {
+                    return Ok(JsValue::from_f64(offset as f64));
+                }
+                let update_json =
+                    super::js_value_to_json(update.clone()).map_err(|error| error.into_js())?;
+                let update_id = update_json
+                    .get("updateId")
+                    .and_then(Value::as_i64)
+                    .ok_or_else(|| js_error("bot update is missing an integer updateId"))?;
+                let callback_result = on_update.call1(&JsValue::UNDEFINED, &update)?;
+                JsFuture::from(Promise::resolve(&callback_result)).await?;
+                offset = offset.max(update_id);
+                if let Some(callback) = on_offset.as_ref() {
+                    callback.call1(&JsValue::UNDEFINED, &JsValue::from_f64(offset as f64))?;
+                }
+            }
+        }
+    }
+
+    /// Returns the public VAPID key. A missing endpoint or an empty server key
+    /// means Web Push is disabled for this deployment and returns `null`.
+    #[wasm_bindgen(js_name = getPushVapidKey)]
+    pub async fn get_push_vapid_key(&self) -> Result<JsValue, JsValue> {
+        let response = match self
+            .invoke("GET", "/push/vapid", JsValue::UNDEFINED, false, &[])
+            .await
+        {
+            Ok(response) => response,
+            Err(error) if error_status(&error) == Some(404) => return Ok(JsValue::NULL),
+            Err(error) => return Err(error),
+        };
+        let key = property(&response, "publicKey")
+            .and_then(|value| value.as_string())
+            .filter(|value| !value.is_empty());
+        Ok(key.map_or(JsValue::NULL, |value| JsValue::from_str(&value)))
+    }
+
+    /// Registers the current browser subscription. The backend wire shape and
+    /// its 512-character user-agent bound are owned by the library.
+    #[wasm_bindgen(js_name = subscribePush)]
+    pub async fn subscribe_push(&self, input: JsValue) -> Result<JsValue, JsValue> {
+        let input = input_to_object(input)?;
+        let endpoint = required_string(&input, "endpoint")?;
+        let p256dh = required_string(&input, "p256dh")?;
+        let auth = required_string(&input, "auth")?;
+        let user_agent = optional_string(&input, "userAgent")?.unwrap_or_default();
+        let body = push_subscription_body(&endpoint, &p256dh, &auth, &user_agent);
+        self.invoke("POST", "/push/subscribe", json_to_js(&body)?, true, &[])
+            .await
+    }
+
+    /// Removes the current device's server-side push association.
+    #[wasm_bindgen(js_name = unsubscribePush)]
+    pub async fn unsubscribe_push(&self, endpoint: String) -> Result<JsValue, JsValue> {
+        self.invoke(
+            "DELETE",
+            "/push/subscribe",
+            json_to_js(&serde_json::json!({ "endpoint": endpoint }))?,
+            true,
+            &[],
         )
         .await
     }
@@ -825,16 +1027,22 @@ impl BrowserApi {
         let body = json_to_js(&camel_to_snake_json(
             super::js_value_to_json(input).map_err(|error| error.into_js())?,
         ))?;
-        let rest = BrowserRestClient::new(self.api_base.clone())?;
-        rest.request(
-            "POST".to_owned(),
-            "/api/bot/v1/answerCallbackQuery".to_owned(),
-            Some(body),
-            Some(token),
-            None,
-            None,
-        )
-        .await
+        let mut rest = BrowserRestClient::new(self.api_base.clone())?;
+        rest.set_timeout_ms(self.timeout_ms)?;
+        rest.set_retry_on_rate_limit(self.retry_on_rate_limit);
+        let response = rest
+            .request_with_cache(
+                "POST".to_owned(),
+                "/api/bot/v1/answerCallbackQuery".to_owned(),
+                Some(body),
+                Some(token),
+                None,
+                None,
+                true,
+            )
+            .await?;
+        self.notify_mutation_success("POST", true);
+        Ok(response)
     }
 }
 
@@ -1005,6 +1213,13 @@ fn encode_segment(input: &str) -> String {
     encode_component(input)
 }
 
+fn account_avatar_image_path(account_id: &str) -> Result<String, &'static str> {
+    if account_id.trim().is_empty() {
+        return Err("avatar image input requires a non-empty accountId");
+    }
+    Ok(format!("/avatars/{}", encode_segment(account_id)))
+}
+
 fn encode_component(input: &str) -> String {
     let mut encoded = String::with_capacity(input.len());
     for byte in input.bytes() {
@@ -1067,6 +1282,82 @@ fn json_to_js(value: &Value) -> Result<JsValue, JsValue> {
     super::json_to_js_value(value).map_err(|error| error.into_js())
 }
 
+fn camelize_bot_response(value: JsValue) -> Result<JsValue, JsValue> {
+    let value = super::js_value_to_json(value).map_err(|error| error.into_js())?;
+    json_to_js(&snake_case_to_camel_json(value))
+}
+
+fn snake_case_to_camel_json(value: Value) -> Value {
+    match value {
+        Value::Object(object) => Value::Object(
+            object
+                .into_iter()
+                .map(|(key, value)| (snake_case_to_camel(&key), snake_case_to_camel_json(value)))
+                .collect(),
+        ),
+        Value::Array(values) => {
+            Value::Array(values.into_iter().map(snake_case_to_camel_json).collect())
+        }
+        other => other,
+    }
+}
+
+fn snake_case_to_camel(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut uppercase_next = false;
+    for ch in input.chars() {
+        if ch == '_' {
+            uppercase_next = true;
+        } else if uppercase_next {
+            output.extend(ch.to_uppercase());
+            uppercase_next = false;
+        } else {
+            output.push(ch);
+        }
+    }
+    output
+}
+
+fn required_string(input: &Map<String, Value>, key: &str) -> Result<String, JsValue> {
+    input
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .map(str::to_owned)
+        .ok_or_else(|| {
+            js_error(&format!(
+                "operation input is missing a non-empty string field {key}"
+            ))
+        })
+}
+
+fn is_mutating_method(method: &str) -> bool {
+    matches!(method, "POST" | "PUT" | "PATCH" | "DELETE")
+}
+
+fn should_notify_mutation(method: &str, authenticated: bool, has_session: bool) -> bool {
+    authenticated && has_session && is_mutating_method(method)
+}
+
+fn optional_string(input: &Map<String, Value>, key: &str) -> Result<Option<String>, JsValue> {
+    match input.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value.clone())),
+        Some(_) => Err(js_error(&format!("operation field {key} must be a string"))),
+    }
+}
+
+fn push_subscription_body(endpoint: &str, p256dh: &str, auth: &str, user_agent: &str) -> Value {
+    let user_agent = user_agent.chars().take(512).collect::<String>();
+    serde_json::json!({
+        "subscription": {
+            "endpoint": endpoint,
+            "keys": { "p256dh": p256dh, "auth": auth }
+        },
+        "userAgent": user_agent
+    })
+}
+
 fn js_error(message: &str) -> JsValue {
     JsError::new(message).into()
 }
@@ -1076,6 +1367,14 @@ fn error_status(error: &JsValue) -> Option<u16> {
         .ok()
         .and_then(|value| value.as_f64())
         .and_then(|value| u16::try_from(value as u64).ok())
+}
+
+fn should_retry_avatar_finalize_status(status: Option<u16>) -> bool {
+    matches!(status, Some(0 | 504))
+}
+
+fn should_restart_avatar_upload_status(status: Option<u16>) -> bool {
+    status == Some(404)
 }
 
 fn bot_query_integer(
@@ -1098,10 +1397,54 @@ fn bot_query_integer(
     value
 }
 
+fn bot_query_offset(params: &mut Map<String, Value>) -> i64 {
+    let value = params
+        .remove("offset")
+        .and_then(|value| match value {
+            Value::Number(number) => number.as_i64().or_else(|| {
+                number
+                    .as_f64()
+                    .filter(|value| value.is_finite())
+                    .map(f64::trunc)
+                    .map(|value| value as i64)
+            }),
+            Value::String(string) => string.parse::<i64>().ok().or_else(|| {
+                string
+                    .parse::<f64>()
+                    .ok()
+                    .filter(|value| value.is_finite())
+                    .map(f64::trunc)
+                    .map(|value| value as i64)
+            }),
+            _ => None,
+        })
+        .unwrap_or(0)
+        .max(0);
+    params.insert("offset".to_owned(), Value::Number(Number::from(value)));
+    value
+}
+
+fn normalize_bot_updates_params(params: &mut Map<String, Value>) -> (i64, u32, u32) {
+    remove_transport_fields(params);
+    params.remove("onUpdate");
+    params.remove("onOffset");
+    let offset = bot_query_offset(params);
+    let limit = bot_query_integer(params, "limit", 100, 1, 500);
+    let timeout = bot_query_integer(params, "timeout", 60, 0, 60);
+    (offset, limit, timeout)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{camel_to_snake, camel_to_snake_json, encode_component};
+    use super::{
+        account_avatar_image_path, camel_to_snake, camel_to_snake_json, encode_component,
+        is_mutating_method, normalize_bot_updates_params, push_subscription_body,
+        should_notify_mutation, should_restart_avatar_upload_status,
+        should_retry_avatar_finalize_status, snake_case_to_camel_json,
+    };
+    use friendshub_core::transport::protobuf::{RestProtocol, prepare_rest_request};
     use serde_json::json;
+    use serde_json::{Map, Value};
 
     #[test]
     fn camel_case_conversion_matches_web_wire_names() {
@@ -1116,5 +1459,180 @@ mod tests {
     #[test]
     fn route_components_are_encoded_without_form_semantics() {
         assert_eq!(encode_component("a/b +"), "a%2Fb%20%2B");
+    }
+
+    #[test]
+    fn account_avatar_image_path_is_constructed_and_encoded_in_core() {
+        assert_eq!(
+            account_avatar_image_path("account/9").unwrap(),
+            "/avatars/account%2F9"
+        );
+        assert_eq!(
+            account_avatar_image_path("account-9").unwrap(),
+            "/avatars/account-9"
+        );
+        assert!(account_avatar_image_path("").is_err());
+    }
+
+    #[test]
+    fn push_subscription_builds_the_backend_wire_shape_and_bounds_user_agent() {
+        let input = push_subscription_body(
+            "https://push.example/sub/1",
+            "public-key",
+            "auth-secret",
+            &"🙂".repeat(513),
+        );
+        let wire = camel_to_snake_json(input);
+        assert_eq!(
+            wire["subscription"],
+            json!({
+                "endpoint": "https://push.example/sub/1",
+                "keys": { "p256dh": "public-key", "auth": "auth-secret" }
+            })
+        );
+        assert_eq!(wire["user_agent"].as_str().unwrap().chars().count(), 512);
+    }
+
+    #[test]
+    fn notification_route_substitutes_encoded_id_and_converts_body_fields() {
+        let mut input = json!({
+            "conversationId": "room/one",
+            "level": "mentions"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let path = super::resolve_path(
+            "/conversations/{conversationId}/notification-level",
+            &mut input,
+        )
+        .unwrap();
+        assert_eq!(path, "/conversations/room%2Fone/notification-level");
+        let wire_body = camel_to_snake_json(Value::Object(input));
+        assert_eq!(wire_body, json!({ "level": "mentions" }));
+        let request = prepare_rest_request(
+            "PUT",
+            &format!("/api/v1{path}"),
+            Some(wire_body),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(request.protocol, RestProtocol::Protobuf);
+    }
+
+    #[test]
+    fn push_operations_use_the_registered_protobuf_routes_and_wire_fields() {
+        let vapid = prepare_rest_request("GET", "/api/v1/push/vapid", None, None, None).unwrap();
+        assert_eq!(vapid.protocol, RestProtocol::Protobuf);
+
+        let subscribe_body = camel_to_snake_json(push_subscription_body(
+            "https://push.example/sub/1",
+            "public-key",
+            "auth-secret",
+            "browser",
+        ));
+        let subscribe = prepare_rest_request(
+            "POST",
+            "/api/v1/push/subscribe",
+            Some(subscribe_body.clone()),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(subscribe.protocol, RestProtocol::Protobuf);
+        assert_eq!(
+            subscribe_body,
+            json!({
+                "subscription": {
+                    "endpoint": "https://push.example/sub/1",
+                    "keys": { "p256dh": "public-key", "auth": "auth-secret" }
+                },
+                "user_agent": "browser"
+            })
+        );
+
+        let unsubscribe = prepare_rest_request(
+            "DELETE",
+            "/api/v1/push/subscribe",
+            Some(json!({ "endpoint": "https://push.example/sub/1" })),
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(unsubscribe.protocol, RestProtocol::Protobuf);
+    }
+
+    #[test]
+    fn health_operation_uses_the_root_mounted_protobuf_endpoint() {
+        let health = prepare_rest_request("GET", "/health", None, None, None).unwrap();
+        assert_eq!(health.protocol, RestProtocol::Protobuf);
+    }
+
+    #[test]
+    fn bot_update_parameters_match_long_poll_bounds_and_strip_transport_callbacks() {
+        let mut params: Map<String, Value> = json!({
+            "offset": "4294967297",
+            "limit": 0,
+            "timeout": 75,
+            "signal": "not-json-serializable-in-js",
+            "sessionToken": "must-not-be-forwarded",
+            "onOffset": "callback"
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        let (offset, limit, timeout) = normalize_bot_updates_params(&mut params);
+        assert_eq!((offset, limit, timeout), (4_294_967_297, 1, 60));
+        assert_eq!(params["offset"], json!(4_294_967_297_i64));
+        assert_eq!(params["limit"], json!(1));
+        assert_eq!(params["timeout"], json!(60));
+        assert!(!params.contains_key("signal"));
+        assert!(!params.contains_key("sessionToken"));
+        assert!(!params.contains_key("onOffset"));
+    }
+
+    #[test]
+    fn bot_json_response_fields_are_camelized_recursively() {
+        assert_eq!(
+            snake_case_to_camel_json(json!({
+                "updates": [{
+                    "update_id": 42,
+                    "update_type": "callback_query",
+                    "data": { "callback_query_id": "q1", "account_id": "a1" }
+                }]
+            })),
+            json!({
+                "updates": [{
+                    "updateId": 42,
+                    "updateType": "callback_query",
+                    "data": { "callbackQueryId": "q1", "accountId": "a1" }
+                }]
+            })
+        );
+    }
+
+    #[test]
+    fn avatar_finalize_retries_only_ambiguous_transport_results_and_restarts_only_on_404() {
+        assert!(should_retry_avatar_finalize_status(Some(0)));
+        assert!(should_retry_avatar_finalize_status(Some(504)));
+        assert!(!should_retry_avatar_finalize_status(Some(500)));
+        assert!(!should_retry_avatar_finalize_status(None));
+        assert!(should_restart_avatar_upload_status(Some(404)));
+        assert!(!should_restart_avatar_upload_status(Some(504)));
+    }
+
+    #[test]
+    fn mutation_callback_filter_excludes_reads_and_includes_supported_writes() {
+        for method in ["POST", "PUT", "PATCH", "DELETE"] {
+            assert!(is_mutating_method(method), "{method}");
+        }
+        for method in ["GET", "HEAD"] {
+            assert!(!is_mutating_method(method), "{method}");
+        }
+        assert!(should_notify_mutation("POST", true, true));
+        assert!(!should_notify_mutation("POST", false, true));
+        assert!(!should_notify_mutation("POST", true, false));
+        assert!(!should_notify_mutation("GET", true, true));
     }
 }

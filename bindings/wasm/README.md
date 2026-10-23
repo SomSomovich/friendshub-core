@@ -63,20 +63,31 @@ await push.start(sessionToken, deviceNumber)
 `https://` URLs. HTTP schemes are mapped to WS schemes. Relative paths resolve
 against the current page URL.
 
-`start(sessionToken, deviceNumber)` sends a binary protobuf `ClientHello` with
-the WEB identity (`friendshub-web` version `0.1.0`, protocol `0.1.0`). It
-resolves with the first `ServerHello` object and rejects when the initial
-connection fails. Initial failures do not reconnect. After a successful hello,
-connection loss reconnects after 1, 2, 4, 8, 16, then 30 seconds; a successful
-hello resets that delay. The server hello deadline is 10 seconds after open,
-the overall connect deadline is 30 seconds, and keepalive pings are sent every
-30 seconds.
+`start(sessionToken, deviceNumber, signal?)` sends a binary protobuf
+`ClientHello` with the WEB identity (`friendshub-web` version `0.1.0`, protocol
+`0.1.0`). It resolves with the first normalized connected event. Transient
+initial connection failures are retried after 1, 2, 4, 8, 16, then 30 seconds;
+the 30-second delay remains capped, and a successful `ServerHello` resets the
+backoff. A fatal server error, `close()`, dropping the client, or an aborted
+optional `AbortSignal` stops retries and rejects a still-pending start. The
+server hello deadline is 10 seconds after open, the overall connect deadline is
+30 seconds per attempt, and keepalive pings are sent every 30 seconds.
 
 Each server event handled by the WEB client has its own callback setter. The
-callback receives that protobuf submessage as a camelCase JavaScript object.
-Protobuf `bytes` fields are `Uint8Array`; `int64` and `uint64` fields are plain
-JavaScript numbers, as in the WEB client's `toPlainNumber` conversion. Optional
-fields are `null` when absent. The event callbacks are:
+callback receives a normalized camelCase object matching the WEB event layer,
+not a raw protobuf submessage. UUID byte fields are lowercase UUID strings;
+envelope ciphertext is lowercase hex; poll `encryptedMeta` is base64. Empty
+optional envelope conversation IDs become `null`. `int64` and `uint64` values
+are plain JavaScript numbers. Optional fields are `null` when absent. The
+`hello` and `connected` callbacks receive `{ sessionId, accountId, deviceNumber,
+serverTimestamp }`; protocol version fields stay internal. Delivery receives
+`{ envelopes }`, where each envelope uses the WEB camelCase keys and normalized
+UUID/ciphertext values. Receipt IDs are UUID strings, with server timestamps in
+the matching order. `set_on_pong` receives the echoed `clientTimestamp` as a
+number, matching the WEB transport handler. A malformed envelope or receipt ID
+is skipped individually and reported through `set_on_protocol_error`;
+malformed UUIDs in other events cause that event to be skipped and reported
+there. The event callbacks are:
 
 `set_on_hello`, `set_on_delivery`, `set_on_receipt`, `set_on_pong`,
 `set_on_server_error`, `set_on_presence`, `set_on_bot_message`,
@@ -90,12 +101,14 @@ fields are `null` when absent. The event callbacks are:
 plaintext `ServerFrame.callSignal` event, so this binding ignores it; call
 signaling is carried inside Signal-encrypted envelopes.
 
-Lifecycle and failure callbacks are separate: `set_on_connected` receives the
-ServerHello shape; `set_on_disconnected` receives `{ reason, final }`;
-`set_on_stopped` receives `{ reason }`; transport, protocol, fatal-server, and
-callback failures go to `set_on_transport_error`, `set_on_protocol_error`,
-`set_on_fatal_error`, and `set_on_callback_error` respectively. Error objects
-contain `code` and `message` fields.
+Lifecycle and failure callbacks are separate: `set_on_disconnected` receives
+`{ reason, final }`; `set_on_stopped` receives `{ reason }`;
+`set_on_server_error` receives `{ code, message, fatal, reference }`, with
+blank references normalized to `null`; `set_on_fatal_error` receives
+`{ code, message }`. Transport, protocol, and callback failures go to
+`set_on_transport_error`, `set_on_protocol_error`, and
+`set_on_callback_error` respectively. Diagnostic error objects contain `code`
+and `message` fields.
 
 Outgoing methods are:
 

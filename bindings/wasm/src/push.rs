@@ -19,7 +19,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::{JsFuture, future_to_promise};
-use web_sys::{CloseEvent, Event, MessageEvent, WebSocket};
+use web_sys::{AbortSignal, CloseEvent, Event, MessageEvent, WebSocket};
 
 const PROTOCOL_MAJOR: u32 = 0;
 const PROTOCOL_MINOR: u32 = 1;
@@ -65,10 +65,18 @@ impl BrowserPushClient {
         })
     }
 
-    /// Opens the socket and resolves with the first ServerHello. A failed
-    /// initial connection rejects this promise and does not reconnect.
-    pub fn start(&mut self, session_token: String, device_number: u32) -> Promise {
-        start_client(&self.state, session_token, device_number)
+    /// Opens the socket and resolves with the first ServerHello. Transient
+    /// initial connection failures are retried with the same backoff used for
+    /// reconnects after a successful ServerHello. Closing the client or a fatal
+    /// server error stops the retries and rejects this promise. An optional
+    /// AbortSignal can cancel a start while it is waiting for the first hello.
+    pub fn start(
+        &mut self,
+        session_token: String,
+        device_number: u32,
+        signal: Option<AbortSignal>,
+    ) -> Promise {
+        start_client(&self.state, session_token, device_number, signal)
     }
 
     /// Closes the connection and resolves after the browser reports close, or
@@ -217,6 +225,7 @@ struct PushState {
     timers: HashMap<TimerKind, TimerSlot>,
     start_resolver: Option<Function>,
     start_rejector: Option<Function>,
+    start_abort_listener: Option<StartAbortListener>,
     close_resolvers: Vec<Function>,
 }
 
@@ -238,6 +247,7 @@ impl PushState {
             timers: HashMap::new(),
             start_resolver: None,
             start_rejector: None,
+            start_abort_listener: None,
             close_resolvers: Vec::new(),
         }
     }
@@ -265,6 +275,11 @@ struct SocketListeners {
     _close: Closure<dyn FnMut(CloseEvent)>,
 }
 
+struct StartAbortListener {
+    signal: AbortSignal,
+    callback: Closure<dyn FnMut(Event)>,
+}
+
 fn set_callback(state: &Rc<RefCell<PushState>>, name: &'static str, callback: Option<Function>) {
     let mut state = state.borrow_mut();
     if let Some(callback) = callback {
@@ -274,7 +289,12 @@ fn set_callback(state: &Rc<RefCell<PushState>>, name: &'static str, callback: Op
     }
 }
 
-fn start_client(state: &Rc<RefCell<PushState>>, token: String, device: u32) -> Promise {
+fn start_client(
+    state: &Rc<RefCell<PushState>>,
+    token: String,
+    device: u32,
+    signal: Option<AbortSignal>,
+) -> Promise {
     let state = Rc::clone(state);
     Promise::new(&mut move |resolve, reject| {
         if token.trim().is_empty() || device == 0 {
@@ -284,6 +304,13 @@ fn start_client(state: &Rc<RefCell<PushState>>, token: String, device: u32) -> P
                     "bad_request",
                     "session token and non-zero device number are required",
                 ),
+            );
+            return;
+        }
+        if signal.as_ref().is_some_and(AbortSignal::aborted) {
+            let _ = reject.call1(
+                &JsValue::UNDEFINED,
+                &push_error("aborted", "the push client start was aborted"),
             );
             return;
         }
@@ -308,6 +335,31 @@ fn start_client(state: &Rc<RefCell<PushState>>, token: String, device: u32) -> P
             inner.start_resolver = Some(resolve);
             inner.start_rejector = Some(reject);
         }
+        if let Some(signal) = signal.as_ref() {
+            let weak = Rc::downgrade(&state);
+            let callback = Closure::wrap(Box::new(move |_event: Event| {
+                if let Some(state) = weak.upgrade() {
+                    abort_pending_start(&state);
+                }
+            }) as Box<dyn FnMut(Event)>);
+            if let Err(error) =
+                signal.add_event_listener_with_callback("abort", callback.as_ref().unchecked_ref())
+            {
+                reject_start_value(&state, error);
+                return;
+            }
+            state.borrow_mut().start_abort_listener = Some(StartAbortListener {
+                signal: signal.clone(),
+                callback,
+            });
+            // AbortSignal events are dispatched on the same browser thread,
+            // but check again after listener installation to cover an abort
+            // that happened during setup.
+            if signal.aborted() {
+                abort_pending_start(&state);
+                return;
+            }
+        }
         connect_socket(&state);
     })
 }
@@ -320,9 +372,9 @@ fn close_client(state: &Rc<RefCell<PushState>>) -> Promise {
             inner.closed_by_user = true;
             inner.fatal = false;
             inner.close_resolvers.push(resolve.clone());
-            reject_start(&mut inner, "closed", "the push client was closed");
             inner.socket.clone()
         };
+        reject_start(&state, "closed", "the push client was closed");
         cancel_timer(&state, TimerKind::Reconnect);
         cancel_timer(&state, TimerKind::ConnectDeadline);
         cancel_timer(&state, TimerKind::HelloDeadline);
@@ -354,13 +406,13 @@ fn drop_client(state: &Rc<RefCell<PushState>>) {
         let mut inner = state.borrow_mut();
         inner.closed_by_user = true;
         inner.connected = false;
-        reject_start(&mut inner, "closed", "the push client was dropped");
         (
             inner.socket.take(),
             inner.listeners.take(),
             std::mem::take(&mut inner.close_resolvers),
         )
     };
+    reject_start(state, "closed", "the push client was dropped");
     cancel_timer(state, TimerKind::Reconnect);
     cancel_timer(state, TimerKind::ConnectDeadline);
     cancel_timer(state, TimerKind::HelloDeadline);
@@ -505,14 +557,24 @@ fn dispatch_server_frame(state: &Rc<RefCell<PushState>>, generation: u64, frame:
                 report_protocol_error(state, "unexpected ServerHello");
                 return;
             }
+            let payload = match server_hello_shape(&message) {
+                Ok(payload) => payload.into_js(),
+                Err(error) => {
+                    report_protocol_error(state, &format!("invalid ServerHello: {error}"));
+                    fail_connection_attempt(
+                        state,
+                        generation,
+                        push_error("protocol_error", &error),
+                    );
+                    return;
+                }
+            };
             cancel_timer(state, TimerKind::HelloDeadline);
-            let payload = server_hello_shape(&message).into_js();
             {
                 let mut inner = state.borrow_mut();
-                inner.connected = true;
-                inner.ever_connected = true;
-                inner.reconnect_attempt = 0;
+                mark_server_hello_received(&mut inner);
             }
+            clear_start_abort_listener(state);
             schedule_timer(state, TimerKind::PingInterval, PING_INTERVAL_MS, true);
             invoke_callback(state, "hello", payload.clone());
             invoke_callback(state, "connected", payload.clone());
@@ -523,10 +585,20 @@ fn dispatch_server_frame(state: &Rc<RefCell<PushState>>, generation: u64, frame:
             }
         }
         ServerKind::Delivery(message) => {
-            dispatch_event(state, "delivery", envelope_delivery_shape(&message))
+            let (shape, errors) = envelope_delivery_shape(&message);
+            for error in errors {
+                report_protocol_error(state, &format!("invalid delivered envelope: {error}"));
+            }
+            if let Some(shape) = shape {
+                dispatch_event(state, "delivery", shape);
+            }
         }
         ServerKind::Receipt(message) => {
-            dispatch_event(state, "receipt", envelope_ack_shape(&message))
+            let (shape, errors) = envelope_ack_shape(&message);
+            for error in errors {
+                report_protocol_error(state, &format!("invalid receipt envelope id: {error}"));
+            }
+            dispatch_event(state, "receipt", shape);
         }
         ServerKind::Pong(message) => dispatch_event(state, "pong", pong_shape(&message)),
         ServerKind::Error(mut message) => {
@@ -581,49 +653,51 @@ fn dispatch_server_frame(state: &Rc<RefCell<PushState>>, generation: u64, frame:
             }
         }
         ServerKind::Presence(message) => {
-            dispatch_event(state, "presence", presence_shape(&message))
+            dispatch_event_result(state, "presence", presence_shape(&message))
         }
         ServerKind::BotMessage(message) => {
-            dispatch_event(state, "botMessage", bot_message_shape(&message))
+            dispatch_event_result(state, "botMessage", bot_message_shape(&message))
         }
         ServerKind::ChannelPost(message) => {
-            dispatch_event(state, "channelPost", channel_post_shape(&message))
+            dispatch_event_result(state, "channelPost", channel_post_shape(&message))
         }
-        ServerKind::Typing(message) => dispatch_event(state, "typing", typing_shape(&message)),
+        ServerKind::Typing(message) => {
+            dispatch_event_result(state, "typing", typing_shape(&message))
+        }
         ServerKind::ReadReceipt(message) => {
-            dispatch_event(state, "readReceipt", read_receipt_shape(&message))
+            dispatch_event_result(state, "readReceipt", read_receipt_shape(&message))
         }
-        ServerKind::ConversationUpdated(message) => dispatch_event(
+        ServerKind::ConversationUpdated(message) => dispatch_event_result(
             state,
             "conversationUpdated",
             conversation_updated_shape(&message),
         ),
-        ServerKind::HistoryRequestRelay(message) => dispatch_event(
+        ServerKind::HistoryRequestRelay(message) => dispatch_event_result(
             state,
             "historyRequestRelay",
             history_request_relay_shape(&message),
         ),
         ServerKind::Nudge(message) => {
-            dispatch_event(state, "nudge", nudge_delivery_shape(&message))
+            dispatch_event_result(state, "nudge", nudge_delivery_shape(&message))
         }
         ServerKind::NudgeResult(message) => {
             dispatch_event(state, "nudgeResult", nudge_result_shape(&message))
         }
-        ServerKind::ConversationExpired(message) => dispatch_event(
+        ServerKind::ConversationExpired(message) => dispatch_event_result(
             state,
             "conversationExpired",
             conversation_expired_shape(&message),
         ),
         ServerKind::ScheduledCreated(message) => {
-            dispatch_event(state, "scheduledCreated", scheduled_created_shape(&message))
+            dispatch_event_result(state, "scheduledCreated", scheduled_created_shape(&message))
         }
-        ServerKind::ScheduledCancelled(message) => dispatch_event(
+        ServerKind::ScheduledCancelled(message) => dispatch_event_result(
             state,
             "scheduledCancelled",
             scheduled_cancelled_shape(&message),
         ),
         ServerKind::FoldersUpdated(message) => {
-            dispatch_event(state, "foldersUpdated", folders_updated_shape(&message))
+            dispatch_event_result(state, "foldersUpdated", folders_updated_shape(&message))
         }
         // WEB exchanges call signals inside Signal-encrypted envelopes and
         // does not dispatch this plaintext frame.
@@ -644,10 +718,10 @@ fn dispatch_server_frame(state: &Rc<RefCell<PushState>>, generation: u64, frame:
             bot_callback_answered_shape(&message),
         ),
         ServerKind::PollUpdated(message) => {
-            dispatch_event(state, "pollUpdated", poll_updated_shape(&message))
+            dispatch_event_result(state, "pollUpdated", poll_updated_shape(&message))
         }
         ServerKind::PollDeleted(message) => {
-            dispatch_event(state, "pollDeleted", poll_deleted_shape(&message))
+            dispatch_event_result(state, "pollDeleted", poll_deleted_shape(&message))
         }
     }
 }
@@ -656,16 +730,28 @@ fn dispatch_event(state: &Rc<RefCell<PushState>>, name: &'static str, shape: Sha
     invoke_callback(state, name, shape.into_js());
 }
 
+fn dispatch_event_result(
+    state: &Rc<RefCell<PushState>>,
+    name: &'static str,
+    shape: Result<Shape, String>,
+) {
+    match shape {
+        Ok(shape) => dispatch_event(state, name, shape),
+        Err(error) => report_protocol_error(state, &format!("invalid {name} event: {error}")),
+    }
+}
+
 fn handle_close(state: &Rc<RefCell<PushState>>, generation: u64, code: u16, reason: String) {
     if !generation_is_current(state, generation) {
         return;
     }
-    let (was_connected, stopping, ever_connected) = {
+    let (was_connected, stopping, ever_connected, start_pending) = {
         let inner = state.borrow();
         (
             inner.connected,
             inner.closed_by_user || inner.fatal,
             inner.ever_connected,
+            inner.start_resolver.is_some(),
         )
     };
     if was_connected {
@@ -701,14 +787,8 @@ fn handle_close(state: &Rc<RefCell<PushState>>, generation: u64, code: u16, reas
             )])
             .into_js(),
         );
-    } else if was_connected || ever_connected {
+    } else if was_connected || ever_connected || start_pending {
         schedule_reconnect(state);
-    } else {
-        reject_start(
-            &mut state.borrow_mut(),
-            "closed",
-            &format!("the socket closed ({code})"),
-        );
     }
 }
 
@@ -755,12 +835,20 @@ fn reconnect_after_close(state: &Rc<RefCell<PushState>>) {
 fn schedule_reconnect(state: &Rc<RefCell<PushState>>) {
     let (delay, should_retry) = {
         let mut inner = state.borrow_mut();
-        let allowed = !inner.closed_by_user && !inner.fatal && inner.ever_connected;
-        let delay = reconnect_delay(inner.reconnect_attempt);
-        if allowed {
-            inner.reconnect_attempt = inner.reconnect_attempt.saturating_add(1);
+        let start_pending = inner.start_resolver.is_some();
+        let next = next_reconnect(
+            inner.reconnect_attempt,
+            start_pending,
+            inner.ever_connected,
+            inner.closed_by_user,
+            inner.fatal,
+        );
+        if let Some((delay, attempt)) = next {
+            inner.reconnect_attempt = attempt;
+            (delay, true)
+        } else {
+            (0, false)
         }
-        (delay, allowed)
     };
     if should_retry {
         schedule_timer(state, TimerKind::Reconnect, delay, false);
@@ -771,28 +859,73 @@ fn reconnect_delay(attempt: usize) -> i32 {
     RECONNECT_DELAYS_MS[attempt.min(RECONNECT_DELAYS_MS.len() - 1)]
 }
 
+fn mark_server_hello_received(state: &mut PushState) {
+    state.connected = true;
+    state.ever_connected = true;
+    state.reconnect_attempt = 0;
+}
+
+/// Returns the delay and next attempt number when the client still owns a
+/// pending initial start or has connected successfully before. This pure
+/// transition keeps the retry policy testable without browser timers.
+fn next_reconnect(
+    attempt: usize,
+    start_pending: bool,
+    ever_connected: bool,
+    closed_by_user: bool,
+    fatal: bool,
+) -> Option<(i32, usize)> {
+    if closed_by_user || fatal || !(start_pending || ever_connected) {
+        return None;
+    }
+    Some((reconnect_delay(attempt), attempt.saturating_add(1)))
+}
+
 fn fail_connection_attempt(state: &Rc<RefCell<PushState>>, generation: u64, error: JsValue) {
-    if !generation_is_current(state, generation) {
+    // Unlike socket event handlers, this is also called when the browser
+    // refuses to construct a WebSocket, in which case no socket exists.
+    if state.borrow().generation != generation {
         return;
     }
     let can_retry = {
         let inner = state.borrow();
-        inner.ever_connected && !inner.closed_by_user && !inner.fatal
+        next_reconnect(
+            inner.reconnect_attempt,
+            inner.start_resolver.is_some(),
+            inner.ever_connected,
+            inner.closed_by_user,
+            inner.fatal,
+        )
+        .is_some()
     };
     cancel_timer(state, TimerKind::ConnectDeadline);
     cancel_timer(state, TimerKind::HelloDeadline);
-    if !can_retry {
-        reject_start_value(state, error.clone());
-    }
-    if let Some(socket) = state.borrow().socket.clone() {
-        let _ = socket.close();
-    }
     if can_retry {
-        // If construction itself failed there will be no close event to drive
-        // the state machine, so ensure the next attempt is still scheduled.
-        if state.borrow().socket.is_none() {
+        let socket = state.borrow().socket.clone();
+        if let Some(socket) = socket {
+            if socket.ready_state() == WebSocket::CLOSED {
+                let reason = format!("connection attempt failed: {}", describe_js_value(&error));
+                handle_close(state, generation, 1006, reason);
+            } else if let Err(close_error) = socket.close() {
+                report_transport_error(
+                    state,
+                    "failed to close failed WebSocket attempt",
+                    close_error,
+                );
+                let reason = format!("connection attempt failed: {}", describe_js_value(&error));
+                handle_close(state, generation, 1006, reason);
+            } else {
+                // Browsers normally dispatch `close` after `close()`. Bound
+                // that wait so a broken implementation cannot stall startup.
+                schedule_timer(state, TimerKind::CloseDeadline, CLOSE_TIMEOUT_MS, false);
+            }
+        } else {
+            // A constructor failure has no socket close event to advance the
+            // state machine, so schedule the next attempt directly.
             schedule_reconnect(state);
         }
+    } else if !state.borrow().closed_by_user && !state.borrow().fatal {
+        reject_start_value(state, error);
     }
 }
 
@@ -921,9 +1054,14 @@ fn generation_is_current(state: &Rc<RefCell<PushState>>, generation: u64) -> boo
     state.borrow().generation == generation && state.borrow().socket.is_some()
 }
 
-fn reject_start(state: &mut PushState, code: &str, message: &str) {
-    if let Some(reject) = state.start_rejector.take() {
-        state.start_resolver = None;
+fn reject_start(state: &Rc<RefCell<PushState>>, code: &str, message: &str) {
+    let reject = {
+        let mut inner = state.borrow_mut();
+        inner.start_resolver = None;
+        inner.start_rejector.take()
+    };
+    clear_start_abort_listener(state);
+    if let Some(reject) = reject {
         let _ = reject.call1(&JsValue::UNDEFINED, &push_error(code, message));
     }
 }
@@ -934,8 +1072,50 @@ fn reject_start_value(state: &Rc<RefCell<PushState>>, error: JsValue) {
         inner.start_resolver = None;
         inner.start_rejector.take()
     };
+    clear_start_abort_listener(state);
     if let Some(reject) = reject {
         let _ = reject.call1(&JsValue::UNDEFINED, &error);
+    }
+}
+
+fn clear_start_abort_listener(state: &Rc<RefCell<PushState>>) {
+    let listener = state.borrow_mut().start_abort_listener.take();
+    if let Some(listener) = listener {
+        let _ = listener.signal.remove_event_listener_with_callback(
+            "abort",
+            listener.callback.as_ref().unchecked_ref(),
+        );
+        defer_drop(listener.callback);
+    }
+}
+
+fn abort_pending_start(state: &Rc<RefCell<PushState>>) {
+    let socket = {
+        let mut inner = state.borrow_mut();
+        if inner.start_resolver.is_none() || inner.connected {
+            return;
+        }
+        inner.closed_by_user = true;
+        inner.socket.clone()
+    };
+    reject_start(state, "aborted", "the push client start was aborted");
+    cancel_timer(state, TimerKind::Reconnect);
+    cancel_timer(state, TimerKind::ConnectDeadline);
+    cancel_timer(state, TimerKind::HelloDeadline);
+    cancel_timer(state, TimerKind::PingInterval);
+    if let Some(socket) = socket {
+        if socket.ready_state() == WebSocket::CLOSED {
+            let generation = state.borrow().generation;
+            handle_close(state, generation, 1000, "aborted".into());
+        } else if let Err(error) = socket.close() {
+            report_transport_error(state, "failed to close aborted WebSocket", error);
+            let generation = state.borrow().generation;
+            handle_close(state, generation, 1006, "abort close failed".into());
+        } else {
+            schedule_timer(state, TimerKind::CloseDeadline, CLOSE_TIMEOUT_MS, false);
+        }
+    } else {
+        finalize_socket(state, 0, "aborted".into());
     }
 }
 
@@ -1394,7 +1574,6 @@ enum Shape {
     Bool(bool),
     Number(f64),
     String(String),
-    Bytes(Vec<u8>),
     Array(Vec<Shape>),
     Object(Vec<(&'static str, Shape)>),
 }
@@ -1411,14 +1590,75 @@ fn n(value: impl Into<f64>) -> Shape {
 fn s(value: impl Into<String>) -> Shape {
     Shape::String(value.into())
 }
-fn bytes(value: &[u8]) -> Shape {
-    Shape::Bytes(value.to_vec())
-}
 fn opt_string(value: Option<&str>) -> Shape {
     value.map(s).unwrap_or(Shape::Null)
 }
 fn opt_i64(value: Option<i64>) -> Shape {
     value.map(|value| n(value as f64)).unwrap_or(Shape::Null)
+}
+
+fn opt_trimmed_string(value: Option<&str>) -> Shape {
+    value
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(s)
+        .unwrap_or(Shape::Null)
+}
+
+fn uuid_string(value: &[u8]) -> Result<String, String> {
+    if value.len() != 16 {
+        return Err(format!(
+            "expected a 16-byte UUID, received {} bytes",
+            value.len()
+        ));
+    }
+    let value = hex::encode(value);
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        &value[0..8],
+        &value[8..12],
+        &value[12..16],
+        &value[16..20],
+        &value[20..32]
+    ))
+}
+
+fn uuid_shape(value: &[u8]) -> Result<Shape, String> {
+    uuid_string(value).map(Shape::String)
+}
+
+fn optional_uuid_shape(value: &[u8]) -> Result<Shape, String> {
+    if value.is_empty() {
+        Ok(Shape::Null)
+    } else {
+        uuid_shape(value)
+    }
+}
+
+fn base64_string(value: &[u8]) -> String {
+    const ALPHABET: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut output = String::with_capacity(value.len().div_ceil(3) * 4);
+    for chunk in value.chunks(3) {
+        let first = chunk[0];
+        let second = chunk.get(1).copied();
+        let third = chunk.get(2).copied();
+        output.push(ALPHABET[(first >> 2) as usize] as char);
+        output
+            .push(ALPHABET[(((first & 0x03) << 4) | (second.unwrap_or(0) >> 4)) as usize] as char);
+        if let Some(second) = second {
+            output.push(
+                ALPHABET[(((second & 0x0f) << 2) | (third.unwrap_or(0) >> 6)) as usize] as char,
+            );
+        } else {
+            output.push('=');
+        }
+        if let Some(third) = third {
+            output.push(ALPHABET[(third & 0x3f) as usize] as char);
+        } else {
+            output.push('=');
+        }
+    }
+    output
 }
 
 impl Shape {
@@ -1428,7 +1668,6 @@ impl Shape {
             Self::Bool(value) => JsValue::from_bool(value),
             Self::Number(value) => JsValue::from_f64(value),
             Self::String(value) => JsValue::from_str(&value),
-            Self::Bytes(value) => Uint8Array::from(value.as_slice()).into(),
             Self::Array(values) => {
                 let output = Array::new();
                 for value in values {
@@ -1447,72 +1686,94 @@ impl Shape {
     }
 }
 
-fn server_hello_shape(value: &fh::ServerHello) -> Shape {
-    object_shape(vec![
+fn server_hello_shape(value: &fh::ServerHello) -> Result<Shape, String> {
+    let account_id = if value.account_id.is_empty() {
+        String::new()
+    } else {
+        uuid_string(&value.account_id)?
+    };
+    Ok(object_shape(vec![
         ("sessionId", s(value.session_id.clone())),
-        ("accountId", bytes(&value.account_id)),
+        ("accountId", s(account_id)),
         ("deviceNumber", n(value.device_number)),
         ("serverTimestamp", n(value.server_timestamp as f64)),
-        ("protocolMajor", n(value.protocol_major)),
-        ("protocolMinor", n(value.protocol_minor)),
-        ("protocolPatch", n(value.protocol_patch)),
-    ])
+    ]))
 }
 
-fn envelope_shape(value: &Envelope) -> Shape {
-    object_shape(vec![
-        ("envelopeId", bytes(&value.envelope_id)),
-        ("senderAccountId", bytes(&value.sender_account_id)),
+fn envelope_shape(value: &Envelope) -> Result<Shape, String> {
+    Ok(object_shape(vec![
+        ("envelopeId", uuid_shape(&value.envelope_id)?),
+        ("senderAccountId", uuid_shape(&value.sender_account_id)?),
         ("senderDeviceNumber", n(value.sender_device_number)),
-        ("recipientAccountId", bytes(&value.recipient_account_id)),
+        (
+            "recipientAccountId",
+            uuid_shape(&value.recipient_account_id)?,
+        ),
         ("recipientDeviceNumber", n(value.recipient_device_number)),
         ("envelopeType", n(value.envelope_type)),
         ("isPrekeyMessage", b(value.is_prekey_message)),
-        ("ciphertext", bytes(&value.ciphertext)),
+        ("ciphertext", s(hex::encode(&value.ciphertext))),
         ("clientTimestamp", n(value.client_timestamp as f64)),
-        ("conversationId", bytes(&value.conversation_id)),
+        (
+            "conversationId",
+            optional_uuid_shape(&value.conversation_id)?,
+        ),
         ("senderIsBot", b(value.sender_is_bot)),
         ("sendAt", n(value.send_at as f64)),
-    ])
+    ]))
 }
 
-fn envelope_delivery_shape(value: &fh::EnvelopeDelivery) -> Shape {
-    object_shape(vec![(
-        "envelopes",
-        Shape::Array(value.envelopes.iter().map(envelope_shape).collect()),
-    )])
+fn envelope_delivery_shape(value: &fh::EnvelopeDelivery) -> (Option<Shape>, Vec<String>) {
+    let mut errors = Vec::new();
+    let envelopes: Vec<Shape> = value
+        .envelopes
+        .iter()
+        .filter_map(|envelope| match envelope_shape(envelope) {
+            Ok(envelope) => Some(envelope),
+            Err(error) => {
+                errors.push(error);
+                None
+            }
+        })
+        .collect();
+    let shape = if envelopes.is_empty() {
+        None
+    } else {
+        Some(object_shape(vec![("envelopes", Shape::Array(envelopes))]))
+    };
+    (shape, errors)
 }
 
-fn envelope_ack_shape(value: &fh::EnvelopeAck) -> Shape {
-    object_shape(vec![
-        (
-            "envelopeIds",
-            Shape::Array(
-                value
-                    .envelope_ids
-                    .iter()
-                    .map(|value| bytes(value))
-                    .collect(),
-            ),
-        ),
-        (
-            "serverTimestamps",
-            Shape::Array(
-                value
+fn envelope_ack_shape(value: &fh::EnvelopeAck) -> (Shape, Vec<String>) {
+    let mut errors = Vec::new();
+    let mut ids = Vec::with_capacity(value.envelope_ids.len());
+    let mut timestamps = Vec::with_capacity(value.envelope_ids.len());
+    for (index, envelope_id) in value.envelope_ids.iter().enumerate() {
+        match uuid_string(envelope_id) {
+            Ok(envelope_id) => {
+                ids.push(s(envelope_id));
+                timestamps.push(n(value
                     .server_timestamps
-                    .iter()
-                    .map(|value| n(*value as f64))
-                    .collect(),
-            ),
-        ),
-    ])
+                    .get(index)
+                    .copied()
+                    .unwrap_or_default() as f64));
+            }
+            Err(error) => errors.push(error),
+        }
+    }
+    (
+        object_shape(vec![
+            ("envelopeIds", Shape::Array(ids)),
+            ("serverTimestamps", Shape::Array(timestamps)),
+        ]),
+        errors,
+    )
 }
 
 fn pong_shape(value: &fh::Pong) -> Shape {
-    object_shape(vec![
-        ("clientTimestamp", n(value.client_timestamp as f64)),
-        ("serverTimestamp", n(value.server_timestamp as f64)),
-    ])
+    // The existing WEB transport handler consumes only the echoed timestamp
+    // to match the pong against the outstanding ping.
+    n(value.client_timestamp as f64)
 }
 
 fn error_frame_shape(value: &fh::ErrorFrame) -> Shape {
@@ -1520,13 +1781,13 @@ fn error_frame_shape(value: &fh::ErrorFrame) -> Shape {
         ("code", s(value.code.clone())),
         ("message", s(value.message.clone())),
         ("fatal", b(value.fatal)),
-        ("reference", opt_string(value.reference.as_deref())),
+        ("reference", opt_trimmed_string(value.reference.as_deref())),
     ])
 }
 
-fn presence_shape(value: &fh::PresenceUpdate) -> Shape {
-    object_shape(vec![
-        ("accountId", bytes(&value.account_id)),
+fn presence_shape(value: &fh::PresenceUpdate) -> Result<Shape, String> {
+    Ok(object_shape(vec![
+        ("accountId", uuid_shape(&value.account_id)?),
         ("isOnline", b(value.is_online)),
         ("lastSeen", opt_i64(value.last_seen)),
         (
@@ -1541,14 +1802,14 @@ fn presence_shape(value: &fh::PresenceUpdate) -> Shape {
             "customStatusExpiresAt",
             opt_i64(value.custom_status_expires_at),
         ),
-    ])
+    ]))
 }
 
-fn bot_message_shape(value: &fh::BotMessageDelivery) -> Shape {
-    object_shape(vec![
+fn bot_message_shape(value: &fh::BotMessageDelivery) -> Result<Shape, String> {
+    Ok(object_shape(vec![
         ("messageId", s(value.message_id.clone())),
-        ("botId", bytes(&value.bot_id)),
-        ("accountId", bytes(&value.account_id)),
+        ("botId", uuid_shape(&value.bot_id)?),
+        ("accountId", uuid_shape(&value.account_id)?),
         ("text", s(value.text.clone())),
         (
             "replyToMessageId",
@@ -1556,15 +1817,15 @@ fn bot_message_shape(value: &fh::BotMessageDelivery) -> Shape {
         ),
         ("createdAt", n(value.created_at as f64)),
         ("replyMarkup", opt_string(value.reply_markup.as_deref())),
-    ])
+    ]))
 }
 
-fn channel_post_shape(value: &fh::ChannelPostDelivery) -> Shape {
-    object_shape(vec![
+fn channel_post_shape(value: &fh::ChannelPostDelivery) -> Result<Shape, String> {
+    Ok(object_shape(vec![
         ("postId", s(value.post_id.clone())),
-        ("channelId", bytes(&value.channel_id)),
+        ("channelId", uuid_shape(&value.channel_id)?),
         ("authorType", s(value.author_type.clone())),
-        ("authorId", bytes(&value.author_id)),
+        ("authorId", uuid_shape(&value.author_id)?),
         ("text", s(value.text.clone())),
         (
             "attachmentIds",
@@ -1575,71 +1836,88 @@ fn channel_post_shape(value: &fh::ChannelPostDelivery) -> Shape {
             opt_string(value.reply_to_post_id.as_deref()),
         ),
         ("createdAt", n(value.created_at as f64)),
-    ])
+    ]))
 }
 
-fn typing_shape(value: &fh::TypingDelivery) -> Shape {
-    object_shape(vec![
-        ("conversationId", bytes(&value.conversation_id)),
-        ("accountId", bytes(&value.account_id)),
-    ])
+fn typing_shape(value: &fh::TypingDelivery) -> Result<Shape, String> {
+    Ok(object_shape(vec![
+        ("conversationId", uuid_shape(&value.conversation_id)?),
+        ("accountId", uuid_shape(&value.account_id)?),
+    ]))
 }
 
-fn read_receipt_shape(value: &fh::ReadReceiptDelivery) -> Shape {
-    object_shape(vec![
-        ("conversationId", bytes(&value.conversation_id)),
-        ("accountId", bytes(&value.account_id)),
+fn read_receipt_shape(value: &fh::ReadReceiptDelivery) -> Result<Shape, String> {
+    Ok(object_shape(vec![
+        ("conversationId", uuid_shape(&value.conversation_id)?),
+        ("accountId", uuid_shape(&value.account_id)?),
         ("lastReadAt", n(value.last_read_at as f64)),
-    ])
+    ]))
 }
 
-fn conversation_updated_shape(value: &fh::ConversationUpdatedDelivery) -> Shape {
-    object_shape(vec![
-        ("conversationId", bytes(&value.conversation_id)),
+fn conversation_updated_shape(value: &fh::ConversationUpdatedDelivery) -> Result<Shape, String> {
+    Ok(object_shape(vec![
+        ("conversationId", uuid_shape(&value.conversation_id)?),
         ("title", opt_string(value.title.as_deref())),
         ("description", opt_string(value.description.as_deref())),
         ("isPublic", value.is_public.map(b).unwrap_or(Shape::Null)),
         ("membersChanged", b(value.members_changed)),
-    ])
+    ]))
 }
 
-fn history_request_relay_shape(value: &fh::HistoryRequestRelay) -> Shape {
-    object_shape(vec![
+fn history_request_relay_shape(value: &fh::HistoryRequestRelay) -> Result<Shape, String> {
+    let conversation_ids = value
+        .conversation_ids
+        .iter()
+        .enumerate()
+        .map(|(index, id)| {
+            uuid_shape(id).map_err(|error| format!("conversationIds[{index}]: {error}"))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(object_shape(vec![
         ("fromDeviceNumber", n(value.from_device_number)),
-        (
-            "conversationIds",
-            Shape::Array(value.conversation_ids.iter().map(|id| bytes(id)).collect()),
-        ),
-    ])
+        ("conversationIds", Shape::Array(conversation_ids)),
+    ]))
 }
 
-fn nudge_delivery_shape(value: &fh::NudgeDelivery) -> Shape {
-    object_shape(vec![
-        ("conversationId", bytes(&value.conversation_id)),
-        ("fromAccountId", bytes(&value.from_account_id)),
-    ])
+fn nudge_delivery_shape(value: &fh::NudgeDelivery) -> Result<Shape, String> {
+    Ok(object_shape(vec![
+        ("conversationId", uuid_shape(&value.conversation_id)?),
+        ("fromAccountId", uuid_shape(&value.from_account_id)?),
+    ]))
 }
 
 fn nudge_result_shape(value: &fh::NudgeResult) -> Shape {
     object_shape(vec![("delivered", b(value.delivered))])
 }
-fn conversation_expired_shape(value: &fh::ConversationExpiredDelivery) -> Shape {
-    object_shape(vec![("conversationId", bytes(&value.conversation_id))])
+fn conversation_expired_shape(value: &fh::ConversationExpiredDelivery) -> Result<Shape, String> {
+    Ok(object_shape(vec![(
+        "conversationId",
+        uuid_shape(&value.conversation_id)?,
+    )]))
 }
 
-fn scheduled_created_shape(value: &fh::ScheduledEnvelopeCreated) -> Shape {
-    object_shape(vec![
-        ("envelopeId", bytes(&value.envelope_id)),
-        ("conversationId", bytes(&value.conversation_id)),
+fn scheduled_created_shape(value: &fh::ScheduledEnvelopeCreated) -> Result<Shape, String> {
+    Ok(object_shape(vec![
+        ("envelopeId", uuid_shape(&value.envelope_id)?),
+        (
+            "conversationId",
+            optional_uuid_shape(&value.conversation_id)?,
+        ),
         ("sendAt", n(value.send_at as f64)),
-    ])
+    ]))
 }
 
-fn scheduled_cancelled_shape(value: &fh::ScheduledEnvelopeCancelled) -> Shape {
-    object_shape(vec![("envelopeId", bytes(&value.envelope_id))])
+fn scheduled_cancelled_shape(value: &fh::ScheduledEnvelopeCancelled) -> Result<Shape, String> {
+    Ok(object_shape(vec![(
+        "envelopeId",
+        uuid_shape(&value.envelope_id)?,
+    )]))
 }
-fn folders_updated_shape(value: &fh::FoldersUpdated) -> Shape {
-    object_shape(vec![("accountId", bytes(&value.account_id))])
+fn folders_updated_shape(value: &fh::FoldersUpdated) -> Result<Shape, String> {
+    Ok(object_shape(vec![(
+        "accountId",
+        uuid_shape(&value.account_id)?,
+    )]))
 }
 
 fn bot_message_edited_shape(value: &fh::BotMessageEdited) -> Shape {
@@ -1667,10 +1945,32 @@ fn bot_callback_answered_shape(value: &fh::BotCallbackAnswered) -> Shape {
     ])
 }
 
-fn poll_updated_shape(value: &fh::PollUpdated) -> Shape {
-    object_shape(vec![
+fn poll_updated_shape(value: &fh::PollUpdated) -> Result<Shape, String> {
+    let extra_options = value
+        .extra_options
+        .iter()
+        .map(|option| {
+            object_shape(vec![
+                ("optionId", s(option.option_id.clone())),
+                ("encryptedMeta", s(base64_string(&option.encrypted_meta))),
+                (
+                    "proposedByAccountId",
+                    opt_string(option.proposed_by_account_id.as_deref()),
+                ),
+                (
+                    "proposedByDeviceNumber",
+                    option
+                        .proposed_by_device_number
+                        .map(|value| n(value))
+                        .unwrap_or(Shape::Null),
+                ),
+                ("createdAt", n(option.created_at as f64)),
+            ])
+        })
+        .collect::<Vec<_>>();
+    Ok(object_shape(vec![
         ("pollId", s(value.poll_id.clone())),
-        ("conversationId", bytes(&value.conversation_id)),
+        ("conversationId", uuid_shape(&value.conversation_id)?),
         (
             "counts",
             Shape::Array(
@@ -1692,46 +1992,20 @@ fn poll_updated_shape(value: &fh::PollUpdated) -> Shape {
             "correctOptionId",
             opt_string(value.correct_option_id.as_deref()),
         ),
-        (
-            "extraOptions",
-            Shape::Array(
-                value
-                    .extra_options
-                    .iter()
-                    .map(|option| {
-                        object_shape(vec![
-                            ("optionId", s(option.option_id.clone())),
-                            ("encryptedMeta", bytes(&option.encrypted_meta)),
-                            (
-                                "proposedByAccountId",
-                                opt_string(option.proposed_by_account_id.as_deref()),
-                            ),
-                            (
-                                "proposedByDeviceNumber",
-                                option
-                                    .proposed_by_device_number
-                                    .map(|value| n(value))
-                                    .unwrap_or(Shape::Null),
-                            ),
-                            ("createdAt", n(option.created_at as f64)),
-                        ])
-                    })
-                    .collect(),
-            ),
-        ),
+        ("extraOptions", Shape::Array(extra_options)),
         (
             "deletedOptionIds",
             Shape::Array(value.deleted_option_ids.iter().cloned().map(s).collect()),
         ),
         ("revision", n(value.revision as f64)),
-    ])
+    ]))
 }
 
-fn poll_deleted_shape(value: &fh::PollDeleted) -> Shape {
-    object_shape(vec![
+fn poll_deleted_shape(value: &fh::PollDeleted) -> Result<Shape, String> {
+    Ok(object_shape(vec![
         ("pollId", s(value.poll_id.clone())),
-        ("conversationId", bytes(&value.conversation_id)),
-    ])
+        ("conversationId", uuid_shape(&value.conversation_id)?),
+    ]))
 }
 
 fn push_error(code: &str, message: &str) -> JsValue {
@@ -1842,6 +2116,62 @@ mod tests {
     }
 
     #[test]
+    fn pending_initial_start_retries_with_the_same_backoff_as_reconnects() {
+        let mut attempt = 0;
+        let delays = (0..8)
+            .map(|_| {
+                let (delay, next_attempt) =
+                    next_reconnect(attempt, true, false, false, false).unwrap();
+                attempt = next_attempt;
+                delay
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            delays,
+            vec![1_000, 2_000, 4_000, 8_000, 16_000, 30_000, 30_000, 30_000]
+        );
+    }
+
+    #[test]
+    fn close_abort_or_fatal_server_error_stops_retrying() {
+        assert_eq!(next_reconnect(0, true, false, true, false), None);
+        assert_eq!(next_reconnect(0, true, false, false, true), None);
+        assert_eq!(next_reconnect(0, false, false, false, false), None);
+    }
+
+    #[test]
+    fn server_hello_resets_reconnect_backoff() {
+        let mut state = PushState::new("wss://api.example.test/ws".into());
+        state.reconnect_attempt = 5;
+
+        mark_server_hello_received(&mut state);
+
+        assert!(state.connected);
+        assert!(state.ever_connected);
+        assert_eq!(state.reconnect_attempt, 0);
+        assert_eq!(
+            next_reconnect(state.reconnect_attempt, false, true, false, false),
+            Some((1_000, 1))
+        );
+    }
+
+    #[test]
+    fn normalized_base64_matches_standard_padding() {
+        for (input, expected) in [
+            (&b""[..], ""),
+            (&b"f"[..], "Zg=="),
+            (&b"fo"[..], "Zm8="),
+            (&b"foo"[..], "Zm9v"),
+            (&b"foob"[..], "Zm9vYg=="),
+            (&b"fooba"[..], "Zm9vYmE="),
+            (&b"foobar"[..], "Zm9vYmFy"),
+        ] {
+            assert_eq!(base64_string(input), expected);
+        }
+    }
+
+    #[test]
     fn incremental_upload_size_matches_prost_frame_size() {
         for ciphertext_len in [0, 1, 126, 127, 128, 16_384, 65_536] {
             let envelope = Envelope {
@@ -1909,30 +2239,196 @@ mod tests {
     }
 
     #[test]
-    fn server_frame_conversion_keeps_camel_case_fields_and_typed_bytes() {
-        let frame = ServerFrame {
-            kind: Some(ServerKind::Presence(fh::PresenceUpdate {
-                account_id: vec![1, 2],
-                is_online: true,
-                last_seen: Some(42),
-                custom_status_text: None,
-                custom_status_emoji: Some("wave".into()),
-                custom_status_expires_at: None,
-            })),
-        };
-        let shape = presence_shape(match frame.kind.as_ref().unwrap() {
-            ServerKind::Presence(value) => value,
-            _ => unreachable!(),
-        });
+    fn connected_and_presence_shapes_use_web_uuid_strings() {
+        let hello = server_hello_shape(&fh::ServerHello {
+            session_id: "session-1".into(),
+            account_id: (0..16).collect(),
+            device_number: 3,
+            server_timestamp: 1_700_000_000,
+            protocol_major: 99,
+            protocol_minor: 98,
+            protocol_patch: 97,
+        })
+        .unwrap();
+        assert_eq!(
+            hello,
+            object_shape(vec![
+                ("sessionId", s("session-1")),
+                ("accountId", s("00010203-0405-0607-0809-0a0b0c0d0e0f")),
+                ("deviceNumber", n(3)),
+                ("serverTimestamp", n(1_700_000_000_f64)),
+            ])
+        );
+
+        let shape = presence_shape(&fh::PresenceUpdate {
+            account_id: (0..16).collect(),
+            is_online: true,
+            last_seen: Some(42),
+            custom_status_text: None,
+            custom_status_emoji: Some("wave".into()),
+            custom_status_expires_at: None,
+        })
+        .unwrap();
         assert_eq!(
             shape,
             object_shape(vec![
-                ("accountId", Shape::Bytes(vec![1, 2])),
+                ("accountId", s("00010203-0405-0607-0809-0a0b0c0d0e0f")),
                 ("isOnline", Shape::Bool(true)),
                 ("lastSeen", Shape::Number(42.0)),
                 ("customStatusText", Shape::Null),
                 ("customStatusEmoji", Shape::String("wave".into())),
                 ("customStatusExpiresAt", Shape::Null),
+            ])
+        );
+    }
+
+    #[test]
+    fn pong_callback_matches_web_transport_handler_argument() {
+        assert_eq!(
+            pong_shape(&fh::Pong {
+                client_timestamp: 12,
+                server_timestamp: 34,
+            }),
+            n(12)
+        );
+    }
+
+    #[test]
+    fn envelope_shape_matches_web_uuid_hex_and_optional_conversation_fields() {
+        let shape = envelope_shape(&Envelope {
+            envelope_id: (0..16).collect(),
+            sender_account_id: vec![0x11; 16],
+            sender_device_number: 1,
+            recipient_account_id: vec![0x22; 16],
+            recipient_device_number: 2,
+            envelope_type: 1,
+            is_prekey_message: false,
+            ciphertext: vec![0x00, 0xab, 0xff],
+            client_timestamp: 1_700_000_000,
+            conversation_id: Vec::new(),
+            sender_is_bot: true,
+            send_at: 0,
+        })
+        .unwrap();
+        assert_eq!(
+            shape,
+            object_shape(vec![
+                ("envelopeId", s("00010203-0405-0607-0809-0a0b0c0d0e0f")),
+                ("senderAccountId", s("11111111-1111-1111-1111-111111111111")),
+                ("senderDeviceNumber", n(1)),
+                (
+                    "recipientAccountId",
+                    s("22222222-2222-2222-2222-222222222222")
+                ),
+                ("recipientDeviceNumber", n(2)),
+                ("envelopeType", n(1)),
+                ("isPrekeyMessage", b(false)),
+                ("ciphertext", s("00abff")),
+                ("clientTimestamp", n(1_700_000_000_f64)),
+                ("conversationId", Shape::Null),
+                ("senderIsBot", b(true)),
+                ("sendAt", n(0)),
+            ])
+        );
+    }
+
+    #[test]
+    fn malformed_delivery_and_receipt_items_are_skipped_individually() {
+        let valid = Envelope {
+            envelope_id: vec![0x11; 16],
+            sender_account_id: vec![0x22; 16],
+            sender_device_number: 1,
+            recipient_account_id: vec![0x33; 16],
+            recipient_device_number: 2,
+            envelope_type: 1,
+            is_prekey_message: false,
+            ciphertext: vec![0xaa],
+            client_timestamp: 10,
+            conversation_id: Vec::new(),
+            sender_is_bot: false,
+            send_at: 0,
+        };
+        let invalid = Envelope {
+            envelope_id: vec![1],
+            ..valid.clone()
+        };
+        let expected_envelope = envelope_shape(&valid).unwrap();
+        let (delivery, delivery_errors) = envelope_delivery_shape(&fh::EnvelopeDelivery {
+            envelopes: vec![invalid, valid],
+        });
+        assert_eq!(delivery_errors.len(), 1);
+        assert_eq!(
+            delivery,
+            Some(object_shape(vec![(
+                "envelopes",
+                Shape::Array(vec![expected_envelope]),
+            )]))
+        );
+
+        let (receipt, receipt_errors) = envelope_ack_shape(&fh::EnvelopeAck {
+            envelope_ids: vec![vec![0x44; 16], vec![1], vec![0x55; 16]],
+            server_timestamps: vec![101, 202, 303],
+        });
+        assert_eq!(receipt_errors.len(), 1);
+        assert_eq!(
+            receipt,
+            object_shape(vec![
+                (
+                    "envelopeIds",
+                    Shape::Array(vec![
+                        s("44444444-4444-4444-4444-444444444444"),
+                        s("55555555-5555-5555-5555-555555555555"),
+                    ])
+                ),
+                ("serverTimestamps", Shape::Array(vec![n(101), n(303)])),
+            ])
+        );
+    }
+
+    #[test]
+    fn poll_metadata_is_base64_encoded_for_web_event_shape() {
+        let shape = poll_updated_shape(&fh::PollUpdated {
+            poll_id: "poll-1".into(),
+            conversation_id: vec![0; 16],
+            counts: vec![],
+            total_voters: 3,
+            closed_at: None,
+            correct_option_id: None,
+            extra_options: vec![fh::PollExtraOption {
+                option_id: "custom".into(),
+                encrypted_meta: b"foo".to_vec(),
+                proposed_by_account_id: Some("00112233-4455-6677-8899-aabbccddeeff".into()),
+                proposed_by_device_number: Some(4),
+                created_at: 12,
+            }],
+            deleted_option_ids: vec![],
+            revision: 7,
+        })
+        .unwrap();
+        assert_eq!(
+            shape,
+            object_shape(vec![
+                ("pollId", s("poll-1")),
+                ("conversationId", s("00000000-0000-0000-0000-000000000000")),
+                ("counts", Shape::Array(vec![])),
+                ("totalVoters", n(3)),
+                ("closedAt", Shape::Null),
+                ("correctOptionId", Shape::Null),
+                (
+                    "extraOptions",
+                    Shape::Array(vec![object_shape(vec![
+                        ("optionId", s("custom")),
+                        ("encryptedMeta", s("Zm9v")),
+                        (
+                            "proposedByAccountId",
+                            s("00112233-4455-6677-8899-aabbccddeeff")
+                        ),
+                        ("proposedByDeviceNumber", n(4)),
+                        ("createdAt", n(12)),
+                    ])])
+                ),
+                ("deletedOptionIds", Shape::Array(vec![])),
+                ("revision", n(7)),
             ])
         );
     }

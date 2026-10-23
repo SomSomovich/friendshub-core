@@ -2,7 +2,7 @@ use friendshub_core::error::Error as CoreError;
 use friendshub_core::transport::protobuf::{
     RestProtocol, finish_rest_response, format_rest_error_body, prepare_rest_request,
 };
-use js_sys::{ArrayBuffer, Date, Error as JsError, Reflect, Uint8Array};
+use js_sys::{ArrayBuffer, Date, Error as JsError, Promise, Reflect, Uint8Array};
 use serde_json::Value;
 use std::cell::Cell;
 use std::rc::Rc;
@@ -12,7 +12,8 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::{
-    AbortController, AbortSignal, Event, Headers, Request, RequestInit, Response, Window,
+    AbortController, AbortSignal, Event, Headers, Request, RequestCache, RequestInit, Response,
+    Window,
 };
 
 mod api;
@@ -36,6 +37,7 @@ pub struct BrowserRestClient {
     api_base: String,
     device_number: Option<u32>,
     timeout_ms: u32,
+    retry_on_rate_limit: bool,
 }
 
 #[wasm_bindgen]
@@ -48,6 +50,7 @@ impl BrowserRestClient {
             api_base: normalized.api_base,
             device_number: None,
             timeout_ms: DEFAULT_TIMEOUT_MS,
+            retry_on_rate_limit: true,
         })
     }
 
@@ -55,6 +58,13 @@ impl BrowserRestClient {
     /// which is required for endpoints such as login before device creation.
     pub fn set_device_number(&mut self, device_number: Option<u32>) {
         self.device_number = device_number;
+    }
+
+    /// Retries one HTTP 429 response when the server provides a valid
+    /// `Retry-After` value. Enabled by default.
+    #[wasm_bindgen(js_name = setRetryOnRateLimit)]
+    pub fn set_retry_on_rate_limit(&mut self, enabled: bool) {
+        self.retry_on_rate_limit = enabled;
     }
 
     /// Sets Fetch's total deadline, including response body download.
@@ -95,6 +105,8 @@ impl BrowserRestClient {
             response_type,
             Vec::new(),
             true,
+            false,
+            false,
         )
         .await
     }
@@ -175,6 +187,7 @@ impl BrowserRestClient {
             response_type.as_deref(),
             &[],
             attach_session_headers,
+            false,
         )
         .await
     }
@@ -205,6 +218,58 @@ impl BrowserRestClient {
             response_type,
             extra_headers,
             include_device_number,
+            false,
+            false,
+        )
+        .await
+    }
+
+    pub(crate) async fn request_with_cache(
+        &self,
+        method: String,
+        path: String,
+        body: Option<JsValue>,
+        bearer: Option<String>,
+        signal: Option<AbortSignal>,
+        response_type: Option<String>,
+        no_store: bool,
+    ) -> Result<JsValue, JsValue> {
+        self.request_with_options_inner(
+            method,
+            path,
+            body,
+            bearer,
+            signal,
+            response_type,
+            Vec::new(),
+            true,
+            no_store,
+            false,
+        )
+        .await
+    }
+
+    /// Sends a GET that bypasses the browser HTTP cache. Absolute URLs are
+    /// first normalized to a relative path only when they match this client's
+    /// API origin; other absolute URLs remain credential-free capabilities.
+    pub(crate) async fn request_bytes_no_store(
+        &self,
+        path: String,
+        bearer: Option<String>,
+        signal: Option<AbortSignal>,
+    ) -> Result<JsValue, JsValue> {
+        let path = self.first_party_relative_path(&path).unwrap_or(path);
+        self.request_with_options_inner(
+            "GET".to_owned(),
+            path,
+            None,
+            bearer,
+            signal,
+            Some("bytes".to_owned()),
+            Vec::new(),
+            true,
+            true,
+            false,
         )
         .await
     }
@@ -220,11 +285,14 @@ impl BrowserRestClient {
         response_type: Option<String>,
         extra_headers: Vec<(String, String)>,
         include_device_number: bool,
+        no_store: bool,
+        allow_absolute_same_origin_auth: bool,
     ) -> Result<JsValue, JsValue> {
         let method = validate_method(&method).map_err(|error| error.into_js())?;
         validate_response_type(response_type.as_deref()).map_err(|error| error.into_js())?;
         let url = self.request_url(&path).map_err(|error| error.into_js())?;
-        let attach_session_headers = should_attach_session_headers(&path);
+        let attach_session_headers =
+            should_attach_session_headers(&path) || allow_absolute_same_origin_auth;
         let codec_origin = self.codec_origin().unwrap_or_default();
         let codec_path = route_path_for_codec(&url, &codec_origin).map_err(|e| e.into_js())?;
         let body = body
@@ -261,6 +329,7 @@ impl BrowserRestClient {
             response_type.as_deref(),
             &extra_headers,
             include_device_number && attach_session_headers,
+            no_store,
         )
         .await
     }
@@ -280,6 +349,72 @@ impl BrowserRestClient {
         response_type: Option<&str>,
         extra_headers: &[(String, String)],
         include_device_number: bool,
+        no_store: bool,
+    ) -> Result<JsValue, JsValue> {
+        let first = self
+            .execute_once(
+                method,
+                url,
+                codec_path,
+                protocol.clone(),
+                accept,
+                content_type.clone(),
+                body.clone(),
+                bearer,
+                external_signal.clone(),
+                response_type,
+                extra_headers,
+                include_device_number,
+                no_store,
+            )
+            .await;
+        let Err(error) = first else {
+            return first;
+        };
+        let Some(delay_ms) = rate_limit_retry_delay(&error) else {
+            return Err(error);
+        };
+        if !self.retry_on_rate_limit || external_signal.as_ref().is_some_and(AbortSignal::aborted) {
+            return Err(error);
+        }
+        wait_for_retry_after(delay_ms).await?;
+        if external_signal.as_ref().is_some_and(AbortSignal::aborted) {
+            return Err(error);
+        }
+        self.execute_once(
+            method,
+            url,
+            codec_path,
+            protocol,
+            accept,
+            content_type,
+            body,
+            bearer,
+            external_signal,
+            response_type,
+            extra_headers,
+            include_device_number,
+            no_store,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn execute_once(
+        &self,
+        method: &'static str,
+        url: &str,
+        codec_path: &str,
+        protocol: RestProtocol,
+        accept: Option<&'static str>,
+        content_type: Option<String>,
+        body: Option<JsValue>,
+        bearer: Option<&str>,
+        external_signal: Option<AbortSignal>,
+        response_type: Option<&str>,
+        extra_headers: &[(String, String)],
+        include_device_number: bool,
+        no_store: bool,
     ) -> Result<JsValue, JsValue> {
         let window = web_sys::window().ok_or_else(|| {
             RestError::new(
@@ -366,6 +501,9 @@ impl BrowserRestClient {
             init.set_method(method);
             init.set_headers_headers(&headers);
             init.set_signal(Some(&controller.signal()));
+            if no_store {
+                init.set_cache(RequestCache::NoStore);
+            }
             if let Some(body) = body.as_ref() {
                 init.set_body(body);
             }
@@ -572,6 +710,26 @@ impl BrowserRestClient {
             return Some(self.origin.clone());
         }
         web_sys::window()?.location().origin().ok()
+    }
+
+    fn first_party_relative_path(&self, path: &str) -> Option<String> {
+        if !is_absolute_http_url(path) {
+            return None;
+        }
+        let window = web_sys::window()?;
+        if !url_matches_api_origin(path, &self.origin, &window) {
+            return None;
+        }
+        let parsed = Url::parse(path).ok()?;
+        if parsed.fragment().is_some() {
+            return None;
+        }
+        let mut relative = parsed.path().to_owned();
+        if let Some(query) = parsed.query() {
+            relative.push('?');
+            relative.push_str(query);
+        }
+        Some(relative)
     }
 }
 
@@ -925,6 +1083,54 @@ fn parse_retry_after_ms(value: &str, now_ms: f64) -> Option<f64> {
     date_ms.is_finite().then(|| (date_ms - now_ms).max(0.0))
 }
 
+fn rate_limit_retry_delay(error: &JsValue) -> Option<f64> {
+    let status = Reflect::get(error, &JsValue::from_str("status"))
+        .ok()?
+        .as_f64()
+        .and_then(|status| u16::try_from(status as u64).ok());
+    let retry_after = Reflect::get(error, &JsValue::from_str("retryAfterMs"))
+        .ok()?
+        .as_f64();
+    rate_limit_retry_delay_values(status, retry_after)
+}
+
+fn rate_limit_retry_delay_values(status: Option<u16>, retry_after_ms: Option<f64>) -> Option<f64> {
+    if status != Some(429) {
+        return None;
+    }
+    retry_after_ms.filter(|delay| delay.is_finite() && *delay >= 0.0)
+}
+
+async fn wait_for_retry_after(mut remaining_ms: f64) -> Result<(), JsValue> {
+    while remaining_ms > 0.0 {
+        let interval = remaining_ms.min(i32::MAX as f64).ceil() as i32;
+        let window = web_sys::window().ok_or_else(|| {
+            RestError::new(
+                "runtime",
+                0,
+                "browser window is unavailable while waiting for rate limit".into(),
+                String::new(),
+            )
+            .into_js()
+        })?;
+        let timer_window = window.clone();
+        let promise = Promise::new(&mut move |resolve, reject| {
+            let callback = Closure::once_into_js(move || {
+                let _ = resolve.call0(&JsValue::UNDEFINED);
+            });
+            if let Err(error) = timer_window.set_timeout_with_callback_and_timeout_and_arguments_0(
+                callback.unchecked_ref(),
+                interval,
+            ) {
+                let _ = reject.call1(&JsValue::UNDEFINED, &error);
+            }
+        });
+        JsFuture::from(promise).await?;
+        remaining_ms = (remaining_ms - f64::from(interval)).max(0.0);
+    }
+    Ok(())
+}
+
 fn js_runtime_error(context: &str, cause: JsValue) -> JsValue {
     RestError::new(
         "runtime",
@@ -1064,6 +1270,7 @@ mod tests {
             api_base: base.api_base,
             device_number: None,
             timeout_ms: DEFAULT_TIMEOUT_MS,
+            retry_on_rate_limit: true,
         };
         assert_eq!(
             client.request_url("/api/v1/register").unwrap(),
@@ -1093,6 +1300,7 @@ mod tests {
             api_base: base.api_base,
             device_number: None,
             timeout_ms: DEFAULT_TIMEOUT_MS,
+            retry_on_rate_limit: true,
         };
         assert_eq!(client.request_url("/api/v1/me").unwrap(), "/api/v1/me");
         assert_eq!(client.request_url("/health").unwrap(), "/health");
@@ -1107,6 +1315,7 @@ mod tests {
             api_base: base.api_base,
             device_number: None,
             timeout_ms: DEFAULT_TIMEOUT_MS,
+            retry_on_rate_limit: true,
         };
         assert!(client.request_url("//evil.example/x").is_err());
         assert!(client.request_url("/api/v1/me#fragment").is_err());
@@ -1229,6 +1438,21 @@ mod tests {
         assert_eq!(parse_retry_after_ms("1.25", 10_000.0), Some(1250.0));
         assert_eq!(parse_retry_after_ms("0", 10_000.0), Some(0.0));
         assert_eq!(parse_retry_after_ms("-1", 10_000.0), None);
+    }
+
+    #[test]
+    fn rate_limit_retry_requires_status_429_and_a_valid_delay() {
+        assert_eq!(
+            rate_limit_retry_delay_values(Some(429), Some(2500.0)),
+            Some(2500.0)
+        );
+        assert_eq!(rate_limit_retry_delay_values(Some(500), Some(2500.0)), None);
+        assert_eq!(rate_limit_retry_delay_values(Some(429), None), None);
+        assert_eq!(
+            rate_limit_retry_delay_values(Some(429), Some(f64::NAN)),
+            None
+        );
+        assert_eq!(rate_limit_retry_delay_values(Some(429), Some(-1.0)), None);
     }
 
     #[test]
