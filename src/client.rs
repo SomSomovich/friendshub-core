@@ -5,7 +5,6 @@
 //! the library.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use serde::Serialize;
 use serde::de::DeserializeOwned;
@@ -13,7 +12,7 @@ use serde::de::DeserializeOwned;
 use crate::config::Config;
 use crate::db;
 use crate::error::{Error, Result};
-use crate::events::{Event, EventHandler, EventQueue};
+use crate::events::{EventHandler, EventQueue};
 use crate::runtime::{Actor, ActorState};
 use crate::transport::HttpClient;
 
@@ -71,20 +70,6 @@ impl Client {
         self.actor.call(method_id, request.to_vec())
     }
 
-    /// Waits for the next event using the compatibility pull interface.
-    /// Registered handlers receive future events on the callback worker.
-    pub fn poll_event(&self, timeout: Duration) -> Result<Option<Event>> {
-        let bytes = self
-            .actor
-            .call(method_ids::POLL_EVENT, 0_u32.to_le_bytes().to_vec())?;
-        if !bytes.is_empty() {
-            return serde_json::from_slice(&bytes)
-                .map(Some)
-                .map_err(Error::from);
-        }
-        Ok(self.events.poll(timeout))
-    }
-
     /// Acknowledges a durable event, including its delivery receipt when
     /// applicable. Ephemeral events have no ID to acknowledge.
     pub fn ack_event(&self, event_id: u64) -> Result<()> {
@@ -108,8 +93,9 @@ impl Client {
         Ok(())
     }
 
-    /// Returns future events to `poll_event` and waits for in-flight callback
-    /// work to finish.
+    /// Stops event delivery and waits for in-flight callback work to finish.
+    /// Events produced while no handler is registered are pushed when the
+    /// next handler is installed.
     pub fn clear_event_handler(&self) {
         self.events.clear_handler_and_wait();
     }

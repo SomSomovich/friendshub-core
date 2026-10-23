@@ -13,7 +13,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-#define FH_ABI_VERSION 1
+#define FH_ABI_VERSION 2
 
 /**
  * Length of the base nonce shared by all chunks of one file.
@@ -128,9 +128,11 @@ uint32_t fh_abi_version(void);
 
 /**
  * Installs per-event callbacks, or clears callbacks when `callbacks` is null.
- * The event view and JSON bytes are owned by the library and borrowed only
- * until the callback returns. `user_data` remains owned by the caller and
- * must stay valid until callbacks are cleared or the handle is destroyed.
+ * Events produced while no callback is installed are queued and pushed to
+ * the next registered handler. The event view and JSON bytes are owned by
+ * the library and borrowed only until the callback returns. `user_data`
+ * remains owned by the caller and must stay valid until callbacks are cleared
+ * or the handle is destroyed.
  */
 int32_t fh_set_event_callbacks(struct FH_FhHandle *handle, const struct FH_FhEventCallbacks *callbacks, void *user_data);
 
@@ -193,19 +195,5 @@ void fh_destroy(struct FH_FhHandle *handle);
  *   `fh_buffer_free` when the return code is zero or one.
  */
 int32_t fh_init(const uint8_t *config_json, size_t config_len, struct FH_FhHandle **out_handle, struct FH_FhBuffer *out);
-
-/**
- * Blocks up to `timeout_ms` for the next event.
- *
- * On timeout returns 0 with an empty buffer. On any other outcome the
- * buffer carries a JSON event.
- *
- * # Safety
- *
- * - `handle` must be a live pointer from `fh_init`.
- * - `out` must be a valid, writable pointer; it is always written to and
- *   must be freed with `fh_buffer_free`.
- */
-int32_t fh_poll_event(struct FH_FhHandle *handle, uint32_t timeout_ms, struct FH_FhBuffer *out);
 
 #endif  /* FRIENDSHUB_CORE_H */

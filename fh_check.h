@@ -127,18 +127,4 @@ void fh_destroy(struct FH_FhHandle *handle);
  */
 int32_t fh_init(const uint8_t *config_json, size_t config_len, struct FH_FhHandle **out_handle, struct FH_FhBuffer *out);
 
-/**
- * Blocks up to `timeout_ms` for the next event.
- *
- * On timeout returns 0 with an empty buffer. On any other outcome the
- * buffer carries a JSON event.
- *
- * # Safety
- *
- * - `handle` must be a live pointer from `fh_init`.
- * - `out` must be a valid, writable pointer; it is always written to and
- *   must be freed with `fh_buffer_free`.
- */
-int32_t fh_poll_event(struct FH_FhHandle *handle, uint32_t timeout_ms, struct FH_FhBuffer *out);
-
 #endif  /* FRIENDSHUB_CORE_H */

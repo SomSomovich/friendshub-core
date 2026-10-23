@@ -19,9 +19,6 @@ int32_t fh_call(
     FhHandle* handle, uint32_t method_id,
     const uint8_t* req, size_t req_len, FhBuffer* out);
 
-int32_t fh_poll_event(
-    FhHandle* handle, uint32_t timeout_ms, FhBuffer* out);
-
 int32_t fh_ack_event(FhHandle* handle, uint64_t event_id);
 
 int32_t fh_set_event_callbacks(
@@ -31,12 +28,12 @@ void fh_buffer_free(FhBuffer* buf);
 ```
 
 `fh_set_event_callbacks` installs one optional callback per event kind. Pass
-`NULL` for `callbacks` to clear the handler and return future events to the
-pull queue. Callbacks run serially on the library-owned worker thread and may
-reenter `fh_call`. Each receives an `FhEventView`; its JSON pointer is borrowed
-until the callback returns, so the consumer never allocates or frees event
-payload memory. Keep `user_data` alive until callbacks drain during clear or
-destroy.
+`NULL` for `callbacks` to clear the handler. Events produced until another
+handler is registered are queued internally and pushed to that handler.
+Callbacks run serially on the library-owned worker thread and may reenter
+`fh_call`. Each receives an `FhEventView`; its JSON pointer is borrowed until
+the callback returns, so the consumer never allocates or frees event payload
+memory. Keep `user_data` alive until callbacks drain during clear or destroy.
 
 Every function returns `int32_t`: 0 on success, non-zero on failure. On
 failure the out buffer carries a JSON `{ "code": "...", "message": "..." }`.
@@ -68,7 +65,7 @@ so existing IDs never move.
 
 | Range | Area |
 |---|---|
-| `0x0000_xxxx` | service (ping, version, poll_event, ack_event, event callback activation) |
+| `0x0000_xxxx` | service (ping, version, ack_event, event callback activation) |
 | `0x0001_xxxx` | auth |
 | `0x0002_xxxx` | contacts, blocks |
 | `0x0003_xxxx` | conversations |
@@ -96,7 +93,6 @@ so existing IDs never move.
 |---|---|---|
 | `0x0000_0001` | (empty) | `{"pong":true}` |
 | `0x0000_0002` | (empty) | server version, urls, ws state |
-| `0x0000_0003` | (usually via fh_poll_event) | next event or empty |
 | `0x0000_0004` | `{"event_id": N}` | `{"acked":true}` |
 | `0x0000_0005` | internal | activates PUSH delivery and drains queued events; called by the client facades |
 

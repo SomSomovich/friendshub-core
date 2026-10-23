@@ -1,10 +1,9 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::Duration;
 
 use crate::error::Result;
-use crate::events::{Event, EventQueue};
+use crate::events::EventQueue;
 use crate::runtime::Actor;
 
 use super::events::FfiEventHandler;
@@ -38,13 +37,9 @@ impl FhHandle {
         self.inner.call(method, payload)
     }
 
-    pub fn poll_event(&self, timeout: Duration) -> Result<Option<Event>> {
-        self.inner.poll_event(timeout)
-    }
-
-    /// Clones the owned state out of an opaque FFI handle before a blocking
-    /// actor call or event wait. A callback may destroy the public handle
-    /// reentrantly while that operation is in progress.
+    /// Clones the owned state out of an opaque FFI handle before an actor
+    /// call. A callback may destroy the public handle reentrantly while that
+    /// operation is in progress.
     pub(crate) fn inner_arc(&self) -> Arc<HandleInner> {
         self.inner.clone()
     }
@@ -59,21 +54,6 @@ impl HandleInner {
 
     pub(crate) fn call(&self, method: u32, payload: Vec<u8>) -> Result<Vec<u8>> {
         self.actor.call(method, payload)
-    }
-
-    pub(crate) fn poll_event(&self, timeout: Duration) -> Result<Option<Event>> {
-        // Hold the shared state through the direct queue wait so a callback
-        // that destroys the public C handle cannot tear down this operation.
-        let bytes = self.actor.call(
-            crate::client::method_ids::POLL_EVENT,
-            0_u32.to_le_bytes().to_vec(),
-        )?;
-        if !bytes.is_empty() {
-            return serde_json::from_slice(&bytes)
-                .map(Some)
-                .map_err(crate::error::Error::from);
-        }
-        Ok(self.events.poll(timeout))
     }
 
     pub(crate) fn set_event_callbacks(

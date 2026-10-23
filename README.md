@@ -21,8 +21,10 @@ let version: Value = client.call_json(method_ids::VERSION, &serde_json::json!({}
 ```
 
 Incoming events are pushed to a registered handler on a library-owned worker.
-Without a handler, callers can continue using `Client::poll_event` or
-`fh_poll_event`.
+Register an `EventHandler` with `Client::set_event_handler` before starting
+the websocket. Events produced before registration are queued internally and
+pushed when the handler is installed; durable events are restored after a
+restart until acknowledged.
 
 ## License
 

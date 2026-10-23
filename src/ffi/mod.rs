@@ -6,7 +6,6 @@
 use std::ffi::c_void;
 use std::os::raw::c_char;
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::api;
 use crate::config::Config;
@@ -27,9 +26,9 @@ pub use types::FhBuffer;
 use handle::FhHandle;
 use panic::guard;
 
-pub const ABI_VERSION: u32 = 1;
+pub const ABI_VERSION: u32 = 2;
 
-const ABI_STRING: &[u8] = b"0.1.2\0";
+const ABI_STRING: &[u8] = b"0.1.3\0";
 
 const METHOD_ACK_EVENT: u32 = 0x0000_0004;
 
@@ -173,11 +172,12 @@ pub unsafe extern "C" fn fh_destroy(handle: *mut FhHandle) {
 
 /// Installs or clears the per-event callback table.
 ///
-/// Passing a null `callbacks` pointer clears the current handler and returns
-/// future events to `fh_poll_event`. Each non-null slot is called on the
-/// library's dedicated callback worker thread. The event view and its JSON
-/// bytes are borrowed only for the duration of the callback; the library
-/// allocates and releases that memory.
+/// Passing a null `callbacks` pointer clears the current handler. Events
+/// produced until another handler is registered are queued internally and
+/// pushed to the next handler. Each non-null slot is called on the library's
+/// dedicated callback worker thread. The event view and its JSON bytes are
+/// borrowed only for the duration of the callback; the library allocates and
+/// releases that memory.
 ///
 /// `user_data` must remain valid until this function returns after replacing
 /// or clearing a handler, or until `fh_destroy` returns. When clear/destroy is
@@ -264,55 +264,6 @@ pub unsafe extern "C" fn fh_call(
         let inner = unsafe { (&*handle).inner_arc() };
         match inner.call(method_id, payload) {
             Ok(bytes) => {
-                // SAFETY: `out` was checked non-null.
-                unsafe {
-                    *out = FhBuffer::from_vec(bytes);
-                }
-                0
-            }
-            Err(e) => write_error(out, &e),
-        }
-    })
-}
-
-/// Blocks up to `timeout_ms` for the next event.
-///
-/// On timeout returns 0 with an empty buffer. On any other outcome the
-/// buffer carries a JSON event.
-///
-/// # Safety
-///
-/// - `handle` must be a live pointer from `fh_init`.
-/// - `out` must be a valid, writable pointer; it is always written to and
-///   must be freed with `fh_buffer_free`.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn fh_poll_event(
-    handle: *mut FhHandle,
-    timeout_ms: u32,
-    out: *mut FhBuffer,
-) -> i32 {
-    guard(-1, || {
-        if handle.is_null() || out.is_null() {
-            return -1;
-        }
-        // SAFETY: `out` was checked non-null.
-        unsafe {
-            *out = FhBuffer::EMPTY;
-        }
-
-        // Clone the shared state before the blocking pull wait. A callback
-        // may destroy the public handle while this call is waiting.
-        // SAFETY: `handle` is a live pointer, per the caller's contract.
-        let inner = unsafe { (&*handle).inner_arc() };
-        match inner.poll_event(Duration::from_millis(timeout_ms as u64)) {
-            Ok(event) => {
-                let bytes = match event {
-                    Some(event) => match serde_json::to_vec(&event) {
-                        Ok(bytes) => bytes,
-                        Err(error) => return write_error(out, &Error::from(error)),
-                    },
-                    None => Vec::new(),
-                };
                 // SAFETY: `out` was checked non-null.
                 unsafe {
                     *out = FhBuffer::from_vec(bytes);

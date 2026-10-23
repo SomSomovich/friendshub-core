@@ -1,8 +1,7 @@
 use std::collections::VecDeque;
 use std::panic::{AssertUnwindSafe, catch_unwind};
-use std::sync::{Arc, Condvar, Mutex, mpsc as std_mpsc};
+use std::sync::{Arc, Mutex, mpsc as std_mpsc};
 use std::thread;
-use std::time::{Duration, Instant};
 
 use crate::events::types::{Event, EventHandler};
 
@@ -46,7 +45,6 @@ impl CallbackWorker {
 
 pub struct EventQueue {
     state: Mutex<QueueState>,
-    changed: Condvar,
 }
 
 #[derive(Default)]
@@ -60,7 +58,6 @@ impl EventQueue {
     pub fn new() -> Self {
         Self {
             state: Mutex::new(QueueState::default()),
-            changed: Condvar::new(),
         }
     }
 
@@ -74,32 +71,29 @@ impl EventQueue {
             let Some(worker) = state.worker.as_ref() else {
                 state.active = false;
                 state.backlog.push_back(ev);
-                self.changed.notify_all();
                 return;
             };
             match worker.tx.send(ev) {
                 Ok(()) => return,
                 Err(error) => {
                     // If the callback thread exited unexpectedly, discard the
-                    // stale registration and preserve the event in PULL mode.
+                    // stale registration and preserve the event for the next
+                    // push handler registration.
                     state.worker.take();
                     state.active = false;
                     state.backlog.push_back(error.0);
-                    self.changed.notify_all();
                     return;
                 }
             }
         }
 
         state.backlog.push_back(ev);
-        self.changed.notify_one();
     }
 
     /// Registers a handler whose methods run on one dedicated callback
-    /// thread. Events already queued for [`Self::poll`] stay there until
-    /// [`Self::drain_backlog_to_handler`] is called. That activation step
-    /// transfers the existing pull backlog before routing future events to
-    /// the handler, preserving FIFO order.
+    /// thread. Events queued before registration stay in the internal push
+    /// backlog until [`Self::drain_backlog_to_handler`] transfers them to the
+    /// worker. Activation preserves FIFO order with future events.
     ///
     /// Replacing a handler routes future events to the new handler. Events
     /// already queued for the old handler are drained by its worker and may
@@ -113,16 +107,16 @@ impl EventQueue {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.active = false;
             let previous = state.worker.replace(worker);
-            self.changed.notify_all();
             previous
         };
         drop(previous);
         Ok(())
     }
 
-    /// Removes the callback handler. Events pushed after this call return to
-    /// the PULL queue. Events already queued for the handler continue on its
-    /// worker and may complete after this returns.
+    /// Removes the callback handler. Events pushed after this call are kept
+    /// in the internal backlog and pushed to the next registered handler.
+    /// Events already queued for the handler continue on its worker and may
+    /// complete after this returns.
     pub fn clear_handler(&self) {
         let previous = {
             let mut state = self
@@ -131,7 +125,6 @@ impl EventQueue {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.active = false;
             let previous = state.worker.take();
-            self.changed.notify_all();
             previous
         };
         drop(previous);
@@ -148,7 +141,6 @@ impl EventQueue {
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.active = false;
             let previous = state.worker.take();
-            self.changed.notify_all();
             previous
         };
         if let Some(worker) = previous {
@@ -156,10 +148,9 @@ impl EventQueue {
         }
     }
 
-    /// Moves events accumulated in pull mode to the currently installed
-    /// callback worker.
-    /// The actor calls this after installing a handler, so events delivered
-    /// before registration are not stranded in the pull queue.
+    /// Moves events accumulated before handler activation to the currently
+    /// installed callback worker. This ensures events delivered before
+    /// registration are pushed after the handler is installed.
     pub fn drain_backlog_to_handler(&self) -> std::io::Result<()> {
         let mut state = self
             .state
@@ -185,16 +176,14 @@ impl EventQueue {
                     state.backlog.push_front(error.0);
                     state.worker.take();
                     state.active = false;
-                    self.changed.notify_all();
                     return Err(std::io::Error::new(
                         std::io::ErrorKind::BrokenPipe,
-                        "event callback worker stopped while draining the pull queue",
+                        "event callback worker stopped while draining the event backlog",
                     ));
                 }
             }
         }
         state.active = true;
-        self.changed.notify_all();
         Ok(())
     }
 
@@ -203,46 +192,6 @@ impl EventQueue {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .active
-    }
-
-    /// Waits up to `timeout` for an event. Returns `None` on timeout or while
-    /// a callback handler is registered, including during backlog activation.
-    pub fn poll(&self, timeout: Duration) -> Option<Event> {
-        let deadline = Instant::now().checked_add(timeout);
-        let mut state = self
-            .state
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-
-        loop {
-            // Once a handler is installed, including while it is being
-            // activated, pull callers must not race the replay drain.
-            if state.worker.is_some() {
-                return None;
-            }
-            if let Some(event) = state.backlog.pop_front() {
-                return Some(event);
-            }
-            if timeout.is_zero() {
-                return None;
-            }
-
-            let remaining = match deadline {
-                Some(deadline) => deadline.saturating_duration_since(Instant::now()),
-                None => timeout,
-            };
-            if remaining.is_zero() {
-                return None;
-            }
-            let (next_state, wait) = self
-                .changed
-                .wait_timeout(state, remaining)
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            state = next_state;
-            if wait.timed_out() && state.backlog.is_empty() {
-                return None;
-            }
-        }
     }
 }
 
@@ -623,16 +572,10 @@ mod tests {
     }
 
     #[test]
-    fn poll_is_the_fallback_without_a_handler_and_after_clear() {
+    fn events_wait_for_a_push_handler_before_and_after_clear() {
         let queue = EventQueue::new();
         let first = event("receipt", None, json!({"sequence":1}));
         queue.push(first.clone());
-        let pulled = queue
-            .poll(Duration::ZERO)
-            .expect("no-handler event must be polled");
-        assert_eq!(pulled.kind, first.kind);
-        assert_eq!(pulled.payload, first.payload);
-
         let (handler, rx) = handler_channel();
         queue
             .set_handler(handler)
@@ -640,6 +583,12 @@ mod tests {
         queue
             .drain_backlog_to_handler()
             .expect("callback must activate");
+        let first_callback = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("event queued before registration must be pushed");
+        assert_eq!(first_callback.method, "on_receipt");
+        assert_eq!(first_callback.kind, first.kind);
+
         queue.push(event("presence_updated", None, json!({"online":true})));
         let callback = rx
             .recv_timeout(Duration::from_secs(2))
@@ -649,12 +598,20 @@ mod tests {
         queue.clear_handler();
         let durable = event("envelope_received", Some(812), json!({"ciphertext":"beef"}));
         queue.push(durable.clone());
-        let pulled = queue
-            .poll(Duration::ZERO)
-            .expect("cleared handler restores PULL");
-        assert_eq!(pulled.id, durable.id, "durable event ID must be preserved");
-        assert_eq!(pulled.kind, durable.kind);
-        assert_eq!(pulled.payload, durable.payload);
+        let (handler, rx) = handler_channel();
+        queue
+            .set_handler(handler)
+            .expect("replacement callback thread must start");
+        queue
+            .drain_backlog_to_handler()
+            .expect("replacement callback must activate");
+        let callback = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("event queued after clear must be pushed after registration");
+        assert_eq!(callback.method, "on_envelope_received");
+        assert_eq!(callback.id, durable.id);
+        assert_eq!(callback.kind, durable.kind);
+        queue.clear_handler_and_wait();
     }
 
     #[test]
@@ -666,10 +623,6 @@ mod tests {
         queue
             .set_handler(handler)
             .expect("callback thread must start");
-        assert!(
-            queue.poll(Duration::ZERO).is_none(),
-            "pull must not steal events after callback registration begins"
-        );
         queue.push(event("receipt", Some(813), json!({"sequence":2})));
         queue
             .drain_backlog_to_handler()
@@ -680,31 +633,6 @@ mod tests {
         assert_eq!(first.method, "on_typing");
         assert_eq!(second.method, "on_receipt");
         assert_eq!(second.id, Some(813));
-        assert!(queue.poll(Duration::ZERO).is_none());
-        queue.clear_handler_and_wait();
-    }
-
-    #[test]
-    fn long_pull_wait_does_not_hold_up_callback_activation() {
-        let queue = std::sync::Arc::new(EventQueue::new());
-        let (started_tx, started_rx) = std::sync::mpsc::channel();
-        let polling_queue = queue.clone();
-        let poller = std::thread::spawn(move || {
-            started_tx.send(()).unwrap();
-            polling_queue.poll(Duration::from_secs(5))
-        });
-        started_rx.recv_timeout(Duration::from_secs(1)).unwrap();
-        std::thread::sleep(Duration::from_millis(25));
-
-        let (handler, _) = handler_channel();
-        queue.set_handler(handler).unwrap();
-        let started = std::time::Instant::now();
-        queue.drain_backlog_to_handler().unwrap();
-        assert!(
-            started.elapsed() < Duration::from_millis(250),
-            "callback activation waited behind a long pull operation"
-        );
-        assert!(poller.join().unwrap().is_none());
         queue.clear_handler_and_wait();
     }
 }

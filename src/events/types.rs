@@ -3,7 +3,8 @@ use serde::{Deserialize, Serialize};
 /// A single event handed to the consumer.
 ///
 /// A durable event has `id = Some(n)` and must be acknowledged with
-/// fh_ack_event. An ephemeral event has `id = None` and is gone once read.
+/// fh_ack_event. An ephemeral event has `id = None` and is gone after callback
+/// delivery.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Event {
     #[serde(skip_serializing_if = "Option::is_none")]

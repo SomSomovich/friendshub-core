@@ -3,12 +3,12 @@
 The library pushes events to a registered callback handler on a dedicated
 worker thread. Rust consumers register an `EventHandler` with
 `Client::set_event_handler`; C consumers register individual slots through
-`fh_set_event_callbacks`. Each event kind has its own callback. If no handler
-is installed, events remain available through `Client::poll_event` or
-`fh_poll_event`. Installing a handler drains events that accumulated in the
-in-memory pull queue into that handler. Durable events left unacknowledged in
-SQLite are restored into the queue when the client opens, so the next handler
-registration pushes them again.
+`fh_set_event_callbacks`. Each event kind has its own callback, and callbacks
+are the only event delivery interface. Events produced before a handler is
+installed, or while it is cleared, wait in the library's in-memory delivery
+backlog and are pushed when the next handler is registered. Durable events
+left unacknowledged in SQLite are restored when the client opens, so the next
+handler registration pushes them again.
 
 Callbacks run serially on the library-owned worker, not on the websocket or
 actor thread. A callback may call back into the client. Rust event references
@@ -16,23 +16,17 @@ and C `FhEventView.event_json` bytes are borrowed for the callback duration;
 the library allocates and releases the payload. C callers keep `user_data`
 valid until callbacks have drained after unregister/destroy.
 
-Callback registration first queues new events in the pull queue while the
-library transfers older queued events to the callback worker. This keeps the
-event order stable across activation. A pull wait blocks only on the event
-queue; it does not occupy the actor thread or delay callback registration.
-
-| Return | Out buffer | Meaning |
-|---|---|---|
-| 0 | empty | no event within the timeout |
-| 0 | JSON event | an event was returned |
-| non-zero | JSON error | the poll failed (handle closed, internal error) |
+During callback activation, new events are queued behind earlier events until
+the library has transferred the backlog to the callback worker. This keeps
+event order stable. Ephemeral events waiting in memory are lost if the process
+exits before they are pushed; durable events are replayed from SQLite.
 
 ## Durable vs ephemeral
 
 An event carries `id`. If the field is present, the event is **durable**:
 the library has persisted it and will not forget it until the consumer calls
 `fh_ack_event(handle, id)`. If the field is absent, the event is **ephemeral**:
-it existed only in memory and is gone once read.
+it exists only in memory and is gone after callback delivery.
 
 ### Why durable events exist
 
@@ -142,20 +136,12 @@ The `event` field discriminates:
 
 ## Callback pattern
 
-Install one callback per event type and handle durable IDs from the event
-view. For C, `event_id == 0` marks an ephemeral event; a nonzero ID must be
-passed to `fh_ack_event` after the application has safely handled the payload.
-The callback's JSON bytes must not be retained after it returns.
-
-## Pull compatibility pattern
-
-1. Call `fh_poll_event(handle, 5000, &out)`.
-2. Non-zero return: treat as error and back off.
-3. Empty buffer: the timeout expired; loop again.
-4. Otherwise parse the JSON, dispatch on `kind`, and - if `id` is present -
-   call `fh_ack_event(handle, id)` once the payload has been persisted or
-   otherwise handled.
-5. Call `fh_buffer_free(&out)` before the next iteration.
+Register the Rust handler or C callback table before starting the websocket.
+For C, `event_id == 0` marks an ephemeral event; a nonzero ID must be passed
+to `fh_ack_event` after the application has safely handled the payload. The
+callback's JSON bytes must not be retained after it returns. Clearing the
+handler pauses delivery; registering another handler pushes queued events in
+order.
 
 Do not ack before the payload is safely stored. If the process dies between
 ack and a successful write, the event is gone.

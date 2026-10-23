@@ -1,5 +1,4 @@
 use std::sync::Arc;
-use std::time::Duration;
 
 use crate::db::pending_events;
 use crate::error::{Error, Result};
@@ -46,7 +45,6 @@ pub async fn dispatch(state: Arc<ActorState>, method: u32, payload: Vec<u8>) -> 
         // service
         0x0000_0001 => ping().await,
         0x0000_0002 => version(&state).await,
-        0x0000_0003 => poll_event(&state, &payload).await,
         0x0000_0004 => ws::ack_event(&state, payload).await,
         0x0000_0005 => activate_push(&state).await,
 
@@ -346,6 +344,9 @@ pub(crate) async fn restore_pending_events(state: &ActorState) -> Result<()> {
 }
 
 async fn activate_push(state: &Arc<ActorState>) -> Result<Vec<u8>> {
+    // Emit these before draining the backlog so identity changes discovered
+    // during an earlier API call are included in this push activation.
+    emit_pending_identity_changes(state).await;
     state
         .events
         .drain_backlog_to_handler()
@@ -369,19 +370,6 @@ async fn version(state: &Arc<ActorState>) -> Result<Vec<u8>> {
     });
     Ok(serde_json::to_vec(&v)?)
 }
-
-async fn poll_event(state: &Arc<ActorState>, _payload: &[u8]) -> Result<Vec<u8>> {
-    // Identity key changes are persisted outside the event queue. Flush them
-    // first so the pull compatibility API can return one in this poll.
-    emit_pending_identity_changes(state).await;
-    match state.events.poll(Duration::ZERO) {
-        Some(ev) => Ok(serde_json::to_vec(&ev)?),
-        None => Ok(Vec::new()),
-    }
-}
-
-#[allow(dead_code)]
-fn _touch(_: Event) {}
 
 /// Moves un-notified identity changes into the event queue and marks them
 /// notified. The event is ephemeral: the consumer is expected to show it

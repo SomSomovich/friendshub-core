@@ -18,10 +18,14 @@ impl EventHandler for Recorder {
     fn on_receipt(&self, event: &Event) {
         let _ = self.0.send(("receipt", event.id));
     }
+
+    fn on_identity_changed(&self, event: &Event) {
+        let _ = self.0.send(("identity_changed", event.id));
+    }
 }
 
 #[test]
-fn event_queue_pushes_to_distinct_callbacks_without_polling() {
+fn event_queue_pushes_to_distinct_callbacks() {
     let queue = EventQueue::new();
     let (tx, rx) = mpsc::channel();
     queue.set_handler(Arc::new(Recorder(tx))).unwrap();
@@ -47,8 +51,8 @@ fn event_queue_pushes_to_distinct_callbacks_without_polling() {
     queue.clear_handler_and_wait();
 }
 
-#[test]
-fn safe_client_opens_database_and_calls_dispatch_without_ffi_buffers() {
+#[tokio::test(flavor = "current_thread")]
+async fn safe_client_opens_database_and_pushes_pending_identity_changes() {
     let db_path =
         std::env::temp_dir().join(format!("friendshub-core-{}.sqlite", uuid::Uuid::new_v4()));
     let config: Config = serde_json::from_value(serde_json::json!({
@@ -66,6 +70,41 @@ fn safe_client_opens_database_and_calls_dispatch_without_ffi_buffers() {
         .call_json(method_ids::PING, &serde_json::json!({}))
         .unwrap();
     assert_eq!(response, serde_json::json!({"pong":true}));
+    let removed_event_poll = client
+        .call_bytes(0x0000_0003, &[])
+        .expect_err("event polling method must not remain in the dispatcher");
+    assert_eq!(removed_event_poll.to_string(), "unknown method 0x00000003");
+
+    let pool = SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(
+            SqliteConnectOptions::new()
+                .filename(&db_path)
+                .create_if_missing(false),
+        )
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO identity_changes (account_id, device_number, old_key, new_key, changed_at) VALUES (?, ?, ?, ?, ?)",
+    )
+    .bind("peer-account")
+    .bind(2_i64)
+    .bind(vec![0x01_u8; 32])
+    .bind(vec![0x02_u8; 32])
+    .bind(123_i64)
+    .execute(&pool)
+    .await
+    .unwrap();
+    pool.close().await;
+
+    let (tx, rx) = mpsc::channel();
+    client.set_event_handler(Arc::new(Recorder(tx))).unwrap();
+    assert_eq!(
+        rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        ("identity_changed", None),
+        "identity changes pending before handler registration must be pushed"
+    );
+    client.clear_event_handler();
     drop(client);
     let _ = std::fs::remove_file(db_path);
 }

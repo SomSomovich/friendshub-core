@@ -2,7 +2,6 @@
 
 pub const PING: u32 = 0x0000_0001;
 pub const VERSION: u32 = 0x0000_0002;
-pub const POLL_EVENT: u32 = 0x0000_0003;
 pub const ACK_EVENT: u32 = 0x0000_0004;
 pub const ACTIVATE_EVENT_PUSH: u32 = 0x0000_0005;
 pub const WS_ACK_EVENT: u32 = 0x0000_0004;

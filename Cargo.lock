@@ -1118,7 +1118,7 @@ dependencies = [
 
 [[package]]
 name = "friendshub-core"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1159,7 +1159,7 @@ dependencies = [
 
 [[package]]
 name = "friendshub-core-wasm"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "friendshub-core",
  "js-sys",

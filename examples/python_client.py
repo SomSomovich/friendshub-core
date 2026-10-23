@@ -6,8 +6,9 @@ The library is loaded through ctypes; no bindings, no code generation. Run:
     python examples/python_client.py
 
 Edit the CONFIG at the top first. The script inspects the local database,
-and if the device is already initialized, starts the websocket and pumps
-events. Otherwise it prints the sequence of calls that would complete setup.
+registers event callbacks, and if the device is already initialized, starts
+the websocket and receives pushed events. Otherwise it prints the sequence of
+calls that would complete setup.
 
 This is a skeleton for a first integration test, not a production client.
 """
@@ -48,6 +49,64 @@ class FhBuffer(ctypes.Structure):
         ("len", ctypes.c_size_t),
         ("cap", ctypes.c_size_t),
     ]
+
+
+class FhEventView(ctypes.Structure):
+    _fields_ = [
+        ("event_id", ctypes.c_uint64),
+        ("event_json", ctypes.POINTER(ctypes.c_uint8)),
+        ("event_json_len", ctypes.c_size_t),
+    ]
+
+
+FhEventCallback = ctypes.CFUNCTYPE(
+    None, ctypes.c_void_p, ctypes.POINTER(FhEventView)
+)
+
+EVENT_CALLBACK_FIELDS = [
+    "on_ws_connected",
+    "on_ws_disconnected",
+    "on_ws_stopped",
+    "on_envelope_received",
+    "on_receipt",
+    "on_server_error",
+    "on_fatal_error",
+    "on_presence_updated",
+    "on_bot_message",
+    "on_channel_post",
+    "on_typing",
+    "on_read_receipt",
+    "on_conversation_updated",
+    "on_history_request",
+    "on_nudge",
+    "on_nudge_result",
+    "on_conversation_expired",
+    "on_scheduled_created",
+    "on_scheduled_cancelled",
+    "on_folders_updated",
+    "on_bot_message_edited",
+    "on_bot_message_deleted",
+    "on_bot_callback_answered",
+    "on_poll_updated",
+    "on_poll_deleted",
+    "on_call_signal",
+    "on_identity_changed",
+    "on_webrtc_ice_candidate",
+    "on_webrtc_signaling_state_changed",
+    "on_webrtc_ice_connection_state_changed",
+    "on_webrtc_ice_gathering_state_changed",
+    "on_webrtc_connection_state_changed",
+    "on_webrtc_data_channel_opened",
+    "on_webrtc_data_channel_closed",
+    "on_webrtc_data_channel_message",
+    "on_webrtc_track_received",
+    "on_webrtc_closed",
+    "on_unhandled",
+]
+
+
+class FhEventCallbacks(ctypes.Structure):
+    _fields_ = [(name, FhEventCallback) for name in EVENT_CALLBACK_FIELDS]
 
 
 def load_library():
@@ -91,12 +150,12 @@ def load_library():
     ]
     lib.fh_call.restype = ctypes.c_int32
 
-    lib.fh_poll_event.argtypes = [
+    lib.fh_set_event_callbacks.argtypes = [
         ctypes.c_void_p,
-        ctypes.c_uint32,
-        ctypes.POINTER(FhBuffer),
+        ctypes.POINTER(FhEventCallbacks),
+        ctypes.c_void_p,
     ]
-    lib.fh_poll_event.restype = ctypes.c_int32
+    lib.fh_set_event_callbacks.restype = ctypes.c_int32
 
     lib.fh_ack_event.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
     lib.fh_ack_event.restype = ctypes.c_int32
@@ -117,6 +176,9 @@ class Client:
     def __init__(self, lib):
         self.lib = lib
         self.handle = ctypes.c_void_p()
+        self.callback_errors = []
+        self._event_callback_refs = {}
+        self._event_callbacks = None
 
     def init(self, config):
         raw = json.dumps(config).encode("utf-8")
@@ -132,16 +194,56 @@ class Client:
         rc = self.lib.fh_call(self.handle, method_id, arr, len(raw), ctypes.byref(buf))
         return self._check(rc, buf, "fh_call(0x%08x)" % method_id)
 
-    def poll_event(self, timeout_ms=5000):
-        buf = FhBuffer()
-        rc = self.lib.fh_poll_event(self.handle, timeout_ms, ctypes.byref(buf))
+    def register_event_callbacks(self):
+        def make_callback(callback_name):
+            @FhEventCallback
+            def callback(_user_data, event_ptr):
+                try:
+                    if not event_ptr:
+                        return
+                    view = event_ptr.contents
+                    raw = ctypes.string_at(view.event_json, view.event_json_len)
+                    event = json.loads(raw.decode("utf-8"))
+                    kind = event.get("kind", "unknown")
+                    print("event (" + callback_name + "): " + str(kind))
+
+                    if callback_name == "on_envelope_received":
+                        payload = event.get("payload", {})
+                        plaintext = payload.get("plaintext_hex")
+                        sender = payload.get("sender_account_id", "?")
+                        if plaintext:
+                            message = bytes.fromhex(plaintext).decode(
+                                "utf-8", errors="replace"
+                            )
+                            print("  from " + sender + ": " + message)
+                        else:
+                            print("  (could not decrypt: ciphertext only)")
+                        if view.event_id != 0:
+                            self.ack_event(view.event_id)
+                    elif callback_name == "on_ws_connected":
+                        print("  websocket connected")
+                    elif callback_name == "on_ws_disconnected":
+                        print("  websocket disconnected")
+                    elif callback_name in ("on_server_error", "on_fatal_error"):
+                        print("  " + json.dumps(event.get("payload", {})))
+                except BaseException as error:
+                    # Python exceptions must not unwind across the C ABI.
+                    self.callback_errors.append(error)
+
+            return callback
+
+        self._event_callback_refs = {
+            name: make_callback(name) for name in EVENT_CALLBACK_FIELDS
+        }
+        callbacks = FhEventCallbacks()
+        for name, callback in self._event_callback_refs.items():
+            setattr(callbacks, name, callback)
+        self._event_callbacks = callbacks
+        rc = self.lib.fh_set_event_callbacks(
+            self.handle, ctypes.byref(self._event_callbacks), None
+        )
         if rc != 0:
-            self._check(rc, buf, "fh_poll_event")
-        data = buf_to_bytes(buf)
-        self.lib.fh_buffer_free(ctypes.byref(buf))
-        if not data:
-            return None
-        return json.loads(data.decode("utf-8"))
+            raise RuntimeError("fh_set_event_callbacks returned " + str(rc))
 
     def ack_event(self, event_id):
         rc = self.lib.fh_ack_event(self.handle, ctypes.c_uint64(event_id))
@@ -196,32 +298,13 @@ def main():
             print("  client.call(M_INIT_DEVICE, {\"name\": DEVICE_NAME})")
             return
 
+        client.register_event_callbacks()
         client.call(M_WS_START)
         print("")
-        print("websocket started; polling events for 60 seconds")
-
-        deadline = time.time() + 60
-        while time.time() < deadline:
-            event = client.poll_event(5000)
-            if event is None:
-                continue
-            kind = event.get("kind")
-            print("event: " + str(kind))
-            if kind == "envelope_received":
-                payload = event.get("payload", {})
-                pt = payload.get("plaintext_hex")
-                sender = payload.get("sender_account_id", "?")
-                if pt:
-                    text = bytes.fromhex(pt).decode("utf-8", errors="replace")
-                    print("  from " + sender + ": " + text)
-                else:
-                    print("  (could not decrypt: ciphertext only)")
-                if "id" in event:
-                    client.ack_event(event["id"])
-            elif kind == "ws_connected":
-                print("  websocket connected")
-            elif kind == "ws_disconnected":
-                print("  websocket disconnected")
+        print("websocket started; receiving pushed events for 60 seconds")
+        time.sleep(60)
+        if client.callback_errors:
+            raise RuntimeError("event callback failed") from client.callback_errors[0]
     finally:
         client.close()
 

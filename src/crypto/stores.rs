@@ -144,7 +144,7 @@ impl IdentityKeyStore for Store {
         .await
         .map_err(store_err)?;
 
-        // Record the change so poll_event can surface it. The new key is
+        // Record the change so the push callback can surface it. The new key is
         // stored either way -- rejecting it outright would make the client
         // unable to decrypt legitimate re-registrations -- but the user is
         // told, and can decide whether to trust the peer again.
