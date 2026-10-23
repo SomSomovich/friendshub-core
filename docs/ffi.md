@@ -11,21 +11,28 @@ const char* fh_abi_string(void);
 
 int32_t fh_init(
     const uint8_t* config_json, size_t config_len,
-    FhHandle** out_handle, FhBuffer* out);
+    struct FH_FhHandle** out_handle,
+    FH_FhResultCallback callback, void* user_data);
 
-void fh_destroy(FhHandle* handle);
+void fh_destroy(struct FH_FhHandle* handle);
 
 int32_t fh_call(
-    FhHandle* handle, uint32_t method_id,
-    const uint8_t* req, size_t req_len, FhBuffer* out);
+    struct FH_FhHandle* handle, uint32_t method_id,
+    const uint8_t* req, size_t req_len,
+    FH_FhResultCallback callback, void* user_data);
 
-int32_t fh_ack_event(FhHandle* handle, uint64_t event_id);
+int32_t fh_ack_event(struct FH_FhHandle* handle, uint64_t event_id);
 
 int32_t fh_set_event_callbacks(
-    FhHandle* handle, const FhEventCallbacks* callbacks, void* user_data);
-
-void fh_buffer_free(FhBuffer* buf);
+    struct FH_FhHandle* handle, const struct FH_FhEventCallbacks* callbacks, void* user_data);
 ```
+
+`fh_init` and `fh_call` invoke `FH_FhResultCallback` synchronously on the
+calling thread with the status and a read-only result pointer. The pointer is
+valid only until the callback returns; the library releases its backing
+allocation automatically. Consumers never receive or release a library-owned
+result buffer. A callback may parse or consume the bytes immediately; keeping
+the result after returning requires an application-owned copy.
 
 `fh_set_event_callbacks` installs one optional callback per event kind. Pass
 `NULL` for `callbacks` to clear the handler. Events produced until another
@@ -35,12 +42,18 @@ Callbacks run serially on the library-owned worker thread and may reenter
 the callback returns, so the consumer never allocates or frees event payload
 memory. Keep `user_data` alive until callbacks drain during clear or destroy.
 
-Every function returns `int32_t`: 0 on success, non-zero on failure. On
-failure the out buffer carries a JSON `{ "code": "...", "message": "..." }`.
-On success it carries the method-specific JSON response.
+For `fh_call`, the callback receives `status == 0` on success and a non-zero
+status on failure. Its bytes contain the method-specific response or JSON
+error object (`{"code":"...","message":"..."}`). `fh_init` returns an
+empty result on success and a JSON error object on failure. A zero-length
+result is passed as `data == NULL` and `data_len == 0`. The callback must not
+unwind across the C ABI boundary and must not retain or free the borrowed
+result.
 
-Every successful call that fills an out buffer must be followed by
-`fh_buffer_free`. Forgetting this leaks one Vec per call.
+`config_json` and `req` are input borrows: the caller keeps them readable for
+the duration of the function call. The library deserializes configuration and
+copies request bytes into library-owned storage before the call returns; the
+caller may then reuse or release its input storage.
 
 ## Configuration
 

@@ -13,7 +13,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-#define FH_ABI_VERSION 1
+#define FH_ABI_VERSION 3
 
 /**
  * Length of the base nonce shared by all chunks of one file.
@@ -52,20 +52,84 @@
 typedef struct FH_FhHandle FH_FhHandle;
 
 /**
- * A byte buffer passed across the FFI boundary.
- *
- * Callers must release it with fh_buffer_free. An empty buffer is
- * { data: null, len: 0, cap: 0 }.
+ * Borrowed event payload supplied to an event callback. `event_json` is valid
+ * only until the callback returns. `event_id == 0` means ephemeral; otherwise
+ * acknowledge the durable event with fh_ack_event.
  */
-typedef struct FH_FhBuffer {
-    uint8_t *data;
-    size_t len;
-    size_t cap;
-} FH_FhBuffer;
+typedef struct FH_FhEventView {
+    uint64_t event_id;
+    const uint8_t *event_json;
+    size_t event_json_len;
+} FH_FhEventView;
+
+/**
+ * Event callback. Do not retain the event view or its JSON pointer after
+ * returning, and do not unwind across the C ABI boundary.
+ */
+typedef void (*FH_FhEventCallback)(void *user_data, const struct FH_FhEventView *event);
+
+/** Separate callback slots for all event kinds emitted by the library. */
+typedef struct FH_FhEventCallbacks {
+    FH_FhEventCallback on_ws_connected;
+    FH_FhEventCallback on_ws_disconnected;
+    FH_FhEventCallback on_ws_stopped;
+    FH_FhEventCallback on_envelope_received;
+    FH_FhEventCallback on_receipt;
+    FH_FhEventCallback on_server_error;
+    FH_FhEventCallback on_fatal_error;
+    FH_FhEventCallback on_presence_updated;
+    FH_FhEventCallback on_bot_message;
+    FH_FhEventCallback on_channel_post;
+    FH_FhEventCallback on_typing;
+    FH_FhEventCallback on_read_receipt;
+    FH_FhEventCallback on_conversation_updated;
+    FH_FhEventCallback on_history_request;
+    FH_FhEventCallback on_nudge;
+    FH_FhEventCallback on_nudge_result;
+    FH_FhEventCallback on_conversation_expired;
+    FH_FhEventCallback on_scheduled_created;
+    FH_FhEventCallback on_scheduled_cancelled;
+    FH_FhEventCallback on_folders_updated;
+    FH_FhEventCallback on_bot_message_edited;
+    FH_FhEventCallback on_bot_message_deleted;
+    FH_FhEventCallback on_bot_callback_answered;
+    FH_FhEventCallback on_poll_updated;
+    FH_FhEventCallback on_poll_deleted;
+    FH_FhEventCallback on_call_signal;
+    FH_FhEventCallback on_identity_changed;
+    FH_FhEventCallback on_webrtc_ice_candidate;
+    FH_FhEventCallback on_webrtc_signaling_state_changed;
+    FH_FhEventCallback on_webrtc_ice_connection_state_changed;
+    FH_FhEventCallback on_webrtc_ice_gathering_state_changed;
+    FH_FhEventCallback on_webrtc_connection_state_changed;
+    FH_FhEventCallback on_webrtc_data_channel_opened;
+    FH_FhEventCallback on_webrtc_data_channel_closed;
+    FH_FhEventCallback on_webrtc_data_channel_message;
+    FH_FhEventCallback on_webrtc_track_received;
+    FH_FhEventCallback on_webrtc_closed;
+    FH_FhEventCallback on_unhandled;
+} FH_FhEventCallbacks;
+
+/**
+ * Synchronous result callback for fh_init and fh_call. `data` is read-only
+ * and borrowed only until the callback returns; do not retain or free it.
+ * Zero-length results use NULL.
+ */
+typedef void (*FH_FhResultCallback)(void *user_data, int32_t status, const uint8_t *data, size_t data_len);
 
 const char *fh_abi_string(void);
 
 uint32_t fh_abi_version(void);
+
+/**
+ * Installs per-event callbacks, or clears callbacks when `callbacks` is null.
+ * Events produced while no callback is installed are queued and pushed to
+ * the next registered handler. The event view and JSON bytes are owned by
+ * the library and borrowed only until the callback returns. `user_data`
+ * remains owned by the caller and must stay valid until callbacks are cleared
+ * or the handle is destroyed.
+ */
+int32_t fh_set_event_callbacks(struct FH_FhHandle *handle, const struct FH_FhEventCallbacks *callbacks, void *user_data);
 
 /**
  * Releases the database row for a durable event and, where the event is an
@@ -78,29 +142,19 @@ uint32_t fh_abi_version(void);
 int32_t fh_ack_event(struct FH_FhHandle *handle, uint64_t event_id);
 
 /**
- * Releases a buffer returned by any other `fh_*` call.
- *
- * # Safety
- *
- * `buf` must be either null or a pointer to an `FhBuffer` that was
- * returned by this library and has not been released yet. After the call
- * the buffer is reset to empty, so a second call on the same value is
- * safe and does nothing.
- */
-void fh_buffer_free(struct FH_FhBuffer *buf);
-
-/**
  * Invokes one method by id. See docs/ffi.md for the method table.
+ * The response is borrowed by the synchronous callback and released
+ * automatically when it returns.
  *
  * # Safety
  *
  * - `handle` must be a live pointer from `fh_init`.
  * - `req` must point to at least `req_len` readable bytes, or be null
  *   with `req_len == 0`.
- * - `out` must be a valid, writable pointer; it is always written to and
- *   must be freed with `fh_buffer_free`.
+ * - `callback` must be callable and must not unwind across the C ABI.
+ * - `user_data` must remain valid for the duration of the callback.
  */
-int32_t fh_call(struct FH_FhHandle *handle, uint32_t method_id, const uint8_t *req, size_t req_len, struct FH_FhBuffer *out);
+int32_t fh_call(struct FH_FhHandle *handle, uint32_t method_id, const uint8_t *req, size_t req_len, FH_FhResultCallback callback, void *user_data);
 
 /**
  * Destroys a handle and everything it owns.
@@ -114,17 +168,18 @@ int32_t fh_call(struct FH_FhHandle *handle, uint32_t method_id, const uint8_t *r
 void fh_destroy(struct FH_FhHandle *handle);
 
 /**
- * Initialises a handle for one account.
+ * Initialises a handle for one account. The response is borrowed by the
+ * synchronous callback and released automatically when it returns.
  *
  * # Safety
  *
  * - `config_json` must point to at least `config_len` readable bytes, or
  *   be null with `config_len == 0`.
- * - `out_handle` and `out` must be valid, writable pointers.
+ * - `out_handle` must be a valid, writable pointer.
  * - `out_handle` is written to on success; on failure it stays null.
- * - `out` is always written to. Callers must free it with
- *   `fh_buffer_free` when the return code is zero or one.
+ * - `callback` must be callable and must not unwind across the C ABI.
+ * - `user_data` must remain valid for the duration of the callback.
  */
-int32_t fh_init(const uint8_t *config_json, size_t config_len, struct FH_FhHandle **out_handle, struct FH_FhBuffer *out);
+int32_t fh_init(const uint8_t *config_json, size_t config_len, struct FH_FhHandle **out_handle, FH_FhResultCallback callback, void *user_data);
 
 #endif  /* FRIENDSHUB_CORE_H */

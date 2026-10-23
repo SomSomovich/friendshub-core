@@ -15,9 +15,15 @@ use web_sys::{
     AbortController, AbortSignal, Event, Headers, Request, RequestInit, Response, Window,
 };
 
+mod api;
+mod calls;
 mod push;
+pub mod signal;
 mod webrtc;
+pub use api::BrowserApi;
+pub use calls::BrowserCallManager;
 pub use push::BrowserPushClient;
+pub use signal::*;
 pub use webrtc::BrowserRtcManager;
 
 const DEFAULT_TIMEOUT_MS: u32 = 30_000;
@@ -80,37 +86,15 @@ impl BrowserRestClient {
         signal: Option<AbortSignal>,
         response_type: Option<String>,
     ) -> Result<JsValue, JsValue> {
-        let method = validate_method(&method).map_err(|error| error.into_js())?;
-        validate_response_type(response_type.as_deref()).map_err(|error| error.into_js())?;
-        let url = self.request_url(&path).map_err(|error| error.into_js())?;
-        let codec_origin = self.codec_origin().unwrap_or_default();
-        let codec_path = route_path_for_codec(&url, &codec_origin).map_err(|e| e.into_js())?;
-        let body = body
-            .filter(|value| !value.is_undefined())
-            .map(js_value_to_json)
-            .transpose()
-            .map_err(|error: RestError| {
-                RestError::new(
-                    "invalid_payload",
-                    0,
-                    format!("request body is not JSON-compatible: {}", error.message),
-                    String::new(),
-                )
-                .into_js()
-            })?;
-        let prepared = prepare_rest_request(method, &codec_path, body, None, None)
-            .map_err(request_core_error_to_js)?;
-        self.execute(
+        self.request_with_options_inner(
             method,
-            &url,
-            &codec_path,
-            prepared.protocol,
-            prepared.accept,
-            prepared.content_type,
-            prepared.body.map(bytes_to_js_body),
-            bearer.as_deref(),
+            path,
+            body,
+            bearer,
             signal,
-            response_type.as_deref(),
+            response_type,
+            Vec::new(),
+            true,
         )
         .await
     }
@@ -140,6 +124,7 @@ impl BrowserRestClient {
             .into_js());
         }
         let url = self.request_url(&path).map_err(|error| error.into_js())?;
+        let attach_session_headers = should_attach_session_headers(&path);
         let codec_origin = self.codec_origin().unwrap_or_default();
         let codec_path = route_path_for_codec(&url, &codec_origin).map_err(|e| e.into_js())?;
         let inferred_content_type = if content_type.is_none() {
@@ -176,6 +161,7 @@ impl BrowserRestClient {
             .into_js());
         }
         let prepared_content_type = prepared.content_type;
+        let bearer = bearer.filter(|_| attach_session_headers);
         self.execute(
             method,
             &url,
@@ -187,12 +173,98 @@ impl BrowserRestClient {
             bearer.as_deref(),
             signal,
             response_type.as_deref(),
+            &[],
+            attach_session_headers,
         )
         .await
     }
 }
 
 impl BrowserRestClient {
+    /// Sends a REST request with operation-specific headers and device-header
+    /// policy. Used by the typed API facade for WEB endpoints that set
+    /// `Idempotency-Key` or deliberately omit `X-Device-Number`.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) async fn request_with_options(
+        &self,
+        method: String,
+        path: String,
+        body: Option<JsValue>,
+        bearer: Option<String>,
+        signal: Option<AbortSignal>,
+        response_type: Option<String>,
+        extra_headers: Vec<(String, String)>,
+        include_device_number: bool,
+    ) -> Result<JsValue, JsValue> {
+        self.request_with_options_inner(
+            method,
+            path,
+            body,
+            bearer,
+            signal,
+            response_type,
+            extra_headers,
+            include_device_number,
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn request_with_options_inner(
+        &self,
+        method: String,
+        path: String,
+        body: Option<JsValue>,
+        bearer: Option<String>,
+        signal: Option<AbortSignal>,
+        response_type: Option<String>,
+        extra_headers: Vec<(String, String)>,
+        include_device_number: bool,
+    ) -> Result<JsValue, JsValue> {
+        let method = validate_method(&method).map_err(|error| error.into_js())?;
+        validate_response_type(response_type.as_deref()).map_err(|error| error.into_js())?;
+        let url = self.request_url(&path).map_err(|error| error.into_js())?;
+        let attach_session_headers = should_attach_session_headers(&path);
+        let codec_origin = self.codec_origin().unwrap_or_default();
+        let codec_path = route_path_for_codec(&url, &codec_origin).map_err(|e| e.into_js())?;
+        let body = body
+            .filter(|value| !value.is_undefined())
+            .map(js_value_to_json)
+            .transpose()
+            .map_err(|error: RestError| {
+                RestError::new(
+                    "invalid_payload",
+                    0,
+                    format!("request body is not JSON-compatible: {}", error.message),
+                    String::new(),
+                )
+                .into_js()
+            })?;
+        let prepared = prepare_rest_request(method, &codec_path, body, None, None)
+            .map_err(request_core_error_to_js)?;
+        let bearer = bearer.filter(|_| attach_session_headers);
+        let extra_headers = if attach_session_headers {
+            extra_headers
+        } else {
+            Vec::new()
+        };
+        self.execute(
+            method,
+            &url,
+            &codec_path,
+            prepared.protocol,
+            prepared.accept,
+            prepared.content_type,
+            prepared.body.map(bytes_to_js_body),
+            bearer.as_deref(),
+            signal,
+            response_type.as_deref(),
+            &extra_headers,
+            include_device_number && attach_session_headers,
+        )
+        .await
+    }
+
     #[allow(clippy::too_many_arguments)]
     async fn execute(
         &self,
@@ -206,6 +278,8 @@ impl BrowserRestClient {
         bearer: Option<&str>,
         external_signal: Option<AbortSignal>,
         response_type: Option<&str>,
+        extra_headers: &[(String, String)],
+        include_device_number: bool,
     ) -> Result<JsValue, JsValue> {
         let window = web_sys::window().ok_or_else(|| {
             RestError::new(
@@ -228,6 +302,11 @@ impl BrowserRestClient {
                 .set("Content-Type", value)
                 .map_err(|error| js_runtime_error("invalid Content-Type header", error))?;
         }
+        for (name, value) in extra_headers {
+            headers
+                .set(name, value)
+                .map_err(|error| js_runtime_error("invalid request header", error))?;
+        }
         if let Some(token) = bearer {
             if url_matches_api_origin(url, &self.origin, &window) {
                 headers
@@ -235,13 +314,15 @@ impl BrowserRestClient {
                     .map_err(|error| js_runtime_error("invalid Authorization header", error))?;
             }
         }
-        if let Some(device_number) = self
-            .device_number
-            .filter(|_| url_matches_api_origin(url, &self.origin, &window))
-        {
-            headers
-                .set("X-Device-Number", &device_number.to_string())
-                .map_err(|error| js_runtime_error("invalid device number header", error))?;
+        if include_device_number {
+            if let Some(device_number) = self
+                .device_number
+                .filter(|_| url_matches_api_origin(url, &self.origin, &window))
+            {
+                headers
+                    .set("X-Device-Number", &device_number.to_string())
+                    .map_err(|error| js_runtime_error("invalid device number header", error))?;
+            }
         }
 
         let controller = AbortController::new().map_err(|error| {
@@ -590,6 +671,12 @@ fn route_path_for_codec(url: &str, origin: &str) -> Result<String, RestError> {
 fn is_absolute_http_url(value: &str) -> bool {
     has_absolute_url_scheme(value)
         && Url::parse(value).is_ok_and(|url| matches!(url.scheme(), "http" | "https"))
+}
+
+/// Absolute URLs may be presigned storage capabilities. They never receive
+/// FriendsHub session credentials, even if storage shares the API origin.
+fn should_attach_session_headers(path: &str) -> bool {
+    !is_absolute_http_url(path)
 }
 
 fn has_absolute_url_scheme(value: &str) -> bool {
@@ -1101,6 +1188,17 @@ mod tests {
             Some(page_origin)
         ));
         assert!(is_same_origin_request("/api/v1/me", "", Some(page_origin)));
+    }
+
+    #[test]
+    fn absolute_presigned_urls_never_receive_session_headers() {
+        assert!(!should_attach_session_headers(
+            "https://api.example.test/storage/object?signature=x"
+        ));
+        assert!(!should_attach_session_headers(
+            "https://storage.example.test/object?signature=x"
+        ));
+        assert!(should_attach_session_headers("/api/v1/attachments/init"));
     }
 
     #[test]

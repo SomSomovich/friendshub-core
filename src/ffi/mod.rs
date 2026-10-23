@@ -18,17 +18,20 @@ use crate::transport::HttpClient;
 pub mod events;
 pub mod handle;
 pub mod panic;
-pub mod types;
 
 pub use events::{FhEventCallback, FhEventCallbacks, FhEventView};
-pub use types::FhBuffer;
+
+/// Receives a synchronous result from `fh_init` or `fh_call`. `data` is
+/// borrowed until the callback returns.
+pub type FhResultCallback =
+    unsafe extern "C" fn(user_data: *mut c_void, status: i32, data: *const u8, data_len: usize);
 
 use handle::FhHandle;
 use panic::guard;
 
-pub const ABI_VERSION: u32 = 2;
+pub const ABI_VERSION: u32 = 3;
 
-const ABI_STRING: &[u8] = b"0.1.3\0";
+const ABI_STRING: &[u8] = b"0.1.4\0";
 
 const METHOD_ACK_EVENT: u32 = 0x0000_0004;
 
@@ -42,66 +45,63 @@ pub extern "C" fn fh_abi_string() -> *const c_char {
     ABI_STRING.as_ptr() as *const c_char
 }
 
-/// Releases a buffer returned by any other `fh_*` call.
+/// Initialises a handle for one account and supplies any result through a
+/// synchronous callback borrow. On success the result is empty; on failure it
+/// is a JSON error object. The result memory is owned and released by the
+/// library after the callback returns.
 ///
 /// # Safety
 ///
-/// `buf` must be either null or a pointer to an `FhBuffer` that was
-/// returned by this library and has not been released yet. After the call
-/// the buffer is reset to empty, so a second call on the same value is
-/// safe and does nothing.
-#[unsafe(no_mangle)]
-pub unsafe extern "C" fn fh_buffer_free(buf: *mut FhBuffer) {
-    guard((), || {
-        if buf.is_null() {
-            return;
-        }
-        // SAFETY: the caller promises `buf` is a valid pointer to a buffer
-        // this library produced.
-        unsafe {
-            (*buf).release();
-        }
-    });
-}
-
-/// Initialises a handle for one account.
-///
-/// # Safety
-///
-/// - `config_json` must point to at least `config_len` readable bytes, or
-///   be null with `config_len == 0`.
-/// - `out_handle` and `out` must be valid, writable pointers.
-/// - `out_handle` is written to on success; on failure it stays null.
-/// - `out` is always written to. Callers must free it with
-///   `fh_buffer_free` when the return code is zero or one.
+/// - `config_json` must point to at least `config_len` readable bytes, or be
+///   null with `config_len == 0`.
+/// - `out_handle` must be a valid, writable pointer.
+/// - `callback` must be a valid function pointer and must not unwind across
+///   the C ABI boundary.
+/// - `user_data` must remain valid for the duration of the callback.
+/// - callback `data` is borrowed only until the callback returns; it must not
+///   be retained or freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fh_init(
     config_json: *const u8,
     config_len: usize,
     out_handle: *mut *mut FhHandle,
-    out: *mut FhBuffer,
+    callback: FhResultCallback,
+    user_data: *mut c_void,
 ) -> i32 {
     guard(-1, || {
-        if out_handle.is_null() || out.is_null() {
-            return -1;
+        // SAFETY: this wrapper forwards the input and output pointer contracts
+        // to the private initializer and keeps the result alive through the
+        // synchronous callback.
+        let (status, result) = unsafe { init_inner(config_json, config_len, out_handle) };
+        deliver_result(callback, user_data, status, &result);
+        status
+    })
+}
+
+unsafe fn init_inner(
+    config_json: *const u8,
+    config_len: usize,
+    out_handle: *mut *mut FhHandle,
+) -> (i32, Vec<u8>) {
+    guard((-1, Vec::new()), || {
+        if out_handle.is_null() {
+            return (-1, Vec::new());
         }
-        // SAFETY: both pointers were checked above.
-        unsafe {
-            *out_handle = std::ptr::null_mut();
-            *out = FhBuffer::EMPTY;
-        }
+        // SAFETY: the public `fh_init` contract requires a valid writable
+        // out_handle pointer.
+        unsafe { *out_handle = std::ptr::null_mut() };
 
         if config_json.is_null() || config_len == 0 {
-            return write_error(out, &Error::Config("config is empty".into()));
+            return error_result(&Error::Config("config is empty".into()));
         }
 
-        // SAFETY: the caller promises `config_json` is readable for
-        // `config_len` bytes.
+        // SAFETY: the public `fh_init` contract requires config_json to be
+        // readable for config_len bytes.
         let bytes = unsafe { std::slice::from_raw_parts(config_json, config_len) };
 
         let cfg = match Config::from_json(bytes) {
             Ok(c) => c,
-            Err(e) => return write_error(out, &e),
+            Err(e) => return error_result(&e),
         };
 
         crate::logging::init_once(&cfg.log_level, &cfg.log_format);
@@ -128,16 +128,14 @@ pub unsafe extern "C" fn fh_init(
                 Ok(ActorState::new_with_events(config, db, http, actor_events))
             })
         }) {
-            Ok(a) => a,
-            Err(e) => return write_error(out, &e),
+            Ok(actor) => actor,
+            Err(error) => return error_result(&error),
         };
 
         let handle = Box::new(FhHandle::new(actor, events));
-        // SAFETY: `out_handle` was checked non-null.
-        unsafe {
-            *out_handle = Box::into_raw(handle);
-        }
-        0
+        // SAFETY: out_handle was checked non-null and is writable by contract.
+        unsafe { *out_handle = Box::into_raw(handle) };
+        (0, Vec::new())
     })
 }
 
@@ -224,53 +222,65 @@ pub unsafe extern "C" fn fh_set_event_callbacks(
     })
 }
 
-/// Invokes one method by id. See docs/ffi.md for the method table.
+/// Invokes one method by id and supplies its result through a synchronous
+/// callback borrow. The callback receives the method response on success and
+/// a JSON error object on failure. The result memory is owned and released by
+/// the library after the callback returns. See docs/ffi.md for method IDs.
 ///
 /// # Safety
 ///
 /// - `handle` must be a live pointer from `fh_init`.
-/// - `req` must point to at least `req_len` readable bytes, or be null
-///   with `req_len == 0`.
-/// - `out` must be a valid, writable pointer; it is always written to and
-///   must be freed with `fh_buffer_free`.
+/// - `req` must point to at least `req_len` readable bytes, or be null with
+///   `req_len == 0`.
+/// - `callback` must be a valid function pointer and must not unwind across
+///   the C ABI boundary.
+/// - `user_data` must remain valid for the duration of the callback.
+/// - callback `data` is borrowed only until the callback returns; it must not
+///   be retained or freed.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn fh_call(
     handle: *mut FhHandle,
     method_id: u32,
     req: *const u8,
     req_len: usize,
-    out: *mut FhBuffer,
+    callback: FhResultCallback,
+    user_data: *mut c_void,
 ) -> i32 {
     guard(-1, || {
-        if handle.is_null() || out.is_null() {
-            return -1;
-        }
-        // SAFETY: `out` was checked non-null.
-        unsafe {
-            *out = FhBuffer::EMPTY;
+        // SAFETY: this wrapper forwards pointer requirements to the private
+        // dispatcher and keeps its owned result alive through the callback.
+        let (status, result) = unsafe { call_inner(handle, method_id, req, req_len) };
+        deliver_result(callback, user_data, status, &result);
+        status
+    })
+}
+
+unsafe fn call_inner(
+    handle: *mut FhHandle,
+    method_id: u32,
+    req: *const u8,
+    req_len: usize,
+) -> (i32, Vec<u8>) {
+    guard((-1, Vec::new()), || {
+        if handle.is_null() {
+            return (-1, Vec::new());
         }
 
         let payload = if req.is_null() || req_len == 0 {
             Vec::new()
         } else {
-            // SAFETY: the caller promises `req` is readable for `req_len`
-            // bytes.
+            // SAFETY: the public `fh_call` contract requires req to be
+            // readable for req_len bytes; copy it before dispatch.
             unsafe { std::slice::from_raw_parts(req, req_len) }.to_vec()
         };
 
-        // Clone the shared state so callbacks may destroy the opaque handle
-        // while this actor request is in flight.
-        // SAFETY: `handle` is a live pointer, per the caller's contract.
+        // Clone shared state so an event callback may destroy the public
+        // handle while this request is in flight.
+        // SAFETY: the public `fh_call` contract requires a live handle.
         let inner = unsafe { (&*handle).inner_arc() };
         match inner.call(method_id, payload) {
-            Ok(bytes) => {
-                // SAFETY: `out` was checked non-null.
-                unsafe {
-                    *out = FhBuffer::from_vec(bytes);
-                }
-                0
-            }
-            Err(e) => write_error(out, &e),
+            Ok(response) => (0, response),
+            Err(error) => error_result(&error),
         }
     })
 }
@@ -302,14 +312,128 @@ pub unsafe extern "C" fn fh_ack_event(handle: *mut FhHandle, event_id: u64) -> i
     })
 }
 
-fn write_error(out: *mut FhBuffer, e: &Error) -> i32 {
-    let bytes = e.to_json().into_bytes();
-    // SAFETY: every caller passes a pointer it has already checked non-null.
-    unsafe {
-        *out = FhBuffer::from_vec(bytes);
-    }
-    1
+fn error_result(error: &Error) -> (i32, Vec<u8>) {
+    (1, error.to_json().into_bytes())
 }
 
 #[allow(dead_code)]
 fn _unused(_: Result<()>, _: api::DispatchMarker) {}
+
+fn deliver_result(callback: FhResultCallback, user_data: *mut c_void, status: i32, result: &[u8]) {
+    let data = if result.is_empty() {
+        std::ptr::null()
+    } else {
+        result.as_ptr()
+    };
+    // SAFETY: the callback is required to be callable by the public function's
+    // contract. `data` points into the library-owned result, which remains
+    // allocated until after this synchronous callback returns.
+    unsafe { callback(user_data, status, data, result.len()) };
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[derive(Default)]
+    struct CapturedResult {
+        status: i32,
+        bytes: Vec<u8>,
+        was_null_for_empty: bool,
+    }
+
+    unsafe extern "C" fn capture_result(
+        user_data: *mut c_void,
+        status: i32,
+        data: *const u8,
+        data_len: usize,
+    ) {
+        // SAFETY: the test passes a pointer to a live CapturedResult and the
+        // callback contract guarantees `data` is readable for `data_len`.
+        let captured = unsafe { &mut *(user_data.cast::<CapturedResult>()) };
+        captured.status = status;
+        captured.was_null_for_empty = data.is_null() && data_len == 0;
+        if !data.is_null() {
+            // SAFETY: `deliver_result` keeps the library-owned allocation live
+            // until this callback returns.
+            captured.bytes = unsafe { std::slice::from_raw_parts(data, data_len) }.to_vec();
+        }
+    }
+
+    #[test]
+    fn callback_receives_borrowed_result() {
+        let mut captured = CapturedResult::default();
+        let result = br#"{"ok":true}"#.to_vec();
+
+        deliver_result(
+            capture_result,
+            (&mut captured as *mut CapturedResult).cast(),
+            0,
+            &result,
+        );
+
+        assert_eq!(captured.status, 0);
+        assert_eq!(captured.bytes, br#"{"ok":true}"#);
+    }
+
+    #[test]
+    fn callback_receives_error_result() {
+        let mut captured = CapturedResult::default();
+        let result = br#"{"code":"denied","message":"no"}"#.to_vec();
+
+        deliver_result(
+            capture_result,
+            (&mut captured as *mut CapturedResult).cast(),
+            1,
+            &result,
+        );
+
+        assert_eq!(captured.status, 1);
+        assert_eq!(captured.bytes, br#"{"code":"denied","message":"no"}"#);
+    }
+
+    #[test]
+    fn callback_receives_empty_results_as_null() {
+        let mut captured = CapturedResult::default();
+        let result = Vec::new();
+
+        deliver_result(
+            capture_result,
+            (&mut captured as *mut CapturedResult).cast(),
+            1,
+            &result,
+        );
+
+        assert_eq!(captured.status, 1);
+        assert!(captured.bytes.is_empty());
+        assert!(captured.was_null_for_empty);
+    }
+
+    #[test]
+    fn init_reports_json_errors_through_callback() {
+        let config = b"{}";
+        let mut handle: *mut FhHandle = std::ptr::null_mut();
+        let mut captured = CapturedResult::default();
+
+        // SAFETY: all pointers refer to valid memory for the duration of the
+        // call, and the callback only reads its borrowed result synchronously.
+        let status = unsafe {
+            fh_init(
+                config.as_ptr(),
+                config.len(),
+                &mut handle,
+                capture_result,
+                (&mut captured as *mut CapturedResult).cast(),
+            )
+        };
+
+        assert_eq!(status, 1);
+        assert!(handle.is_null());
+        assert_eq!(captured.status, 1);
+        assert!(
+            std::str::from_utf8(&captured.bytes)
+                .expect("error payload is UTF-8 JSON")
+                .contains("db_path")
+        );
+    }
+}

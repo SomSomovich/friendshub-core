@@ -64,7 +64,6 @@ build_wasm() {
     wasm-pack build bindings/wasm \
         --target web \
         --release \
-        --no-gitignore \
         --out-dir ../../target/wasm-browser
     printf 'Browser-ready WASM package: %s/target/wasm-browser\n' "$REPO_ROOT"
 }

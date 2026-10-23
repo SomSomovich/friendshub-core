@@ -1,10 +1,34 @@
 # FriendsHub browser binding
 
-This crate exposes the shared REST protobuf route codec, browser WebSocket
-push client, and browser WebRTC media manager through `wasm-bindgen`.
-JavaScript passes ordinary WEB camelCase objects. The binding validates
-inputs, copies request data into Rust-owned protobuf messages, and creates
-fresh JavaScript event values for callbacks.
+This crate exposes the WEB REST operations, protobuf browser WebSocket push,
+Signal Protocol operations, and browser WebRTC/call orchestration through
+`wasm-bindgen`. JavaScript passes WEB camelCase objects. The binding validates
+inputs, converts REST requests to protobuf in Rust, owns Signal state in Rust,
+and creates fresh JavaScript event values for callbacks. UI, IndexedDB,
+service workers, and notification permission/delivery remain in WEB.
+
+## BrowserApi
+
+`new BrowserApi(apiBase)` exposes named operations corresponding to the direct
+REST calls in `friendshubWEB/src/api`. It covers 182 exported WEB operations,
+including session/device management, conversations, attachments, groups,
+channels, bots, profile/search, calls, and WebRTC ICE server discovery. Pass
+the same camelCase fields used by WEB; route construction, query aliases,
+protobuf conversion, binary uploads, idempotency headers, and device-header
+policy are handled by the binding.
+
+```js
+const api = new BrowserApi('https://api.example.test/api/v1')
+const session = await api.login({ fhNumber, password, deviceNumber })
+api.setSession(session.sessionToken, session.deviceNumber)
+const account = await api.getMe()
+```
+
+Unauthenticated operations do not receive session credentials or a device
+number. Absolute presigned storage URLs never receive bearer, device, or
+operation-specific headers, even when they share the API origin. The lower-
+level `BrowserRestClient` remains available for custom routes and binary
+response handling.
 
 ## BrowserRestClient
 
@@ -98,6 +122,16 @@ two-second close deadline. Dropping the Rust client detaches listeners, cancels
 all timers and closes its socket. All listener and timer closures are deferred
 for release if they are currently executing.
 
+## Signal Protocol
+
+The crate exports the existing WEB bridge operations for identity and prekey
+management, session establishment, pairwise encrypt/decrypt, sender-key group
+messages, identity-change tracking, and snapshot/restore. Each operation takes
+an `account_id` and uses an in-memory Rust Signal store. Persist `snapshot()`
+through WEB's existing IndexedDB layer and call `restore()` on startup; call
+`reset()` to release one account's Rust-side state. No Signal private key or
+store buffer needs to be freed by JavaScript.
+
 ## BrowserRtcManager
 
 `BrowserRtcManager` owns browser peer connections and local/remote tracks.
@@ -118,10 +152,17 @@ Use `set_audio_enabled`, `set_video_enabled`, `switch_camera`,
 `local_stream`, `remote_stream`, and `close_call` for media controls and
 lifecycle. Dropping the manager closes remaining calls and releases tracks.
 
-The application still handles Signal encryption and carries call signaling
-inside encrypted envelopes, as the current WEB client does. Browser UI,
-IndexedDB/outbox, service workers, and notification permission/delivery remain
-application responsibilities.
+`BrowserCallManager` coordinates one active call, ICE-server retrieval, SDP
+offer/answer ordering, encrypted-envelope signal sends, ICE buffering, and
+call end/failure callbacks. Its adapters connect the manager to the existing
+REST, Signal, and push objects; the application supplies those dependencies,
+not the call-state machine. Use `set_finished_incoming_check` to connect WEB's
+IndexedDB-backed duplicate-call check, and persist ended incoming calls from
+`set_on_call_ended`. Call signaling uses Signal-encrypted envelope types 10–14
+and never plaintext `CallSignal` frames.
+
+Browser UI, IndexedDB/outbox persistence, service workers, and notification
+permission/delivery remain application responsibilities.
 
 ## Checks
 

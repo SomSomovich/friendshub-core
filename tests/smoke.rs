@@ -24,8 +24,8 @@ fn config_rejects_invalid_json() {
 }
 
 #[test]
-fn abi_version_reflects_the_push_only_abi() {
-    assert_eq!(friendshub_core::ffi::ABI_VERSION, 2);
+fn abi_version_reflects_the_callback_result_abi() {
+    assert_eq!(friendshub_core::ffi::ABI_VERSION, 3);
 }
 
 #[test]

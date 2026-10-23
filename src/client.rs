@@ -20,6 +20,8 @@ pub mod method_ids {
     include!("method_ids.rs");
 }
 
+mod typed;
+
 /// One native FriendsHub client instance for one account and database.
 pub struct Client {
     actor: Actor,

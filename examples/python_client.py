@@ -43,14 +43,6 @@ M_SEND_MESSAGE = 0x00040004
 M_WS_START = 0x00FF0001
 
 
-class FhBuffer(ctypes.Structure):
-    _fields_ = [
-        ("data", ctypes.POINTER(ctypes.c_uint8)),
-        ("len", ctypes.c_size_t),
-        ("cap", ctypes.c_size_t),
-    ]
-
-
 class FhEventView(ctypes.Structure):
     _fields_ = [
         ("event_id", ctypes.c_uint64),
@@ -61,6 +53,13 @@ class FhEventView(ctypes.Structure):
 
 FhEventCallback = ctypes.CFUNCTYPE(
     None, ctypes.c_void_p, ctypes.POINTER(FhEventView)
+)
+FhResultCallback = ctypes.CFUNCTYPE(
+    None,
+    ctypes.c_void_p,
+    ctypes.c_int32,
+    ctypes.POINTER(ctypes.c_uint8),
+    ctypes.c_size_t,
 )
 
 EVENT_CALLBACK_FIELDS = [
@@ -134,7 +133,8 @@ def load_library():
         ctypes.POINTER(ctypes.c_uint8),
         ctypes.c_size_t,
         ctypes.POINTER(ctypes.c_void_p),
-        ctypes.POINTER(FhBuffer),
+        FhResultCallback,
+        ctypes.c_void_p,
     ]
     lib.fh_init.restype = ctypes.c_int32
 
@@ -146,7 +146,8 @@ def load_library():
         ctypes.c_uint32,
         ctypes.POINTER(ctypes.c_uint8),
         ctypes.c_size_t,
-        ctypes.POINTER(FhBuffer),
+        FhResultCallback,
+        ctypes.c_void_p,
     ]
     lib.fh_call.restype = ctypes.c_int32
 
@@ -160,16 +161,7 @@ def load_library():
     lib.fh_ack_event.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
     lib.fh_ack_event.restype = ctypes.c_int32
 
-    lib.fh_buffer_free.argtypes = [ctypes.POINTER(FhBuffer)]
-    lib.fh_buffer_free.restype = None
-
     return lib
-
-
-def buf_to_bytes(buf):
-    if not buf.data or buf.len == 0:
-        return b""
-    return ctypes.string_at(ctypes.cast(buf.data, ctypes.c_void_p), buf.len)
 
 
 class Client:
@@ -183,16 +175,47 @@ class Client:
     def init(self, config):
         raw = json.dumps(config).encode("utf-8")
         arr = (ctypes.c_uint8 * len(raw)).from_buffer_copy(raw)
-        buf = FhBuffer()
-        rc = self.lib.fh_init(arr, len(raw), ctypes.byref(self.handle), ctypes.byref(buf))
-        return self._check(rc, buf, "fh_init")
+        return self._invoke_result(
+            self.lib.fh_init,
+            (arr, len(raw), ctypes.byref(self.handle)),
+            "fh_init",
+        )
 
     def call(self, method_id, payload=None):
         raw = json.dumps(payload).encode("utf-8") if payload is not None else b""
         arr = (ctypes.c_uint8 * len(raw)).from_buffer_copy(raw) if raw else None
-        buf = FhBuffer()
-        rc = self.lib.fh_call(self.handle, method_id, arr, len(raw), ctypes.byref(buf))
-        return self._check(rc, buf, "fh_call(0x%08x)" % method_id)
+        return self._invoke_result(
+            self.lib.fh_call,
+            (self.handle, method_id, arr, len(raw)),
+            "fh_call(0x%08x)" % method_id,
+        )
+
+    def _invoke_result(self, function, args, what):
+        result = {}
+        callback_errors = []
+
+        @FhResultCallback
+        def on_result(_user_data, status, data, data_len):
+            try:
+                length = int(data_len)
+                if length and not data:
+                    raise RuntimeError("library returned a null result with non-zero length")
+                result["status"] = int(status)
+                # Copy only if Python needs to keep or decode the response.
+                # The borrowed pointer itself is never retained or freed.
+                result["data"] = ctypes.string_at(data, length) if length else b""
+            except BaseException as error:
+                # Python exceptions must not unwind across the C ABI.
+                callback_errors.append(error)
+
+        rc = function(*args, on_result, None)
+        if callback_errors:
+            raise RuntimeError(what + " result callback failed") from callback_errors[0]
+        if "status" not in result:
+            raise RuntimeError(what + " returned without invoking its result callback")
+        if rc != result["status"]:
+            raise RuntimeError(what + " returned a status that differs from its callback")
+        return self._check(rc, result["data"], what)
 
     def register_event_callbacks(self):
         def make_callback(callback_name):
@@ -255,9 +278,8 @@ class Client:
             self.lib.fh_destroy(self.handle)
             self.handle = None
 
-    def _check(self, rc, buf, what):
-        data = buf_to_bytes(buf)
-        self.lib.fh_buffer_free(ctypes.byref(buf))
+    @staticmethod
+    def _check(rc, data, what):
         if rc != 0:
             msg = data.decode("utf-8", errors="replace") if data else "(no body)"
             raise RuntimeError(what + " failed (rc=" + str(rc) + "): " + msg)

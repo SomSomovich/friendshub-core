@@ -13,7 +13,7 @@
 #include <stdint.h>
 #include <stdlib.h>
 
-#define FH_ABI_VERSION 2
+#define FH_ABI_VERSION 3
 
 /**
  * Length of the base nonce shared by all chunks of one file.
@@ -50,18 +50,6 @@
  * database, its own websocket.
  */
 typedef struct FH_FhHandle FH_FhHandle;
-
-/**
- * A byte buffer passed across the FFI boundary.
- *
- * Callers must release it with fh_buffer_free. An empty buffer is
- * { data: null, len: 0, cap: 0 }.
- */
-typedef struct FH_FhBuffer {
-    uint8_t *data;
-    size_t len;
-    size_t cap;
-} FH_FhBuffer;
 
 /**
  * Borrowed event payload supplied to an event callback. `event_json` is valid
@@ -122,6 +110,13 @@ typedef struct FH_FhEventCallbacks {
     FH_FhEventCallback on_unhandled;
 } FH_FhEventCallbacks;
 
+/**
+ * Synchronous result callback for fh_init and fh_call. `data` is read-only
+ * and borrowed only until the callback returns; do not retain or free it.
+ * Zero-length results use NULL.
+ */
+typedef void (*FH_FhResultCallback)(void *user_data, int32_t status, const uint8_t *data, size_t data_len);
+
 const char *fh_abi_string(void);
 
 uint32_t fh_abi_version(void);
@@ -147,29 +142,19 @@ int32_t fh_set_event_callbacks(struct FH_FhHandle *handle, const struct FH_FhEve
 int32_t fh_ack_event(struct FH_FhHandle *handle, uint64_t event_id);
 
 /**
- * Releases a buffer returned by any other `fh_*` call.
- *
- * # Safety
- *
- * `buf` must be either null or a pointer to an `FhBuffer` that was
- * returned by this library and has not been released yet. After the call
- * the buffer is reset to empty, so a second call on the same value is
- * safe and does nothing.
- */
-void fh_buffer_free(struct FH_FhBuffer *buf);
-
-/**
  * Invokes one method by id. See docs/ffi.md for the method table.
+ * The response is borrowed by the synchronous callback and released
+ * automatically when it returns.
  *
  * # Safety
  *
  * - `handle` must be a live pointer from `fh_init`.
  * - `req` must point to at least `req_len` readable bytes, or be null
  *   with `req_len == 0`.
- * - `out` must be a valid, writable pointer; it is always written to and
- *   must be freed with `fh_buffer_free`.
+ * - `callback` must be callable and must not unwind across the C ABI.
+ * - `user_data` must remain valid for the duration of the callback.
  */
-int32_t fh_call(struct FH_FhHandle *handle, uint32_t method_id, const uint8_t *req, size_t req_len, struct FH_FhBuffer *out);
+int32_t fh_call(struct FH_FhHandle *handle, uint32_t method_id, const uint8_t *req, size_t req_len, FH_FhResultCallback callback, void *user_data);
 
 /**
  * Destroys a handle and everything it owns.
@@ -183,17 +168,18 @@ int32_t fh_call(struct FH_FhHandle *handle, uint32_t method_id, const uint8_t *r
 void fh_destroy(struct FH_FhHandle *handle);
 
 /**
- * Initialises a handle for one account.
+ * Initialises a handle for one account. The response is borrowed by the
+ * synchronous callback and released automatically when it returns.
  *
  * # Safety
  *
  * - `config_json` must point to at least `config_len` readable bytes, or
  *   be null with `config_len == 0`.
- * - `out_handle` and `out` must be valid, writable pointers.
+ * - `out_handle` must be a valid, writable pointer.
  * - `out_handle` is written to on success; on failure it stays null.
- * - `out` is always written to. Callers must free it with
- *   `fh_buffer_free` when the return code is zero or one.
+ * - `callback` must be callable and must not unwind across the C ABI.
+ * - `user_data` must remain valid for the duration of the callback.
  */
-int32_t fh_init(const uint8_t *config_json, size_t config_len, struct FH_FhHandle **out_handle, struct FH_FhBuffer *out);
+int32_t fh_init(const uint8_t *config_json, size_t config_len, struct FH_FhHandle **out_handle, FH_FhResultCallback callback, void *user_data);
 
 #endif  /* FRIENDSHUB_CORE_H */

@@ -32,7 +32,11 @@ pub struct RestRequest {
 }
 
 type RequestEncoder = fn(Value) -> Result<Vec<u8>>;
+#[cfg(test)]
+type RequestValidator = fn(&[u8]) -> Result<()>;
 type ResponseDecoder = fn(&[u8], ResponseShape) -> Result<Value>;
+#[cfg(test)]
+type DefaultResponseEncoder = fn() -> Vec<u8>;
 
 #[derive(Clone, Copy)]
 enum RequestBody {
@@ -53,6 +57,10 @@ pub(super) struct RouteSpec {
     path: &'static str,
     request: RequestBody,
     response: Option<(ResponseDecoder, ResponseShape)>,
+    #[cfg(test)]
+    request_round_trip: Option<RequestValidator>,
+    #[cfg(test)]
+    response_fixture: Option<DefaultResponseEncoder>,
 }
 
 macro_rules! object_route {
@@ -62,6 +70,10 @@ macro_rules! object_route {
             path: $path,
             request: RequestBody::Protobuf(encode_request::<$request>),
             response: Some((decode_response::<$response>, ResponseShape::Object)),
+            #[cfg(test)]
+            request_round_trip: Some(validate_request::<$request>),
+            #[cfg(test)]
+            response_fixture: Some(encode_default::<$response>),
         }
     };
 }
@@ -73,6 +85,10 @@ macro_rules! object_list_route {
             path: $path,
             request: RequestBody::Protobuf(encode_request::<$request>),
             response: Some((decode_response::<$response>, ResponseShape::Items)),
+            #[cfg(test)]
+            request_round_trip: Some(validate_request::<$request>),
+            #[cfg(test)]
+            response_fixture: Some(encode_default::<$response>),
         }
     };
 }
@@ -84,6 +100,10 @@ macro_rules! get_object_route {
             path: $path,
             request: RequestBody::None,
             response: Some((decode_response::<$response>, ResponseShape::Object)),
+            #[cfg(test)]
+            request_round_trip: None,
+            #[cfg(test)]
+            response_fixture: Some(encode_default::<$response>),
         }
     };
 }
@@ -95,6 +115,10 @@ macro_rules! bodyless_object_route {
             path: $path,
             request: RequestBody::None,
             response: Some((decode_response::<$response>, ResponseShape::Object)),
+            #[cfg(test)]
+            request_round_trip: None,
+            #[cfg(test)]
+            response_fixture: Some(encode_default::<$response>),
         }
     };
 }
@@ -106,6 +130,10 @@ macro_rules! get_list_route {
             path: $path,
             request: RequestBody::None,
             response: Some((decode_response::<$response>, ResponseShape::Items)),
+            #[cfg(test)]
+            request_round_trip: None,
+            #[cfg(test)]
+            response_fixture: Some(encode_default::<$response>),
         }
     };
 }
@@ -117,6 +145,10 @@ macro_rules! bodyless_response_route {
             path: $path,
             request: RequestBody::None,
             response: None,
+            #[cfg(test)]
+            request_round_trip: None,
+            #[cfg(test)]
+            response_fixture: None,
         }
     };
 }
@@ -128,6 +160,10 @@ macro_rules! request_only_route {
             path: $path,
             request: RequestBody::Protobuf(encode_request::<$request>),
             response: None,
+            #[cfg(test)]
+            request_round_trip: Some(validate_request::<$request>),
+            #[cfg(test)]
+            response_fixture: None,
         }
     };
 }
@@ -139,6 +175,10 @@ macro_rules! raw_request_route {
             path: $path,
             request: RequestBody::Raw,
             response: Some((decode_response::<$response>, ResponseShape::Object)),
+            #[cfg(test)]
+            request_round_trip: None,
+            #[cfg(test)]
+            response_fixture: Some(encode_default::<$response>),
         }
     };
 }
@@ -151,6 +191,10 @@ static HEALTH_ROUTE: RouteSpec = RouteSpec {
         decode_response::<crate::proto::rest::HealthResponse>,
         ResponseShape::Object,
     )),
+    #[cfg(test)]
+    request_round_trip: None,
+    #[cfg(test)]
+    response_fixture: Some(encode_default::<crate::proto::rest::HealthResponse>),
 };
 
 static ROUTES: &[RouteSpec] = &[
@@ -736,6 +780,30 @@ where
     Ok(message.encode_to_vec())
 }
 
+#[cfg(test)]
+fn validate_request<M>(bytes: &[u8]) -> Result<()>
+where
+    M: Message + Default,
+{
+    let message = M::decode(bytes).map_err(|error| {
+        Error::InvalidPayload(format!("invalid encoded protobuf REST request: {error}"))
+    })?;
+    if message.encode_to_vec() != bytes {
+        return Err(Error::InvalidPayload(
+            "protobuf REST request did not survive a decode/encode round trip".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn encode_default<M>() -> Vec<u8>
+where
+    M: Message + Default,
+{
+    M::default().encode_to_vec()
+}
+
 fn decode_response<M>(bytes: &[u8], shape: ResponseShape) -> Result<Value>
 where
     M: Message + Default + Serialize,
@@ -915,6 +983,316 @@ fn path_matches(pattern: &str, path: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::collections::HashSet;
+
+    fn sample_path(template: &str) -> String {
+        template
+            .split('/')
+            .map(|segment| {
+                if segment.starts_with('{') && segment.ends_with('}') {
+                    "contract-test-value"
+                } else {
+                    segment
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+
+    #[test]
+    fn every_registered_rest_route_has_valid_metadata_and_round_trips_its_codecs() {
+        let mut route_keys = HashSet::new();
+
+        for route in ROUTES {
+            assert!(matches!(
+                route.method,
+                "GET" | "POST" | "PUT" | "PATCH" | "DELETE"
+            ));
+            assert!(
+                route.path.starts_with('/'),
+                "route path must be absolute: {}",
+                route.path
+            );
+            assert!(
+                !route.path.contains('?'),
+                "route path must not contain query: {}",
+                route.path
+            );
+            assert!(
+                route.path.split('/').all(|segment| {
+                    if segment.contains('{') || segment.contains('}') {
+                        segment.starts_with('{') && segment.ends_with('}') && segment.len() > 2
+                    } else {
+                        true
+                    }
+                }),
+                "malformed route parameter: {}",
+                route.path
+            );
+            assert!(
+                route_keys.insert((route.method, route.path)),
+                "duplicate route: {} {}",
+                route.method,
+                route.path
+            );
+
+            let concrete_path = format!("{API_PREFIX}{}", sample_path(route.path));
+            let Protocol::Protobuf(selected) = protocol_for(route.method, &concrete_path)
+                .unwrap_or_else(|error| {
+                    panic!("{} {} did not dispatch: {error}", route.method, route.path)
+                })
+            else {
+                panic!("{} {} did not select protobuf", route.method, route.path);
+            };
+            assert!(
+                std::ptr::eq(route, selected),
+                "{} {} dispatched to a different route",
+                route.method,
+                route.path
+            );
+            let query_path = format!("{concrete_path}?contract_test=1");
+            let Protocol::Protobuf(query_selected) =
+                protocol_for(route.method, &query_path).unwrap()
+            else {
+                panic!(
+                    "{} {} with a query did not select protobuf",
+                    route.method, route.path
+                );
+            };
+            assert!(
+                std::ptr::eq(route, query_selected),
+                "{} {} query dispatch selected a different route",
+                route.method,
+                route.path
+            );
+
+            match route.request {
+                RequestBody::None => {
+                    let request =
+                        prepare_rest_request(route.method, &concrete_path, None, None, None)
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "{} {} bodyless request failed: {error}",
+                                    route.method, route.path
+                                )
+                            });
+                    assert_eq!(
+                        request.protocol,
+                        RestProtocol::Protobuf,
+                        "{} {}",
+                        route.method,
+                        route.path
+                    );
+                    assert_eq!(
+                        request.accept,
+                        Some(PROTOBUF_MEDIA_TYPE),
+                        "{} {}",
+                        route.method,
+                        route.path
+                    );
+                    assert_eq!(
+                        request.content_type, None,
+                        "{} {}",
+                        route.method, route.path
+                    );
+                    assert_eq!(request.body, None, "{} {}", route.method, route.path);
+                }
+                RequestBody::Protobuf(encode) => {
+                    let validate = route
+                        .request_round_trip
+                        .expect("protobuf route must have a request round-trip validator");
+                    let encoded = encode(Value::Object(Map::new())).unwrap_or_else(|error| {
+                        panic!(
+                            "{} {} request encode failed: {error}",
+                            route.method, route.path
+                        )
+                    });
+                    validate(&encoded).unwrap_or_else(|error| {
+                        panic!(
+                            "{} {} request round trip failed: {error}",
+                            route.method, route.path
+                        )
+                    });
+                    let request = prepare_rest_request(
+                        route.method,
+                        &concrete_path,
+                        Some(Value::Object(Map::new())),
+                        None,
+                        None,
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{} {} request preparation failed: {error}",
+                            route.method, route.path
+                        )
+                    });
+                    assert_eq!(
+                        request.protocol,
+                        RestProtocol::Protobuf,
+                        "{} {}",
+                        route.method,
+                        route.path
+                    );
+                    assert_eq!(
+                        request.accept,
+                        Some(PROTOBUF_MEDIA_TYPE),
+                        "{} {}",
+                        route.method,
+                        route.path
+                    );
+                    assert_eq!(
+                        request.content_type.as_deref(),
+                        Some(PROTOBUF_MEDIA_TYPE),
+                        "{} {}",
+                        route.method,
+                        route.path
+                    );
+                    let prepared_body =
+                        request.body.expect("protobuf request body must be present");
+                    assert_eq!(prepared_body, encoded, "{} {}", route.method, route.path);
+                    validate(&prepared_body).unwrap_or_else(|error| {
+                        panic!(
+                            "{} {} prepared request round trip failed: {error}",
+                            route.method, route.path
+                        )
+                    });
+                }
+                RequestBody::Raw => {
+                    let raw = b"contract-test-raw-body".to_vec();
+                    let request = prepare_rest_request(
+                        route.method,
+                        &concrete_path,
+                        None,
+                        Some(raw.clone()),
+                        Some("application/x-contract-test"),
+                    )
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{} {} raw request failed: {error}",
+                            route.method, route.path
+                        )
+                    });
+                    assert_eq!(
+                        request.protocol,
+                        RestProtocol::Protobuf,
+                        "{} {}",
+                        route.method,
+                        route.path
+                    );
+                    assert_eq!(
+                        request.accept,
+                        Some(PROTOBUF_MEDIA_TYPE),
+                        "{} {}",
+                        route.method,
+                        route.path
+                    );
+                    assert_eq!(
+                        request.content_type.as_deref(),
+                        Some("application/x-contract-test"),
+                        "{} {}",
+                        route.method,
+                        route.path
+                    );
+                    assert_eq!(
+                        request.body.as_deref(),
+                        Some(raw.as_slice()),
+                        "{} {}",
+                        route.method,
+                        route.path
+                    );
+                }
+            }
+
+            match route.response {
+                Some((decode, shape)) => {
+                    let encode_default = route
+                        .response_fixture
+                        .expect("protobuf response route must have a generated response fixture");
+                    let wire = encode_default();
+                    let decoded = decode(&wire, shape).unwrap_or_else(|error| {
+                        panic!(
+                            "{} {} response decode failed: {error}",
+                            route.method, route.path
+                        )
+                    });
+                    let body = decode_response_body(route, &wire).unwrap_or_else(|error| {
+                        panic!(
+                            "{} {} response body decode failed: {error}",
+                            route.method, route.path
+                        )
+                    });
+                    let body: Value = serde_json::from_slice(&body).unwrap_or_else(|error| {
+                        panic!(
+                            "{} {} response JSON conversion failed: {error}",
+                            route.method, route.path
+                        )
+                    });
+                    match shape {
+                        ResponseShape::Object => {
+                            assert!(
+                                decoded.is_object(),
+                                "{} {} object response produced {decoded}",
+                                route.method,
+                                route.path
+                            );
+                            assert!(
+                                body.is_object(),
+                                "{} {} object response body produced {body}",
+                                route.method,
+                                route.path
+                            );
+                        }
+                        ResponseShape::Items => {
+                            assert!(
+                                decoded.is_array(),
+                                "{} {} list response produced {decoded}",
+                                route.method,
+                                route.path
+                            );
+                            assert!(
+                                body.is_array(),
+                                "{} {} list response body produced {body}",
+                                route.method,
+                                route.path
+                            );
+                        }
+                    }
+                }
+                None => {
+                    assert_eq!(
+                        decode_response_body(route, &[]).unwrap(),
+                        b"null",
+                        "{} {} bodyless response",
+                        route.method,
+                        route.path
+                    );
+                }
+            }
+        }
+
+        assert_eq!(route_keys.len(), ROUTES.len());
+        assert_eq!(
+            ROUTES.len(),
+            184,
+            "update this coverage assertion when the registered API changes"
+        );
+
+        assert_eq!(HEALTH_ROUTE.method, "GET");
+        assert_eq!(HEALTH_ROUTE.path, "/health");
+        let Protocol::Protobuf(health_route) = protocol_for("GET", "/health").unwrap() else {
+            panic!("health did not select protobuf");
+        };
+        assert!(std::ptr::eq(&HEALTH_ROUTE, health_route));
+        let Some((decode, shape)) = HEALTH_ROUTE.response else {
+            panic!("health must decode a protobuf response");
+        };
+        let health_wire = HEALTH_ROUTE
+            .response_fixture
+            .expect("health route must have a response fixture")();
+        let health_value = decode(&health_wire, shape).unwrap();
+        assert!(health_value.is_object());
+        assert!(finish_rest_response("GET", "/health", 200, &health_wire).is_ok());
+    }
 
     #[test]
     fn register_request_uses_protobuf_codec() {

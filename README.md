@@ -8,23 +8,52 @@ attachment handling, and WebRTC.
 
 The library builds as an `rlib`, `cdylib`, and `staticlib`. Rust consumers can
 use the safe [`Client`] facade and type-specific [`EventHandler`] callbacks;
-other languages can use the C ABI in `include/friendshub_core.h`.
+other languages can use the C ABI in `include/friendshub_core.h`. REST requests
+use the shared protobuf codec. Push events are delivered through registered
+callbacks, with durable events acknowledged explicitly after handling.
 
 ```rust,no_run
-use friendshub_core::{Client, client::method_ids};
-use serde_json::Value;
+use friendshub_core::Client;
+use serde::{Deserialize, Serialize};
+
+#[derive(Serialize)]
+struct LoginRequest {
+    fh_number: String,
+    password: String,
+    device_number: u32,
+}
+
+#[derive(Deserialize)]
+struct LoginResponse {
+    session_token: Option<String>,
+}
 
 let config = friendshub_core::config::Config::from_json(br#"{"db_path":"/tmp/friendshub-core.db"}"#)?;
 let client = Client::open(config)?;
-let version: Value = client.call_json(method_ids::VERSION, &serde_json::json!({}))?;
+let login: LoginResponse = client.auth_login(&LoginRequest {
+    fh_number: "FH-123456".into(),
+    password: "secret".into(),
+    device_number: 1,
+})?;
+let _account: serde_json::Value = client.auth_me()?;
 # Ok::<(), friendshub_core::error::Error>(())
 ```
+
+The typed facade exposes named methods for the REST, WebSocket, and RTC
+dispatcher operations; request and response types are application-defined
+Serde types. The lower-level `call_json` and `call_bytes` methods remain
+available for custom or newly added operations.
 
 Incoming events are pushed to a registered handler on a library-owned worker.
 Register an `EventHandler` with `Client::set_event_handler` before starting
 the websocket. Events produced before registration are queued internally and
 pushed when the handler is installed; durable events are restored after a
-restart until acknowledged.
+restart until acknowledged with `Client::ack_event`. There is no public event
+pull/next-event API.
+
+The C ABI also uses callbacks for results: the response bytes are borrowed only
+for the duration of the callback, then released by the library. C callers do
+not free library-owned result buffers.
 
 ## License
 
