@@ -1,6 +1,6 @@
 [package]
 name = "friendshub-core"
-version = "0.1.6"
+version = "0.1.7"
 edition = "2024"
 rust-version = "1.98"
 license = "AGPL-3.0-only"
@@ -44,9 +44,10 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1.0.154"
 
 # --- Database ---
-# sqlx 0.9: runtime and TLS features split. Bundled SQLite via sqlx-sqlite.
-sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls", "sqlite", "macros", "migrate"], optional = true }
-sqlx-sqlite = { version = "0.9.0", features = ["bundled"], optional = true }
+# sqlx 0.9: runtime and TLS features split; native SQLite is linked through SQLCipher.
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls", "_sqlite", "sqlx-sqlite", "macros", "migrate"], optional = true }
+sqlx-sqlite = { version = "0.9.0", optional = true }
+libsqlite3-sys = { version = "=0.37.0", default-features = false, features = ["bundled-sqlcipher-vendored-openssl"], optional = true }
 
 # --- Signal E2E crypto ---
 libsignal-protocol = { git = "https://github.com/signalapp/libsignal", tag = "v0.103.1", optional = true }
@@ -85,13 +86,31 @@ parking_lot = { version = "0.12.5", optional = true }
 crossbeam-channel = { version = "0.5.16", optional = true }
 once_cell = { version = "1.21.4", optional = true }
 zeroize = { version = "1.9.0", features = ["derive"], optional = true }
+fs2 = { version = "0.4.3", optional = true }
+libc = { version = "0.2", optional = true }
 chacha20poly1305 = { version = "0.11.0", optional = true }
 bytes = { version = "1", optional = true }
 
-# keyring 4.x is an all-in-one wrapper; use keyring-core/stores directly when
-# the application needs explicit control over the platform backend. Keep the
-# optional dependency disabled until the secure storage approach is selected.
-keyring = { version = "4.2.0", optional = true }
+# Secure platform stores are native-only; WASM keeps no key-store dependency.
+keyring-core = { version = "1", optional = true }
+sha2 = { version = "0.10.9", optional = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+zbus-secret-service-keyring-store = { version = "1", features = ["crypto-rust"], optional = true }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+apple-native-keyring-store = { version = "1", features = ["keychain"], optional = true }
+
+[target.'cfg(target_os = "ios")'.dependencies]
+apple-native-keyring-store = { version = "1", features = ["protected"], optional = true }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-native-keyring-store = { version = "1", optional = true }
+
+[target.'cfg(target_os = "android")'.dependencies]
+android-native-keyring-store = { version = "1", optional = true }
+ndk-context = { version = "0.1.1", optional = true }
+jni = { version = "0.21", optional = true }
 
 [build-dependencies]
 prost-build = "0.14.4"
@@ -100,14 +119,25 @@ prost-build = "0.14.4"
 default = ["native"]
 native = [
     "dep:anyhow",
+    "dep:keyring-core",
+    "dep:sha2",
+    "dep:zbus-secret-service-keyring-store",
+    "dep:apple-native-keyring-store",
+    "dep:windows-native-keyring-store",
+    "dep:android-native-keyring-store",
+    "dep:ndk-context",
+    "dep:jni",
     "dep:async-trait",
     "dep:base64",
     "dep:bytes",
     "dep:chacha20poly1305",
     "dep:crossbeam-channel",
     "dep:futures",
+    "dep:fs2",
     "dep:hex",
+    "dep:libc",
     "dep:libsignal-protocol",
+    "dep:libsqlite3-sys",
     "dep:once_cell",
     "dep:parking_lot",
     "dep:rand",
@@ -130,7 +160,59 @@ native = [
     "dep:zeroize",
 ]
 wasm = []
-keyring = ["native", "dep:keyring"]
+# Integration tests that exercise file-backed clients opt into the volatile
+# keyring mock explicitly; normal/release builds always use the OS store.
+test-keyring = ["native"]
+
+[[test]]
+name = "avatar_upload_flow"
+path = "tests/avatar_upload_flow.rs"
+required-features = ["test-keyring"]
+
+[[test]]
+name = "bot_api"
+path = "tests/bot_api.rs"
+required-features = ["test-keyring"]
+
+[[test]]
+name = "db_encryption"
+path = "tests/db_encryption.rs"
+required-features = ["test-keyring"]
+
+[[test]]
+name = "db_entrypoints"
+path = "tests/db_entrypoints.rs"
+required-features = ["test-keyring"]
+
+[[test]]
+name = "group_sender_key_regressions"
+path = "tests/group_sender_key_regressions.rs"
+required-features = ["test-keyring"]
+
+[[test]]
+name = "push_callbacks"
+path = "tests/push_callbacks.rs"
+required-features = ["test-keyring"]
+
+[[test]]
+name = "rest_protobuf"
+path = "tests/rest_protobuf.rs"
+required-features = ["test-keyring"]
+
+[[test]]
+name = "rest_protobuf_parity"
+path = "tests/rest_protobuf_parity.rs"
+required-features = ["test-keyring"]
+
+[[test]]
+name = "typed_client"
+path = "tests/typed_client.rs"
+required-features = ["test-keyring"]
+
+[[test]]
+name = "websocket_push"
+path = "tests/websocket_push.rs"
+required-features = ["test-keyring"]
 
 [profile.release]
 lto = "thin"

@@ -122,6 +122,13 @@ const char *fh_abi_string(void);
 uint32_t fh_abi_version(void);
 
 /**
+ * Registers a process-lifetime JavaVM and global application context reference.
+ * Returns 0 on success, -1 on failure, and -2 on non-Android targets.
+ */
+int32_t fh_android_init(void *java_vm, void *application_context_global_ref);
+
+
+/**
  * Installs per-event callbacks, or clears callbacks when `callbacks` is null.
  * Events produced while no callback is installed are queued and pushed to
  * the next registered handler. The event view and JSON bytes are owned by

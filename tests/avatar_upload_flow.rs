@@ -27,6 +27,9 @@ mod http_fixture;
 
 use http_fixture::CapturedRequest;
 
+#[path = "support/keyring.rs"]
+mod keyring;
+
 #[tokio::test(flavor = "current_thread")]
 async fn account_avatar_upload_uses_protobuf_storage_put_and_finalize() {
     let api_listener = loopback_listener();
@@ -149,6 +152,7 @@ async fn avatar_finalize_404_restarts_init_and_storage_upload_once() {
 async fn setup_state(
     api_address: std::net::SocketAddr,
 ) -> (Arc<ActorState>, db::Db, PathBuf, PathBuf) {
+    keyring::use_memory_keyring();
     let database_path = unique_path("db", "sqlite");
     let avatar_path = unique_path("avatar", "webp");
     std::fs::write(&avatar_path, WEBP_BYTES).expect("write local WebP fixture");

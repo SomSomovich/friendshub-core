@@ -118,6 +118,7 @@ mod tests {
 
     #[tokio::test]
     async fn failed_envelope_receipt_keeps_the_durable_event_for_retry() {
+        crate::db::key_store::use_test_keyring();
         let db_path = std::env::temp_dir().join(format!(
             "friendshub-core-ack-retry-{}.sqlite",
             uuid::Uuid::new_v4()

@@ -9,6 +9,8 @@ configuration, the full method id table, and worked examples.
 uint32_t fh_abi_version(void);
 const char* fh_abi_string(void);
 
+int32_t fh_android_init(void* java_vm, void* application_context_global_ref);
+
 int32_t fh_init(
     const uint8_t* config_json, size_t config_len,
     struct FH_FhHandle** out_handle,
@@ -54,6 +56,56 @@ result.
 the duration of the function call. The library deserializes configuration and
 copies request bytes into library-owned storage before the call returns; the
 caller may then reuse or release its input storage.
+
+## Android application context
+
+Before calling `fh_init` or Rust `Client::open` on Android, the host must call
+`fh_android_init(java_vm, application_context_global_ref)`. Obtain `JavaVM*`
+with JNI `GetJavaVM`; obtain the application context with
+`Context.getApplicationContext()`, then create a global reference using
+`JNIEnv::NewGlobalRef`. Pass that global reference, never a local reference or
+an Activity. Both pointers must remain valid for the process lifetime; the
+host owns the reference and must not call `DeleteGlobalRef` while core can run.
+The host must let this bridge exclusively manage `ndk-context` initialization
+and must not initialize/release that crate independently.
+
+The bridge is synchronous and serializes initialization against core startup.
+It returns `0` on success, `-1` on invalid arguments, JNI failure, or conflicting
+initialization, and `-2` on native platforms other than Android. It is available
+on every native target without changing ABI version 3 or existing layouts.
+Repeated registration of the same Java application context is idempotent only
+before any successful core open, including different global references to the
+same object. After a successful core open, every initialization call returns an
+error, including registration of the same context. A different context is
+always rejected, including before the first core open. Core startup requires
+registration; a failed startup does not mark a handle as successfully opened,
+and dropping its guard releases the in-progress reservation before retrying.
+Core never transfers database key bytes to the host.
+
+## Native database encryption
+
+The library encrypts every native SQLite page with SQLCipher and stores the
+random 256-bit database key in the platform secure credential store. The host
+continues to supply only `db_path`; it does not allocate, pass, or free key
+material. Native startup requires the relevant system store: Linux Secret
+Service must be available in the user's session, macOS uses Keychain, iOS uses
+protected storage, Windows uses Credential Manager, and Android uses Keystore
+after the context bridge above has been initialized. An unavailable or locked
+store causes startup to return an error; there is no plaintext fallback.
+
+The library creates a new database as SQLCipher from its first page. Existing
+plaintext SQLite files are rejected unchanged on every native platform. There
+is no import, conversion, or plaintext fallback; point the client at a new
+database path if a plaintext file already exists. Existing encrypted or
+otherwise unrecognized files require their matching secure-store key and are
+never replaced when that key is missing or invalid.
+
+The secure-store key is identified by the normalized database path. Moving or
+renaming the database, changing OS accounts, or moving it to another device
+requires a future explicit re-key/import operation. Logout leaves the key in
+the secure store. The library cannot promise forensic erasure of plaintext
+data retained in backups, filesystem snapshots, copy-on-write storage, or
+flash media.
 
 ## Configuration
 

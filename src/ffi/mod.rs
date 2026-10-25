@@ -45,6 +45,40 @@ pub extern "C" fn fh_abi_string() -> *const c_char {
     ABI_STRING.as_ptr() as *const c_char
 }
 
+/// Registers the Android application context before core startup.
+/// Returns 0 on success, -1 on failure, and -2 on non-Android targets.
+///
+/// # Safety
+/// On Android, java_vm must be a valid JavaVM pointer and the context must be
+/// a JNI global reference to the application context. Both must remain valid
+/// for the process lifetime. The host must not initialize/release ndk-context.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fh_android_init(
+    java_vm: *mut c_void,
+    application_context_global_ref: *mut c_void,
+) -> i32 {
+    guard(-1, || {
+        #[cfg(target_os = "android")]
+        {
+            // SAFETY: forwarded from this function's host pointer contract.
+            match unsafe {
+                db::key_store::android::initialize_android_context(
+                    java_vm,
+                    application_context_global_ref,
+                )
+            } {
+                Ok(()) => 0,
+                Err(_) => -1,
+            }
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            let _ = (java_vm, application_context_global_ref);
+            -2
+        }
+    })
+}
+
 /// Initialises a handle for one account and supplies any result through a
 /// synchronous callback borrow. On success the result is empty; on failure it
 /// is a JSON error object. The result memory is owned and released by the
@@ -104,6 +138,12 @@ unsafe fn init_inner(
             Err(e) => return error_result(&e),
         };
 
+        #[cfg(target_os = "android")]
+        let android_open_guard = match db::key_store::android::begin_core_open() {
+            Ok(open_guard) => open_guard,
+            Err(error) => return error_result(&error),
+        };
+
         crate::logging::init_once(&cfg.log_level, &cfg.log_format);
 
         let events = Arc::new(EventQueue::new());
@@ -131,6 +171,9 @@ unsafe fn init_inner(
             Ok(actor) => actor,
             Err(error) => return error_result(&error),
         };
+
+        #[cfg(target_os = "android")]
+        android_open_guard.commit();
 
         let handle = Box::new(FhHandle::new(actor, events));
         // SAFETY: out_handle was checked non-null and is writable by contract.
@@ -435,5 +478,58 @@ mod tests {
                 .expect("error payload is UTF-8 JSON")
                 .contains("db_path")
         );
+    }
+
+    #[test]
+    fn init_inner_fails_closed_without_a_database_key_and_keeps_handle_null() {
+        crate::db::key_store::use_test_keyring();
+        let database_path = std::env::temp_dir().join(format!(
+            "friendshub-ffi-missing-key-{}-{}.db",
+            std::process::id(),
+            uuid::Uuid::new_v4()
+        ));
+        let encrypted_or_unknown = b"unknown encrypted database bytes";
+        std::fs::write(&database_path, encrypted_or_unknown).unwrap();
+        let config = serde_json::to_vec(&serde_json::json!({
+            "db_path": database_path,
+            "api_base": "http://127.0.0.1:1",
+            "ws_url": "ws://127.0.0.1:1",
+            "discovery": { "enabled": false },
+            "log_level": "off",
+            "log_format": "text"
+        }))
+        .unwrap();
+        let mut handle: *mut FhHandle = std::ptr::null_mut();
+
+        // SAFETY: the config and output pointers remain valid for the call.
+        let (status, error) = unsafe { init_inner(config.as_ptr(), config.len(), &mut handle) };
+
+        assert_eq!(status, 1);
+        assert!(handle.is_null());
+        assert!(!error.is_empty());
+        let error_json: serde_json::Value = serde_json::from_slice(&error).unwrap();
+        assert_eq!(error_json["code"], "database");
+
+        let mut ffi_handle: *mut FhHandle = std::ptr::null_mut();
+        let mut captured = CapturedResult::default();
+        // SAFETY: config, output, and callback context are valid for the
+        // synchronous C ABI call; callback bytes are copied before return.
+        let ffi_status = unsafe {
+            fh_init(
+                config.as_ptr(),
+                config.len(),
+                &mut ffi_handle,
+                capture_result,
+                (&mut captured as *mut CapturedResult).cast(),
+            )
+        };
+        assert_eq!(ffi_status, 1);
+        assert!(ffi_handle.is_null());
+        assert_eq!(captured.status, 1);
+        assert!(!captured.bytes.is_empty());
+        let callback_error: serde_json::Value = serde_json::from_slice(&captured.bytes).unwrap();
+        assert_eq!(callback_error["code"], "database");
+        assert_eq!(std::fs::read(&database_path).unwrap(), encrypted_or_unknown);
+        let _ = std::fs::remove_file(database_path);
     }
 }

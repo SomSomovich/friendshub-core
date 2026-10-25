@@ -24,6 +24,9 @@ mod http_fixture;
 
 use http_fixture::CapturedRequest;
 
+#[path = "support/keyring.rs"]
+mod keyring;
+
 impl CapturedRequest {
     fn path_and_query(&self) -> (&str, HashMap<String, String>) {
         let (path, query) = self.target.split_once('?').unwrap_or((&self.target, ""));
@@ -606,6 +609,7 @@ fn answer_callback_query_sends_json_and_accepts_no_content() {
 }
 
 fn open_client(address: std::net::SocketAddr, database_path: &PathBuf) -> Client {
+    keyring::use_memory_keyring();
     Client::open(Config {
         db_path: database_path.clone(),
         api_base: format!("http://{address}"),

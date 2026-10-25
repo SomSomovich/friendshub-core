@@ -30,8 +30,11 @@ pub struct Client {
 
 impl Client {
     /// Opens a client, resolves configured service URLs, and applies database
-    /// migrations before returning.
+    /// schema migrations before returning.
     pub fn open(config: Config) -> Result<Self> {
+        #[cfg(target_os = "android")]
+        let android_open_guard = db::key_store::android::begin_core_open()?;
+
         crate::logging::init_once(&config.log_level, &config.log_format);
         let events = Arc::new(EventQueue::new());
         let actor_events = events.clone();
@@ -51,6 +54,10 @@ impl Client {
                 Ok(ActorState::new_with_events(config, db, http, actor_events))
             })
         })?;
+
+        #[cfg(target_os = "android")]
+        android_open_guard.commit();
+
         Ok(Self { actor, events })
     }
 

@@ -55,6 +55,35 @@ The C ABI also uses callbacks for results: the response bytes are borrowed only
 for the duration of the callback, then released by the library. C callers do
 not free library-owned result buffers.
 
+## Native database security
+
+The native client encrypts the complete SQLite database with SQLCipher. The
+library creates and retains its 256-bit database key in the operating system's
+secure credential store; clients only provide `db_path` and never receive key
+bytes. Native builds require an available secure store: Secret Service in the
+Linux desktop session, Keychain on macOS, protected storage on iOS, Credential
+Manager on Windows, or Keystore on Android. If the store is missing, locked, or
+unavailable, opening the client fails instead of creating or opening a
+plaintext database.
+
+On Android, the host must call `fh_android_init(JavaVM*, application_context)`
+before `fh_init` or `Client::open`. The host keeps the application-context
+global reference alive for the process lifetime. See [the C ABI reference](docs/ffi.md)
+for the exact JNI setup and ownership contract.
+
+The library creates a new database as SQLCipher from its first page. Existing
+plaintext SQLite files are rejected unchanged on every native platform; there
+is no import, conversion, or plaintext fallback. Use a new database path if a
+plaintext file already exists there. Existing encrypted or otherwise
+unrecognized files require their matching secure-store key; the library never
+replaces them when that key is unavailable or wrong.
+
+The key is bound to the normalized database path. Moving or renaming the file,
+or moving it to another OS account or device, requires a future explicit
+re-key/import operation. Logging out does not delete the key. The library
+cannot promise forensic erasure of plaintext data retained in backups,
+snapshots, copy-on-write filesystems, or flash storage.
+
 ## License
 
 AGPL-3.0-only.
@@ -91,6 +120,11 @@ For the browser binding, install `wasm-pack` (for example,
 binding and generates the browser ES module glue and package metadata. The
 ready-to-import package is written to `target/wasm-browser/`. `all` runs this
 step only after the native `cargo zigbuild` release succeeds.
+
+Run the full native suite, including file-backed client integration tests,
+with `cargo test --locked --all-targets --features test-keyring`. That explicit
+test-only feature installs an in-memory keyring for those tests; normal and
+release builds select the operating system's secure store.
 
 ## C header
 

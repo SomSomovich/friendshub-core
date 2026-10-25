@@ -1,8 +1,10 @@
+use std::future::Future;
 use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 
 use futures::future::BoxFuture;
+use tokio::runtime::Runtime;
 use tokio::sync::mpsc;
 use tokio::task::LocalSet;
 
@@ -18,7 +20,7 @@ use crate::webrtc::WebRtcManager;
 /// the sender and letting the socket die with the process.
 pub enum ActorMessage {
     Call(Request),
-    Shutdown(crossbeam_channel::Sender<()>),
+    Shutdown,
 }
 
 pub struct Request {
@@ -29,6 +31,8 @@ pub struct Request {
 
 pub struct Actor {
     tx: mpsc::UnboundedSender<ActorMessage>,
+    thread_done: crossbeam_channel::Receiver<()>,
+    thread: Option<thread::JoinHandle<()>>,
 }
 
 pub struct ActorState {
@@ -38,6 +42,17 @@ pub struct ActorState {
     pub ws: Arc<WsClient>,
     pub events: Arc<EventQueue>,
     pub webrtc: Arc<WebRtcManager>,
+}
+
+fn run_local_set<F>(runtime: &Runtime, local: LocalSet, future: F)
+where
+    F: Future<Output = ()>,
+{
+    runtime.block_on(async move {
+        local.run_until(future).await;
+        drop(local);
+        tokio::task::yield_now().await;
+    });
 }
 
 impl ActorState {
@@ -69,8 +84,9 @@ impl Actor {
     {
         let (tx, rx) = mpsc::unbounded_channel::<ActorMessage>();
         let (init_tx, init_rx) = crossbeam_channel::bounded::<Result<()>>(1);
+        let (thread_done_tx, thread_done) = crossbeam_channel::bounded::<()>(1);
 
-        thread::Builder::new()
+        let thread = thread::Builder::new()
             .name("friendshub-core".into())
             .spawn(move || {
                 let rt = match tokio::runtime::Builder::new_current_thread()
@@ -85,7 +101,7 @@ impl Actor {
                 };
 
                 let local = LocalSet::new();
-                rt.block_on(local.run_until(async move {
+                run_local_set(&rt, local, async move {
                     let state = match init().await {
                         Ok(s) => s,
                         Err(e) => {
@@ -123,14 +139,26 @@ impl Actor {
                     drop(init_tx);
 
                     run(rx, state).await;
-                }));
+                });
+                drop(rt);
+                let _ = thread_done_tx.send(());
             })
             .map_err(|e| Error::SpawnThread(e.to_string()))?;
 
         match init_rx.recv() {
-            Ok(Ok(())) => Ok(Self { tx }),
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(Error::ActorClosed),
+            Ok(Ok(())) => Ok(Self {
+                tx,
+                thread_done,
+                thread: Some(thread),
+            }),
+            Ok(Err(e)) => {
+                let _ = thread.join();
+                Err(e)
+            }
+            Err(_) => {
+                let _ = thread.join();
+                Err(Error::ActorClosed)
+            }
         }
     }
 
@@ -150,12 +178,16 @@ impl Actor {
 
 impl Drop for Actor {
     fn drop(&mut self) {
-        // Ask the actor thread to close the websocket and stop. The wait is
-        // bounded: if the thread is stuck on a request, do not hold the
-        // process open for it.
-        let (done_tx, done_rx) = crossbeam_channel::bounded(1);
-        if self.tx.send(ActorMessage::Shutdown(done_tx)).is_ok() {
-            let _ = done_rx.recv_timeout(Duration::from_secs(2));
+        // The completion signal arrives after LocalSet and Tokio runtime
+        // teardown, because SQLx connections can be returned while tasks drop.
+        let _ = self.tx.send(ActorMessage::Shutdown);
+        match self.thread_done.recv_timeout(Duration::from_secs(2)) {
+            Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
+                if let Some(thread) = self.thread.take() {
+                    let _ = thread.join();
+                }
+            }
+            Err(crossbeam_channel::RecvTimeoutError::Timeout) => {}
         }
     }
 }
@@ -170,11 +202,73 @@ async fn run(mut rx: mpsc::UnboundedReceiver<ActorMessage>, state: Arc<ActorStat
                     let _ = req.reply.send(result);
                 });
             }
-            ActorMessage::Shutdown(done) => {
+            ActorMessage::Shutdown => {
                 let _ = state.ws.stop().await;
-                let _ = done.send(());
                 break;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::panic::{AssertUnwindSafe, catch_unwind};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use tokio::sync::oneshot;
+
+    struct ConnectionDropProbe {
+        _connection: sqlx::pool::PoolConnection<sqlx::Sqlite>,
+        saw_tokio_context: Arc<AtomicBool>,
+    }
+
+    impl Drop for ConnectionDropProbe {
+        fn drop(&mut self) {
+            self.saw_tokio_context.store(
+                tokio::runtime::Handle::try_current().is_ok(),
+                Ordering::SeqCst,
+            );
+        }
+    }
+
+    #[test]
+    fn local_task_pool_connections_drop_inside_the_tokio_context() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let pool = runtime
+            .block_on(
+                sqlx::sqlite::SqlitePoolOptions::new()
+                    .max_connections(1)
+                    .connect("sqlite::memory:"),
+            )
+            .unwrap();
+        let pool_for_task = pool.clone();
+        let saw_tokio_context = Arc::new(AtomicBool::new(false));
+        let context_probe = saw_tokio_context.clone();
+        let (started_tx, started_rx) = oneshot::channel();
+        let local = LocalSet::new();
+        let actor = async move {
+            tokio::task::spawn_local(async move {
+                let connection = pool_for_task.acquire().await.unwrap();
+                let _connection = ConnectionDropProbe {
+                    _connection: connection,
+                    saw_tokio_context: context_probe,
+                };
+                let _ = started_tx.send(());
+                std::future::pending::<()>().await;
+            });
+            started_rx.await.unwrap();
+        };
+
+        let teardown = catch_unwind(AssertUnwindSafe(|| run_local_set(&runtime, local, actor)));
+        runtime.block_on(pool.close());
+        assert!(teardown.is_ok(), "local actor task teardown panicked");
+        assert!(
+            saw_tokio_context.load(Ordering::SeqCst),
+            "local actor task was dropped after leaving the Tokio context"
+        );
     }
 }

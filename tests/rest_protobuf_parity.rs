@@ -24,8 +24,12 @@ mod http_fixture;
 
 use http_fixture::CapturedRequest;
 
+#[path = "support/keyring.rs"]
+mod keyring;
+
 #[tokio::test(flavor = "current_thread")]
 async fn authenticated_contact_wrapper_uses_protobuf_and_keeps_json_and_raw_fallbacks() {
+    keyring::use_memory_keyring();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback fixture");
     listener
         .set_nonblocking(true)

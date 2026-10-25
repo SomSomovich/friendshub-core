@@ -19,6 +19,9 @@ mod http_fixture;
 
 use http_fixture::CapturedRequest;
 
+#[path = "support/keyring.rs"]
+mod keyring;
+
 #[derive(Serialize)]
 struct LoginRequest {
     fh_number: String,
@@ -28,6 +31,7 @@ struct LoginRequest {
 
 #[test]
 fn public_login_wrapper_uses_protobuf_http_and_decodes_protobuf_responses() {
+    keyring::use_memory_keyring();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback fixture");
     let address = listener.local_addr().expect("fixture address");
     let server = thread::spawn(move || -> io::Result<()> {

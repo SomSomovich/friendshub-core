@@ -17,6 +17,9 @@ use friendshub_core::runtime::ActorState;
 use friendshub_core::transport::HttpClient;
 use prost::Message;
 
+#[path = "support/keyring.rs"]
+mod keyring;
+
 static NEXT_DATABASE_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug)]
@@ -36,6 +39,7 @@ impl CapturedRequest {
 
 #[tokio::test(flavor = "current_thread")]
 async fn group_sender_key_apis_resolve_members_from_authenticated_server_conversation() {
+    keyring::use_memory_keyring();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback fixture");
     listener
         .set_nonblocking(true)
@@ -192,6 +196,7 @@ async fn group_sender_key_apis_resolve_members_from_authenticated_server_convers
 
 #[tokio::test(flavor = "current_thread")]
 async fn concurrent_first_use_returns_only_the_persisted_distribution_id() {
+    keyring::use_memory_keyring();
     let database_path = unique_database_path();
     let database = db::pool::open(&database_path)
         .await

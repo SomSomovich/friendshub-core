@@ -18,6 +18,9 @@ mod http_fixture;
 
 use http_fixture::CapturedRequest;
 
+#[path = "support/keyring.rs"]
+mod keyring;
+
 #[derive(Serialize)]
 struct LoginRequest {
     fh_number: String,
@@ -40,6 +43,7 @@ struct Account {
 
 #[test]
 fn named_native_methods_serialize_requests_and_decode_owned_responses() {
+    keyring::use_memory_keyring();
     let listener = TcpListener::bind("127.0.0.1:0").expect("bind local HTTP fixture");
     let address = listener.local_addr().expect("fixture address");
     let server = thread::spawn(move || -> io::Result<()> {
