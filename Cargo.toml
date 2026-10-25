@@ -1,6 +1,6 @@
 [package]
 name = "friendshub-core"
-version = "0.1.7"
+version = "0.1.8"
 edition = "2024"
 rust-version = "1.98"
 license = "AGPL-3.0-only"
@@ -159,7 +159,7 @@ native = [
     "dep:webpki-roots",
     "dep:zeroize",
 ]
-wasm = []
+wasm = ["dep:chacha20poly1305", "dep:hex", "dep:rand"]
 # Integration tests that exercise file-backed clients opt into the volatile
 # keyring mock explicitly; normal/release builds always use the OS store.
 test-keyring = ["native"]

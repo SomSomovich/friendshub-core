@@ -17,9 +17,9 @@ use wasm_bindgen::JsValue;
 
 pub use api::{
     clear_identity_changes, create_sender_key_distribution, decrypt, encrypt, establish_session,
-    generate_identity, generate_prekeys, group_decrypt, group_encrypt, identity_changes,
-    load_identity, local_identity_public, ping, prekey_counts, process_sender_key_distribution,
-    reset, restore, snapshot,
+    generate_identity, generate_prekeys, group_decrypt, group_encrypt, has_session,
+    identity_changes, load_identity, local_identity_public, ping, prekey_counts,
+    process_sender_key_distribution, reset, restore, snapshot,
 };
 
 /// Keeps the legacy generated WASM package's startup export and panic diagnostics.

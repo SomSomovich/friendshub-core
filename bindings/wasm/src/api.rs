@@ -11,6 +11,8 @@ use wasm_bindgen::prelude::*;
 use wasm_bindgen_futures::JsFuture;
 use web_sys::AbortSignal;
 
+mod messaging;
+
 #[wasm_bindgen]
 pub struct BrowserApi {
     api_base: String,
@@ -78,6 +80,77 @@ impl BrowserApi {
     #[wasm_bindgen(js_name = setMutationCallback)]
     pub fn set_mutation_callback(&mut self, callback: Option<Function>) {
         self.mutation_callback = callback;
+    }
+}
+
+#[wasm_bindgen]
+impl BrowserApi {
+    /// Encrypts one payload for a peer device. A fresh one-time prekey bundle
+    /// is fetched and consumed only when no Signal session exists locally.
+    /// The result uses WEB's `{ ciphertextHex, isPrekeyMessage }` contract.
+    #[wasm_bindgen(js_name = encryptForDevice)]
+    pub async fn encrypt_for_device(
+        &self,
+        account_id: String,
+        peer_account_id: String,
+        peer_device_number: u32,
+        local_device_number: u32,
+        plaintext_hex: String,
+    ) -> Result<JsValue, JsValue> {
+        let active_device = self
+            .device_number
+            .ok_or_else(|| js_error("an authenticated device number is required"))?;
+        if active_device != local_device_number {
+            return Err(js_error(
+                "local_device_number does not match the authenticated device",
+            ));
+        }
+        hex::decode(&plaintext_hex).map_err(|error| js_error(&error.to_string()))?;
+
+        if !crate::signal::has_session(&account_id, &peer_account_id, peer_device_number)? {
+            let bundle = self
+                .get_peer_bundle(peer_account_id.clone(), peer_device_number)
+                .await?;
+            let bundle = super::js_value_to_json(bundle).map_err(|error| error.into_js())?;
+            let bundle =
+                serde_json::to_string(&bundle).map_err(|error| js_error(&error.to_string()))?;
+            crate::signal::establish_session(
+                &account_id,
+                &peer_account_id,
+                peer_device_number,
+                local_device_number,
+                &bundle,
+            )?;
+        }
+
+        let encrypted = crate::signal::encrypt(
+            &account_id,
+            &peer_account_id,
+            peer_device_number,
+            local_device_number,
+            &plaintext_hex,
+        )?;
+        let encrypted =
+            serde_json::from_str(&encrypted).map_err(|error| js_error(&error.to_string()))?;
+        json_to_js(&snake_case_to_camel_json(encrypted))
+    }
+
+    /// Builds WEB's encrypted message payload with the stable message id and
+    /// Unix-seconds timestamp supplied by the caller. Returns UTF-8 JSON hex,
+    /// ready for the Signal encrypt operation.
+    #[wasm_bindgen(js_name = buildMessagePayload)]
+    pub fn build_message_payload(
+        &self,
+        message_id: String,
+        draft: JsValue,
+        created_at: f64,
+    ) -> Result<String, JsValue> {
+        let draft = super::js_value_to_json(draft).map_err(|error| error.into_js())?;
+        let payload = messaging::build_message_payload(&message_id, &draft, created_at)
+            .map_err(|error| js_error(&error))?;
+        let serialized =
+            serde_json::to_vec(&payload).map_err(|error| js_error(&error.to_string()))?;
+        Ok(hex::encode(serialized))
     }
 }
 

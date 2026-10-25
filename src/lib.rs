@@ -13,7 +13,7 @@ pub mod bot_api;
 pub mod client;
 #[cfg(feature = "native")]
 pub mod config;
-#[cfg(feature = "native")]
+#[cfg(any(feature = "native", feature = "wasm"))]
 pub mod crypto;
 #[cfg(feature = "native")]
 pub mod db;

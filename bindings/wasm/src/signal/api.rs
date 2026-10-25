@@ -352,6 +352,29 @@ pub fn establish_session(
     })
 }
 
+/// Returns whether the account store has an outbound Signal session record for
+/// one peer device. The browser API uses this only to decide whether the
+/// server's single-use prekey bundle must be fetched before encryption.
+#[wasm_bindgen]
+pub fn has_session(
+    account_id: &str,
+    peer_account_id: &str,
+    peer_device_number: u32,
+) -> JsResult<bool> {
+    require_account_id(account_id)?;
+    if peer_account_id.trim().is_empty() {
+        return Err(js_err("peer_account_id must not be empty"));
+    }
+    device_id(peer_device_number, "peer device number")?;
+    Ok(with_store(account_id, |store| {
+        store
+            .inner
+            .borrow()
+            .sessions
+            .contains_key(&(peer_account_id.to_owned(), peer_device_number))
+    }))
+}
+
 /// Encrypts bytes (encoded as hex) for one peer device. The result JSON matches
 /// `src/wasm/types.ts` after the existing facade maps snake_case to camelCase.
 #[wasm_bindgen]
@@ -718,6 +741,7 @@ mod tests {
         });
 
         establish_session(&alice, &bob, 1, 1, &bundle.to_string()).expect("session establishment");
+        assert!(has_session(&alice, &bob, 1).expect("session lookup"));
         let first = parsed_json(&encrypt(&alice, &bob, 1, 1, &hex::encode("привет")).unwrap());
         assert_eq!(first["is_prekey_message"], true);
         let opened = decrypt(

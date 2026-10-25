@@ -17,11 +17,13 @@ use web_sys::{
 };
 
 mod api;
+mod attachments;
 mod calls;
 mod push;
 pub mod signal;
 mod webrtc;
 pub use api::BrowserApi;
+pub use attachments::{generate_attachment_key, open_chunk, seal_chunk};
 pub use calls::BrowserCallManager;
 pub use push::BrowserPushClient;
 pub use signal::*;

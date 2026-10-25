@@ -137,13 +137,20 @@ for release if they are currently executing.
 
 ## Signal Protocol
 
-The crate exports the existing WEB bridge operations for identity and prekey
-management, session establishment, pairwise encrypt/decrypt, sender-key group
-messages, identity-change tracking, and snapshot/restore. Each operation takes
-an `account_id` and uses an in-memory Rust Signal store. Persist `snapshot()`
-through WEB's existing IndexedDB layer and call `restore()` on startup; call
-`reset()` to release one account's Rust-side state. No Signal private key or
-store buffer needs to be freed by JavaScript.
+The crate exports WEB's Signal operations for identity and prekey management,
+session establishment, pairwise encrypt/decrypt, sender-key group messages,
+identity-change tracking, and snapshot/restore. `BrowserApi.encryptForDevice`
+combines the session check, authenticated prekey-bundle request, session setup,
+and pairwise encryption for one peer device. `BrowserApi.buildMessagePayload`
+constructs the established WEB message payload contract. Both use the same
+in-memory Rust Signal store exposed by the low-level operations. Persist
+`snapshot()` through WEB's existing IndexedDB layer and call `restore()` on
+startup; call `reset()` to release one account's Rust-side state. No Signal
+private key or store buffer needs to be freed by JavaScript.
+
+Attachment key generation and chunk sealing/opening use the core's shared
+ChaCha20-Poly1305 implementation. The browser binding keeps the existing JSON
+key shape and `Uint8Array` chunk boundary.
 
 ## BrowserRtcManager
 
