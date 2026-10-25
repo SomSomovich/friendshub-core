@@ -12,6 +12,8 @@
 use std::time::Duration;
 
 use sqlx::SqlitePool;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use crate::util::time::now_unix;
 
@@ -20,19 +22,19 @@ const NOTIFIED_IDENTITY_TTL_SECS: i64 = 30 * 86_400;
 const SWEEP_INTERVAL: Duration = Duration::from_secs(3600);
 
 /// Runs forever. Intended to be spawned once per handle.
-pub async fn run(db: SqlitePool) {
+pub async fn run(db: SqlitePool, crypto_state_lock: Arc<Mutex<()>>) {
     let mut ticker = tokio::time::interval(SWEEP_INTERVAL);
     ticker.tick().await; // skip the immediate fire
 
     loop {
         ticker.tick().await;
-        if let Err(e) = sweep(&db).await {
+        if let Err(e) = sweep(&db, &crypto_state_lock).await {
             tracing::warn!(error = ?e, "cleanup sweep failed");
         }
     }
 }
 
-async fn sweep(db: &SqlitePool) -> Result<(), sqlx::Error> {
+async fn sweep(db: &SqlitePool, crypto_state_lock: &Mutex<()>) -> Result<(), sqlx::Error> {
     let now = now_unix();
 
     let cutoff = now - PENDING_EVENT_TTL_SECS;
@@ -48,6 +50,7 @@ async fn sweep(db: &SqlitePool) -> Result<(), sqlx::Error> {
     }
 
     let cutoff = now - NOTIFIED_IDENTITY_TTL_SECS;
+    let _crypto_guard = crypto_state_lock.lock().await;
     let identity =
         sqlx::query("DELETE FROM identity_changes WHERE notified = 1 AND changed_at < ?")
             .bind(cutoff)

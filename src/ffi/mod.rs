@@ -19,7 +19,10 @@ pub mod events;
 pub mod handle;
 pub mod panic;
 
-pub use events::{FhEventCallback, FhEventCallbacks, FhEventView};
+pub use events::{
+    FH_EVENT_CALLBACKS_V2_ABI_VERSION, FhEventCallback, FhEventCallbacks, FhEventCallbacksV2,
+    FhEventView,
+};
 
 /// Receives a synchronous result from `fh_init` or `fh_call`. `data` is
 /// borrowed until the callback returns.
@@ -259,6 +262,58 @@ pub unsafe extern "C" fn fh_set_event_callbacks(
         }
         if let Err(error) = inner.activate_event_push() {
             tracing::warn!(%error, "could not activate event callbacks");
+            return 1;
+        }
+        0
+    })
+}
+
+/// Registers the size/versioned V2 callback table, including semantic events
+/// for decrypted messages, actions, calls, attachments, and history transfer.
+///
+/// The original `fh_set_event_callbacks` and `FhEventCallbacks` layout are
+/// unchanged. V2 callbacks receive the same library-owned borrowed event view;
+/// durable IDs remain valid for `fh_ack_event` and must be acknowledged only
+/// after the caller has persisted the event. In particular, history chunks
+/// must remain unacknowledged until the reassembled history item is committed.
+///
+/// # Safety
+///
+/// - `handle` must be a live handle returned by `fh_init`.
+/// - `callbacks` must be null or point to a readable V2 header containing
+///   `struct_size` and `abi_version`. If those fields identify a supported V2
+///   table, the entire region described by `struct_size` must be readable.
+/// - `user_data` must remain valid through callback completion, following the
+///   same replacement, unregister, and destruction rules as the legacy API.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn fh_set_event_callbacks_v2(
+    handle: *mut FhHandle,
+    callbacks: *const FhEventCallbacksV2,
+    user_data: *mut c_void,
+) -> i32 {
+    guard(-1, || {
+        if handle.is_null() {
+            return -1;
+        }
+        // SAFETY: the caller promises a live handle.
+        let inner = unsafe { (&*handle).inner_arc() };
+        if callbacks.is_null() {
+            inner.clear_event_callbacks();
+            return 0;
+        }
+
+        // SAFETY: the public contract requires a readable fixed header and a
+        // readable full table whenever that header declares its full size.
+        let Some(callbacks) = (unsafe { events::copy_v2_callback_table(callbacks) }) else {
+            return -1;
+        };
+        let handler = Arc::new(events::FfiEventHandler::new_v2(callbacks, user_data));
+        if let Err(error) = inner.set_event_callbacks(Some(handler)) {
+            tracing::warn!(%error, "could not start V2 callback worker");
+            return 1;
+        }
+        if let Err(error) = inner.activate_event_push() {
+            tracing::warn!(%error, "could not activate V2 event callbacks");
             return 1;
         }
         0

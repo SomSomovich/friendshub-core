@@ -111,6 +111,29 @@ typedef struct FH_FhEventCallbacks {
 } FH_FhEventCallbacks;
 
 /**
+ * Size/versioned callback table for semantic decrypted receive events.
+ * Initialize struct_size to sizeof(FH_FhEventCallbacksV2), abi_version to 2,
+ * and legacy to the existing callback table. The original callback structure
+ * and fh_set_event_callbacks ABI remain unchanged.
+ */
+#define FH_FH_EVENT_CALLBACKS_V2_ABI_VERSION 2u
+typedef struct FH_FhEventCallbacksV2 {
+    size_t struct_size;
+    uint32_t abi_version;
+    FH_FhEventCallbacks legacy;
+    FH_FhEventCallback on_message_received;
+    FH_FhEventCallback on_poll_received;
+    FH_FhEventCallback on_message_edited;
+    FH_FhEventCallback on_message_deleted;
+    FH_FhEventCallback on_message_reaction;
+    FH_FhEventCallback on_attachment_key_received;
+    FH_FhEventCallback on_call_signal_received;
+    FH_FhEventCallback on_history_chunk_received;
+    FH_FhEventCallback on_history_complete_received;
+    FH_FhEventCallback on_sender_key_received;
+} FH_FhEventCallbacksV2;
+
+/**
  * Synchronous result callback for fh_init and fh_call. `data` is read-only
  * and borrowed only until the callback returns; do not retain or free it.
  * Zero-length results use NULL.
@@ -137,6 +160,17 @@ int32_t fh_android_init(void *java_vm, void *application_context_global_ref);
  * or the handle is destroyed.
  */
 int32_t fh_set_event_callbacks(struct FH_FhHandle *handle, const struct FH_FhEventCallbacks *callbacks, void *user_data);
+
+/**
+ * Registers V2 semantic receive callbacks. callbacks may be NULL to clear the
+ * current registration. The header fields struct_size and abi_version must be
+ * readable before the library reads the complete table. Durable semantic
+ * event IDs are acknowledged with fh_ack_event only after caller persistence.
+ * History callbacks expose individual fragments; acknowledge their durable
+ * event IDs only after the complete history item has been reassembled and
+ * committed by the caller.
+ */
+int32_t fh_set_event_callbacks_v2(struct FH_FhHandle *handle, const struct FH_FhEventCallbacksV2 *callbacks, void *user_data);
 
 /**
  * Releases the database row for a durable event and, where the event is an

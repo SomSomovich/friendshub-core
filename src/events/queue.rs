@@ -200,7 +200,25 @@ fn dispatch_event(handler: &dyn EventHandler, event: &Event) {
         "ws_connected" => handler.on_ws_connected(event),
         "ws_disconnected" => handler.on_ws_disconnected(event),
         "ws_stopped" => handler.on_ws_stopped(event),
-        "envelope_received" => handler.on_envelope_received(event),
+        "envelope_received" => {
+            if let Some(typed) = crate::crypto::receive::classify_received_envelope(event) {
+                dispatch_typed_envelope(handler, &typed);
+            } else {
+                // Unknown payloads, decryption failures, and older encrypted
+                // forms stay observable through the raw-envelope callback.
+                handler.on_envelope_received(event);
+            }
+        }
+        "message_received" => handler.on_message_received(event),
+        "poll_received" => handler.on_poll_received(event),
+        "message_edited" => handler.on_message_edited(event),
+        "message_deleted" => handler.on_message_deleted(event),
+        "message_reaction" => handler.on_message_reaction(event),
+        "attachment_key_received" => handler.on_attachment_key_received(event),
+        "call_signal_received" => handler.on_call_signal_received(event),
+        "history_chunk_received" => handler.on_history_chunk_received(event),
+        "history_complete_received" => handler.on_history_complete_received(event),
+        "sender_key_received" => handler.on_sender_key_received(event),
         "receipt" => handler.on_receipt(event),
         "server_error" => {
             handler.on_server_error(event);
@@ -239,6 +257,22 @@ fn dispatch_event(handler: &dyn EventHandler, event: &Event) {
         "identity_changed" => handler.on_identity_changed(event),
         "webrtc_event" => dispatch_webrtc_event(handler, event),
         _ => handler.on_unhandled(event),
+    }
+}
+
+fn dispatch_typed_envelope(handler: &dyn EventHandler, event: &Event) {
+    match event.kind.as_str() {
+        "message_received" => handler.on_message_received(event),
+        "poll_received" => handler.on_poll_received(event),
+        "message_edited" => handler.on_message_edited(event),
+        "message_deleted" => handler.on_message_deleted(event),
+        "message_reaction" => handler.on_message_reaction(event),
+        "attachment_key_received" => handler.on_attachment_key_received(event),
+        "call_signal_received" => handler.on_call_signal_received(event),
+        "history_chunk_received" => handler.on_history_chunk_received(event),
+        "history_complete_received" => handler.on_history_complete_received(event),
+        "sender_key_received" => handler.on_sender_key_received(event),
+        _ => handler.on_envelope_received(event),
     }
 }
 
@@ -314,6 +348,16 @@ mod tests {
         on_ws_disconnected,
         on_ws_stopped,
         on_envelope_received,
+        on_message_received,
+        on_poll_received,
+        on_message_edited,
+        on_message_deleted,
+        on_message_reaction,
+        on_attachment_key_received,
+        on_call_signal_received,
+        on_history_chunk_received,
+        on_history_complete_received,
+        on_sender_key_received,
         on_receipt,
         on_server_error,
         on_fatal_error,
@@ -378,6 +422,54 @@ mod tests {
             (
                 event("envelope_received", Some(71), json!({"ciphertext":"aa"})),
                 "on_envelope_received",
+            ),
+            (
+                event(
+                    "message_received",
+                    Some(72),
+                    json!({"decrypted_payload":{"kind":"message"}}),
+                ),
+                "on_message_received",
+            ),
+            (
+                event(
+                    "poll_received",
+                    Some(73),
+                    json!({"decrypted_payload":{"kind":"poll"}}),
+                ),
+                "on_poll_received",
+            ),
+            (
+                event("message_edited", Some(74), json!({})),
+                "on_message_edited",
+            ),
+            (
+                event("message_deleted", Some(75), json!({})),
+                "on_message_deleted",
+            ),
+            (
+                event("message_reaction", Some(76), json!({})),
+                "on_message_reaction",
+            ),
+            (
+                event("attachment_key_received", Some(77), json!({})),
+                "on_attachment_key_received",
+            ),
+            (
+                event("call_signal_received", Some(78), json!({})),
+                "on_call_signal_received",
+            ),
+            (
+                event("history_chunk_received", Some(79), json!({})),
+                "on_history_chunk_received",
+            ),
+            (
+                event("history_complete_received", Some(80), json!({})),
+                "on_history_complete_received",
+            ),
+            (
+                event("sender_key_received", Some(81), json!({})),
+                "on_sender_key_received",
             ),
             (event("receipt", None, json!({})), "on_receipt"),
             (event("server_error", None, json!({})), "on_server_error"),
@@ -569,6 +661,80 @@ mod tests {
             rx.try_recv().is_err(),
             "flood must not reach fatal callback"
         );
+    }
+
+    #[test]
+    fn durable_decrypted_envelopes_route_semantically_without_changing_the_ack_id() {
+        let queue = EventQueue::new();
+        let (handler, rx) = handler_channel();
+        queue
+            .set_handler(handler)
+            .expect("callback thread must start");
+        queue
+            .drain_backlog_to_handler()
+            .expect("callback must activate");
+
+        let plaintext = serde_json::to_string(&json!({
+            "kind":"message", "message_id":"message-1", "text":"hello"
+        }))
+        .unwrap();
+        queue.push(event(
+            "envelope_received",
+            Some(1_337),
+            json!({
+                "envelope_id":"envelope-1", "envelope_type":1,
+                "client_timestamp":123, "plaintext_hex":hex::encode(plaintext),
+                "ciphertext":"aabb"
+            }),
+        ));
+
+        let received = rx
+            .recv_timeout(Duration::from_secs(2))
+            .expect("typed event must arrive");
+        assert_eq!(received.method, "on_message_received");
+        assert_eq!(received.kind, "message_received");
+        assert_eq!(received.id, Some(1_337));
+        queue.clear_handler_and_wait();
+    }
+
+    #[test]
+    fn legacy_rust_handlers_keep_receiving_raw_decrypted_envelopes() {
+        struct LegacyOnlyHandler(Sender<(String, Option<u64>, Value)>);
+        impl EventHandler for LegacyOnlyHandler {
+            fn on_envelope_received(&self, event: &Event) {
+                let _ = self
+                    .0
+                    .send((event.kind.clone(), event.id, event.payload.clone()));
+            }
+        }
+
+        let queue = EventQueue::new();
+        let (tx, rx) = mpsc::channel();
+        queue
+            .set_handler(std::sync::Arc::new(LegacyOnlyHandler(tx)))
+            .expect("callback thread must start");
+        queue
+            .drain_backlog_to_handler()
+            .expect("callback must activate");
+        let plaintext = serde_json::to_string(&json!({
+            "kind":"message", "message_id":"m1", "text":"hello"
+        }))
+        .unwrap();
+        queue.push(event(
+            "envelope_received",
+            Some(2_004),
+            json!({
+                "envelope_id":"e1", "envelope_type":1,
+                "plaintext_hex":hex::encode(plaintext), "ciphertext":"aa"
+            }),
+        ));
+
+        let (kind, id, payload) = rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert_eq!(kind, "envelope_received");
+        assert_eq!(id, Some(2_004));
+        assert_eq!(payload["envelope_id"], "e1");
+        assert!(payload.get("decrypted_payload").is_none());
+        queue.clear_handler_and_wait();
     }
 
     #[test]

@@ -23,9 +23,12 @@ pub mod device_init;
 pub mod devices;
 pub mod groups;
 pub mod groups_send;
+pub mod history_replay;
+pub mod history_sync;
 pub mod invites;
 pub mod message_actions;
 pub mod messages;
+pub mod poll_crypto;
 pub mod prekeys;
 pub mod profile;
 pub mod profile_extras;
@@ -41,6 +44,12 @@ pub struct DispatchMarker;
 
 /// Method IDs are namespaced by area. See docs/ffi.md for the full table.
 pub async fn dispatch(state: Arc<ActorState>, method: u32, payload: Vec<u8>) -> Result<Vec<u8>> {
+    let crypto_guard = if method_mutates_crypto_state(method) {
+        Some(state.crypto_state_lock.lock().await)
+    } else {
+        None
+    };
+
     let result = match method {
         // service
         0x0000_0001 => ping().await,
@@ -278,6 +287,26 @@ pub async fn dispatch(state: Arc<ActorState>, method: u32, payload: Vec<u8>) -> 
         0x0013_0014 => chat_extras::scheduled_list(&state, payload).await,
         0x0013_0015 => chat_extras::scheduled_cancel(&state, payload).await,
         0x0013_0016 => chat_extras::global_search(&state, payload).await,
+        crate::method_ids::POLL_CRYPTO_CREATE_CONVERSATION_POLL => {
+            poll_crypto::create_conversation_poll(&state, payload).await
+        }
+        crate::method_ids::POLL_CRYPTO_ENCRYPT_POLL_PAYLOAD => {
+            poll_crypto::encrypt_poll_payload(&state, payload).await
+        }
+        crate::method_ids::POLL_CRYPTO_ENCRYPT_POLL_OPTION => {
+            poll_crypto::encrypt_poll_option(&state, payload).await
+        }
+        crate::method_ids::POLL_CRYPTO_DECRYPT_POLL_PAYLOAD => {
+            poll_crypto::decrypt_poll_payload(&state, payload).await
+        }
+        crate::method_ids::HISTORY_REPLAY_BEGIN_CONVERSATION_PAGE => {
+            history_replay::begin_conversation_page(&state, payload).await
+        }
+        crate::method_ids::HISTORY_REPLAY_BEGIN_SAVED_PAGE => {
+            history_replay::begin_saved_page(&state, payload).await
+        }
+        crate::method_ids::HISTORY_REPLAY_COMMIT => history_replay::commit(&state, payload).await,
+        crate::method_ids::HISTORY_REPLAY_DISCARD => history_replay::discard(&state, payload).await,
 
         // webrtc
         0x0011_0001 => webrtc::ice_servers(&state, payload).await,
@@ -309,11 +338,147 @@ pub async fn dispatch(state: Arc<ActorState>, method: u32, payload: Vec<u8>) -> 
         0x00FF_0005 => ws::send_nudge(&state, payload).await,
         0x00FF_0006 => ws::request_history(&state, payload).await,
         0x00FF_0007 => ws::ping(&state, payload).await,
+        crate::method_ids::WS_SEND_HISTORY => history_sync::send_history(&state, payload).await,
 
         _ => Err(Error::UnknownMethod(method)),
     };
-    emit_pending_identity_changes(&state).await;
+    if crypto_guard.is_some() {
+        emit_pending_identity_changes(&state).await;
+    } else {
+        // Identity-change notifications update the same table that a crypto
+        // snapshot rollback replaces. Keep even this post-dispatch write out
+        // of an in-flight rollback.
+        let _crypto_guard = state.crypto_state_lock.lock().await;
+        emit_pending_identity_changes(&state).await;
+    }
     result
+}
+
+fn method_mutates_crypto_state(method: u32) -> bool {
+    matches!(
+        method,
+        0x0000_0005
+            | 0x0001_0001..=0x0001_0004
+            | 0x0004_0001..=0x0004_0004
+            | 0x0004_0010..=0x0004_0012
+            | 0x0005_0004
+            | 0x0005_0015
+            | 0x0006_0006
+            | 0x000A_0020..=0x000A_0021
+            | crate::method_ids::POLL_CRYPTO_CREATE_CONVERSATION_POLL
+            | crate::method_ids::POLL_CRYPTO_ENCRYPT_POLL_PAYLOAD
+            | crate::method_ids::POLL_CRYPTO_ENCRYPT_POLL_OPTION
+            | crate::method_ids::POLL_CRYPTO_DECRYPT_POLL_PAYLOAD
+            | crate::method_ids::HISTORY_REPLAY_COMMIT
+            | crate::method_ids::WS_SEND_HISTORY
+            | 0x0012_0010..=0x0012_0014
+    )
+}
+
+#[cfg(test)]
+mod crypto_state_serialization_tests {
+    use std::sync::Arc;
+
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    use super::method_mutates_crypto_state;
+    use crate::config::{Config, DiscoveryConfig};
+    use crate::error::Error;
+    use crate::runtime::ActorState;
+    use crate::transport::HttpClient;
+
+    #[test]
+    fn serialized_method_set_covers_every_public_crypto_mutation_path() {
+        for method in [
+            0x0000_0005, // push activation emits crypto identity changes
+            0x0001_0001, // register
+            0x0001_0002, // login
+            0x0001_0003, // login with TOTP
+            0x0001_0004, // logout
+            0x0004_0001, // establish Signal session
+            0x0004_0002, // encrypt one envelope
+            0x0004_0003, // decrypt one envelope
+            0x0004_0004, // send a message
+            0x0004_0010, // edit
+            0x0004_0011, // delete
+            0x0004_0012, // reaction
+            0x0005_0004, // initialize device keys
+            0x0005_0015, // replenish local prekeys
+            0x0006_0006, // encrypt and send attachment key
+            0x000A_0020, // distribute sender key
+            0x000A_0021, // send sender-key message
+            crate::method_ids::POLL_CRYPTO_CREATE_CONVERSATION_POLL,
+            crate::method_ids::POLL_CRYPTO_ENCRYPT_POLL_PAYLOAD,
+            crate::method_ids::POLL_CRYPTO_ENCRYPT_POLL_OPTION,
+            crate::method_ids::POLL_CRYPTO_DECRYPT_POLL_PAYLOAD,
+            crate::method_ids::HISTORY_REPLAY_COMMIT,
+            crate::method_ids::WS_SEND_HISTORY,
+            0x0012_0010, // call offer
+            0x0012_0011, // call answer
+            0x0012_0012, // ICE signal
+            0x0012_0013, // hangup signal
+            0x0012_0014, // reject signal
+        ] {
+            assert!(
+                method_mutates_crypto_state(method),
+                "method 0x{method:08x} must be serialized with crypto updates"
+            );
+        }
+
+        for method in [
+            0x0000_0001, // ping
+            0x0003_0001, // list conversations
+            0x0004_0005, // unknown message method
+            0x0005_0005, // read device initialization status
+            0x0006_0001, // seal/upload attachment without Signal state
+            0x00FF_0003, // upload caller-prepared envelope
+        ] {
+            assert!(
+                !method_mutates_crypto_state(method),
+                "unrelated method 0x{method:08x} must not hold the crypto lock"
+            );
+        }
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn crypto_mutation_dispatch_waits_for_the_shared_state_guard() {
+        let config = Config {
+            db_path: "/tmp/friendshub-core-crypto-serialization-test.db".into(),
+            api_base: "http://127.0.0.1".into(),
+            ws_url: "ws://127.0.0.1/ws".into(),
+            discovery: DiscoveryConfig {
+                enabled: false,
+                ..DiscoveryConfig::default()
+            },
+            log_level: "off".into(),
+            log_format: "text".into(),
+        };
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory database");
+        crate::db::migrations::MIGRATOR
+            .run(&db)
+            .await
+            .expect("apply migrations");
+        let http = HttpClient::new(&config).expect("build HTTP client");
+        let state = Arc::new(ActorState::new(config, db, http));
+
+        let guard = state.crypto_state_lock.lock().await;
+        let mut request = Box::pin(super::dispatch(
+            state.clone(),
+            0x0004_0001,
+            b"not-json".to_vec(),
+        ));
+        tokio::select! {
+            result = &mut request => panic!("crypto dispatch bypassed the state guard: {result:?}"),
+            _ = tokio::task::yield_now() => {}
+        }
+        drop(guard);
+
+        assert!(matches!(request.await, Err(Error::InvalidPayload(_))));
+    }
 }
 
 /// Restores durable events into the in-memory queue before the actor becomes
@@ -501,5 +666,173 @@ mod identity_change_tests {
             "a concurrent dispatch must not enqueue a duplicate warning"
         );
         events.clear_handler_and_wait();
+    }
+}
+
+#[cfg(test)]
+mod poll_crypto_dispatch_tests {
+    use std::sync::Arc;
+
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    use super::dispatch;
+    use crate::config::{Config, DiscoveryConfig};
+    use crate::error::Error;
+    use crate::events::EventQueue;
+    use crate::runtime::ActorState;
+    use crate::transport::HttpClient;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn poll_crypto_method_ids_reach_their_handlers() {
+        let config = Config {
+            db_path: "/tmp/friendshub-core-poll-dispatch-test.db".into(),
+            api_base: "http://127.0.0.1".into(),
+            ws_url: "ws://127.0.0.1/ws".into(),
+            discovery: DiscoveryConfig {
+                enabled: false,
+                ..DiscoveryConfig::default()
+            },
+            log_level: "error".into(),
+            log_format: "text".into(),
+        };
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory database");
+        crate::db::migrations::MIGRATOR
+            .run(&db)
+            .await
+            .expect("apply migrations");
+        let http = HttpClient::new(&config).expect("build HTTP client");
+        let state = Arc::new(ActorState::new_with_events(
+            config,
+            db,
+            http,
+            Arc::new(EventQueue::new()),
+        ));
+
+        for method_id in [
+            crate::method_ids::POLL_CRYPTO_CREATE_CONVERSATION_POLL,
+            crate::method_ids::POLL_CRYPTO_ENCRYPT_POLL_PAYLOAD,
+            crate::method_ids::POLL_CRYPTO_ENCRYPT_POLL_OPTION,
+            crate::method_ids::POLL_CRYPTO_DECRYPT_POLL_PAYLOAD,
+        ] {
+            let error = dispatch(state.clone(), method_id, b"not-json".to_vec())
+                .await
+                .expect_err("invalid JSON must be rejected by the selected poll handler");
+            assert!(
+                matches!(error, Error::InvalidPayload(_)),
+                "method 0x{method_id:08x} did not reach its poll handler: {error:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod history_sync_dispatch_tests {
+    use std::sync::Arc;
+
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    use super::dispatch;
+    use crate::config::{Config, DiscoveryConfig};
+    use crate::error::Error;
+    use crate::events::EventQueue;
+    use crate::runtime::ActorState;
+    use crate::transport::HttpClient;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn history_sync_method_reaches_its_handler() {
+        let config = Config {
+            db_path: "/tmp/friendshub-core-history-sync-dispatch-test.db".into(),
+            api_base: "http://127.0.0.1".into(),
+            ws_url: "ws://127.0.0.1/ws".into(),
+            discovery: DiscoveryConfig {
+                enabled: false,
+                ..DiscoveryConfig::default()
+            },
+            log_level: "error".into(),
+            log_format: "text".into(),
+        };
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory database");
+        crate::db::migrations::MIGRATOR
+            .run(&db)
+            .await
+            .expect("apply migrations");
+        let http = HttpClient::new(&config).expect("build HTTP client");
+        let state = Arc::new(ActorState::new_with_events(
+            config,
+            db,
+            http,
+            Arc::new(EventQueue::new()),
+        ));
+
+        let error = dispatch(state, 0x00FF_0008, b"not-json".to_vec())
+            .await
+            .expect_err("invalid JSON must be rejected by the history sender");
+        assert!(
+            matches!(error, Error::InvalidPayload(_)),
+            "method 0x00ff0008 did not reach the history handler: {error:?}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod history_replay_dispatch_tests {
+    use std::sync::Arc;
+
+    use sqlx::sqlite::SqlitePoolOptions;
+
+    use super::dispatch;
+    use crate::config::{Config, DiscoveryConfig};
+    use crate::error::Error;
+    use crate::events::EventQueue;
+    use crate::runtime::ActorState;
+    use crate::transport::HttpClient;
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn history_replay_method_ids_reach_their_handlers() {
+        let config = Config {
+            db_path: "/tmp/friendshub-core-history-replay-dispatch-test.db".into(),
+            api_base: "http://127.0.0.1".into(),
+            ws_url: "ws://127.0.0.1/ws".into(),
+            discovery: DiscoveryConfig {
+                enabled: false,
+                ..DiscoveryConfig::default()
+            },
+            log_level: "error".into(),
+            log_format: "text".into(),
+        };
+        let db = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect("sqlite::memory:")
+            .await
+            .expect("open in-memory database");
+        crate::db::migrations::MIGRATOR
+            .run(&db)
+            .await
+            .expect("apply migrations");
+        let http = HttpClient::new(&config).expect("build HTTP client");
+        let state = Arc::new(ActorState::new_with_events(
+            config,
+            db,
+            http,
+            Arc::new(EventQueue::new()),
+        ));
+
+        for method_id in [0x0013_0030, 0x0013_0031, 0x0013_0032, 0x0013_0033] {
+            let error = dispatch(state.clone(), method_id, b"not-json".to_vec())
+                .await
+                .expect_err("invalid JSON must be rejected by a history replay handler");
+            assert!(
+                matches!(error, Error::InvalidPayload(_)),
+                "method 0x{method_id:08x} did not reach history replay: {error:?}"
+            );
+        }
     }
 }

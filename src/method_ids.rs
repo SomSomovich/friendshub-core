@@ -200,6 +200,14 @@ pub const CHAT_EXTRAS_FOLDER_REMOVE_CONVERSATION: u32 = 0x0013_0013;
 pub const CHAT_EXTRAS_SCHEDULED_LIST: u32 = 0x0013_0014;
 pub const CHAT_EXTRAS_SCHEDULED_CANCEL: u32 = 0x0013_0015;
 pub const CHAT_EXTRAS_GLOBAL_SEARCH: u32 = 0x0013_0016;
+pub const POLL_CRYPTO_CREATE_CONVERSATION_POLL: u32 = 0x0013_0020;
+pub const POLL_CRYPTO_ENCRYPT_POLL_PAYLOAD: u32 = 0x0013_0021;
+pub const POLL_CRYPTO_ENCRYPT_POLL_OPTION: u32 = 0x0013_0022;
+pub const POLL_CRYPTO_DECRYPT_POLL_PAYLOAD: u32 = 0x0013_0023;
+pub const HISTORY_REPLAY_BEGIN_CONVERSATION_PAGE: u32 = 0x0013_0030;
+pub const HISTORY_REPLAY_BEGIN_SAVED_PAGE: u32 = 0x0013_0031;
+pub const HISTORY_REPLAY_COMMIT: u32 = 0x0013_0032;
+pub const HISTORY_REPLAY_DISCARD: u32 = 0x0013_0033;
 pub const WEBRTC_ICE_SERVERS: u32 = 0x0011_0001;
 pub const WEBRTC_CREATE_OFFER: u32 = 0x0012_0001;
 pub const WEBRTC_ACCEPT_OFFER: u32 = 0x0012_0002;
@@ -227,3 +235,90 @@ pub const WS_SEND_TYPING: u32 = 0x00FF_0004;
 pub const WS_SEND_NUDGE: u32 = 0x00FF_0005;
 pub const WS_REQUEST_HISTORY: u32 = 0x00FF_0006;
 pub const WS_PING: u32 = 0x00FF_0007;
+pub const WS_SEND_HISTORY: u32 = 0x00FF_0008;
+
+#[cfg(test)]
+mod poll_crypto_method_id_tests {
+    use super::*;
+
+    #[test]
+    fn poll_crypto_ids_are_stable_and_distinct_from_existing_poll_methods() {
+        let ids = [
+            POLL_CRYPTO_CREATE_CONVERSATION_POLL,
+            POLL_CRYPTO_ENCRYPT_POLL_PAYLOAD,
+            POLL_CRYPTO_ENCRYPT_POLL_OPTION,
+            POLL_CRYPTO_DECRYPT_POLL_PAYLOAD,
+        ];
+        assert_eq!(ids, [0x0013_0020, 0x0013_0021, 0x0013_0022, 0x0013_0023]);
+
+        let existing = [
+            CHAT_EXTRAS_CONVERSATION_PINS_LIST,
+            CHAT_EXTRAS_CONVERSATION_PIN,
+            CHAT_EXTRAS_CONVERSATION_UNPIN,
+            CHAT_EXTRAS_CONVERSATION_POLLS_LIST,
+            CHAT_EXTRAS_POLL_GET,
+            CHAT_EXTRAS_POLL_CREATE,
+            CHAT_EXTRAS_POLL_VOTE,
+            CHAT_EXTRAS_POLL_STOP,
+            CHAT_EXTRAS_POLL_DELETE,
+            CHAT_EXTRAS_POLL_ADD_OPTION,
+            CHAT_EXTRAS_POLL_DELETE_OPTION,
+            CHAT_EXTRAS_SAVED_CONVERSATION,
+            CHAT_EXTRAS_SAVED_MESSAGES,
+            CHAT_EXTRAS_FOLDERS_LIST,
+            CHAT_EXTRAS_FOLDER_CREATE,
+            CHAT_EXTRAS_FOLDER_UPDATE,
+            CHAT_EXTRAS_FOLDER_DELETE,
+            CHAT_EXTRAS_FOLDER_ADD_CONVERSATION,
+            CHAT_EXTRAS_FOLDER_REMOVE_CONVERSATION,
+            CHAT_EXTRAS_SCHEDULED_LIST,
+            CHAT_EXTRAS_SCHEDULED_CANCEL,
+            CHAT_EXTRAS_GLOBAL_SEARCH,
+        ];
+        for (index, id) in ids.iter().enumerate() {
+            assert!(
+                !existing.contains(id),
+                "poll crypto ID collides: 0x{id:08x}"
+            );
+            assert!(
+                !ids[..index].contains(id),
+                "duplicate poll crypto ID: 0x{id:08x}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod history_replay_method_id_tests {
+    use super::*;
+
+    #[test]
+    fn history_replay_ids_are_stable_and_unique() {
+        let history_replay = [
+            HISTORY_REPLAY_BEGIN_CONVERSATION_PAGE,
+            HISTORY_REPLAY_BEGIN_SAVED_PAGE,
+            HISTORY_REPLAY_COMMIT,
+            HISTORY_REPLAY_DISCARD,
+        ];
+        assert_eq!(
+            history_replay,
+            [0x0013_0030, 0x0013_0031, 0x0013_0032, 0x0013_0033]
+        );
+        for (index, id) in history_replay.iter().enumerate() {
+            assert!(
+                !history_replay[..index].contains(id),
+                "duplicate history replay ID: 0x{id:08x}"
+            );
+            assert!(
+                ![
+                    POLL_CRYPTO_CREATE_CONVERSATION_POLL,
+                    POLL_CRYPTO_ENCRYPT_POLL_PAYLOAD,
+                    POLL_CRYPTO_ENCRYPT_POLL_OPTION,
+                    POLL_CRYPTO_DECRYPT_POLL_PAYLOAD,
+                ]
+                .contains(id),
+                "history replay ID collides with poll crypto: 0x{id:08x}"
+            );
+        }
+    }
+}

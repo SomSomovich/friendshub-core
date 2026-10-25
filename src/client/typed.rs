@@ -199,6 +199,14 @@ request_methods! {
     chat_extras_poll_delete => CHAT_EXTRAS_POLL_DELETE, "chat_extras_poll_delete";
     chat_extras_poll_add_option => CHAT_EXTRAS_POLL_ADD_OPTION, "chat_extras_poll_add_option";
     chat_extras_poll_delete_option => CHAT_EXTRAS_POLL_DELETE_OPTION, "chat_extras_poll_delete_option";
+    poll_crypto_create_conversation_poll => POLL_CRYPTO_CREATE_CONVERSATION_POLL, "poll_crypto_create_conversation_poll";
+    poll_crypto_encrypt_poll_payload => POLL_CRYPTO_ENCRYPT_POLL_PAYLOAD, "poll_crypto_encrypt_poll_payload";
+    poll_crypto_encrypt_poll_option => POLL_CRYPTO_ENCRYPT_POLL_OPTION, "poll_crypto_encrypt_poll_option";
+    poll_crypto_decrypt_poll_payload => POLL_CRYPTO_DECRYPT_POLL_PAYLOAD, "poll_crypto_decrypt_poll_payload";
+    history_replay_begin_conversation_page => HISTORY_REPLAY_BEGIN_CONVERSATION_PAGE, "history_replay_begin_conversation_page";
+    history_replay_begin_saved_page => HISTORY_REPLAY_BEGIN_SAVED_PAGE, "history_replay_begin_saved_page";
+    history_replay_commit => HISTORY_REPLAY_COMMIT, "history_replay_commit";
+    history_replay_discard => HISTORY_REPLAY_DISCARD, "history_replay_discard";
     chat_extras_saved_messages => CHAT_EXTRAS_SAVED_MESSAGES, "chat_extras_saved_messages";
     chat_extras_folder_create => CHAT_EXTRAS_FOLDER_CREATE, "chat_extras_folder_create";
     chat_extras_folder_update => CHAT_EXTRAS_FOLDER_UPDATE, "chat_extras_folder_update";
@@ -230,6 +238,7 @@ request_methods! {
     ws_send_nudge => WS_SEND_NUDGE, "ws_send_nudge";
     ws_request_history => WS_REQUEST_HISTORY, "ws_request_history";
     ws_ping => WS_PING, "ws_ping";
+    ws_send_history => WS_SEND_HISTORY, "ws_send_history";
 }
 
 empty_request_methods! {
@@ -275,4 +284,38 @@ empty_request_methods! {
     webrtc_list_active => WEBRTC_LIST_ACTIVE, "webrtc_list_active";
     ws_start => WS_START, "ws_start";
     ws_stop => WS_STOP, "ws_stop";
+}
+
+#[cfg(test)]
+mod poll_crypto_typed_api_tests {
+    use crate::{client::Client, error::Result};
+    use serde_json::Value;
+
+    #[test]
+    fn all_poll_crypto_typed_methods_are_publicly_callable() {
+        let methods: [fn(&Client, &Value) -> Result<Value>; 4] = [
+            Client::poll_crypto_create_conversation_poll::<Value, Value>,
+            Client::poll_crypto_encrypt_poll_payload::<Value, Value>,
+            Client::poll_crypto_encrypt_poll_option::<Value, Value>,
+            Client::poll_crypto_decrypt_poll_payload::<Value, Value>,
+        ];
+        assert_eq!(methods.len(), 4);
+    }
+}
+
+#[cfg(test)]
+mod history_replay_typed_api_tests {
+    use crate::{client::Client, error::Result};
+    use serde_json::Value;
+
+    #[test]
+    fn all_history_replay_typed_methods_are_publicly_callable() {
+        let methods: [fn(&Client, &Value) -> Result<Value>; 4] = [
+            Client::history_replay_begin_conversation_page::<Value, Value>,
+            Client::history_replay_begin_saved_page::<Value, Value>,
+            Client::history_replay_commit::<Value, Value>,
+            Client::history_replay_discard::<Value, Value>,
+        ];
+        assert_eq!(methods.len(), 4);
+    }
 }

@@ -149,7 +149,7 @@ so existing IDs never move.
 | `0x0010_xxxx` | handles |
 | `0x0011_xxxx` | TURN credentials |
 | `0x0012_xxxx` | WebRTC calls |
-| `0x0013_xxxx` | conversation history, pins, polls, folders, scheduled messages, search |
+| `0x0013_xxxx` | conversation history, pins, polls, folders, scheduled messages, search, poll encryption |
 | `0x00FF_xxxx` | websocket lifecycle |
 
 ### Service
@@ -190,6 +190,13 @@ so existing IDs never move.
 | `0x00FF_0005` | nudge JSON | send a nudge |
 | `0x00FF_0006` | history request JSON | request conversation history |
 | `0x00FF_0007` | `{"timeout_ms":5000}` or empty | send a protobuf ping and return round-trip milliseconds |
+| `0x00FF_0008` | `SendHistoryRequest` JSON | answer a history request by fragmenting caller-owned durable records, encrypting them as own-device `SYNC` envelopes, and submitting them over the active websocket |
+
+`ws_send_history` accepts the records already stored by the caller. The core
+validates the target device and conversations, chunks each item into the shared
+history wire format, and reports submitted chunks. `complete` means the local
+websocket accepted every chunk; it does not mean the server acknowledged the
+transfer. See `src/api/history_sync.rs` for the typed request/response fields.
 
 ### Messages (Signal Protocol)
 
@@ -249,6 +256,81 @@ Both return `{ "envelopes": [...], "device_errors": [...] }` (or with
 abort the batch.
 
 See `group-calls.md` for the flow in context.
+
+### Encrypted polls
+
+These methods keep poll metadata and option text encrypted with the
+conversation Sender Key, while the existing `chat_extras_poll_*` methods
+continue to operate on the server's poll records and votes.
+
+| ID | Typed Rust method | Request | Response |
+|---|---|---|---|
+| `0x0013_0020` | `poll_crypto_create_conversation_poll` | `{"conversation_id":"uuid","metadata":{"title":"...","description":"...","options":[{"id":"...","text":"..."}]},"settings":{"poll_type":"regular","allows_multiple":false,"allows_revoting":false,"allows_user_options":false,"open_period_seconds":null,"correct_option_id":null}}` | `{"item":{...},"metadata":{...},"history_synced":true}` |
+| `0x0013_0021` | `poll_crypto_encrypt_poll_payload` | `{"conversation_id":"uuid","payload":{"text":"..."}}` | JSON string containing standard-base64 Sender Key ciphertext |
+| `0x0013_0022` | `poll_crypto_encrypt_poll_option` | `{"conversation_id":"uuid","text":"..."}` | JSON string containing standard-base64 Sender Key ciphertext for `{"text":"..."}` |
+| `0x0013_0023` | `poll_crypto_decrypt_poll_payload` | `{"sender_account_id":"uuid","sender_device_number":1,"encrypted_meta":"base64"}` | Decrypted JSON value |
+
+Poll creation encrypts metadata, creates the authoritative server poll, then
+sends its poll-ID-linked encrypted history copy to conversation members and
+the caller's other devices. A successful REST poll remains the result even if
+the later websocket history-copy send fails; in that case `history_synced` is
+`false`. It reports that the websocket accepted the send queue, not that the
+server has delivered or acknowledged every envelope.
+
+### Encrypted history replay
+
+History replay fetches the WEB-compatible conversation or Saved Messages page
+inside the library and decrypts it against an isolated copy of Signal state.
+The live ratchet state is not changed until the host has durably saved the page
+and calls `history_replay_commit` with the returned token.
+
+| ID | Typed Rust method | Request | Response |
+|---|---|---|---|
+| `0x0013_0030` | `history_replay_begin_conversation_page` | `{"conversationId":"uuid","before":123,"beforeId":"uuid","limit":200,"knownEnvelopeIds":[],"knownMessageIds":[]}` | staged replay page with `messages`, `attachmentKeys`, `processedEnvelopeIds`, `existingMessageIds`, rollback keys, `cursor`, `hasOlder`, and `replayToken` |
+| `0x0013_0031` | `history_replay_begin_saved_page` | `{"before":123,"beforeId":"uuid","limit":100,"knownEnvelopeIds":[],"knownMessageIds":[]}` | same staged replay page for the current device's Saved Messages |
+| `0x0013_0032` | `history_replay_commit` | `{"replayToken":"uuid"}` | `{"committed":true,"conflict":false,"alreadyCommitted":false}` |
+| `0x0013_0033` | `history_replay_discard` | `{"replayToken":"uuid"}` | `{"discarded":true}` (false for an unknown or expired token) |
+
+`knownEnvelopeIds` is the host's bounded set of already stored envelope UUIDs;
+IDs outside the fetched page are ignored. `knownMessageIds` contains logical
+message IDs already stored in that conversation. The core still stages decryption for an existing logical message
+and returns its ID in `existingMessageIds`, but omits it from `messages` so the
+host can preserve local edits and reactions. Conversation pages default to 200
+rows and Saved Messages pages to 100; `cursor` and `hasOlder` follow the WEB
+pagination contract. The host must persist the page and progress before
+committing the replay token. A successful commit is idempotent if the response
+is lost.
+
+For native clients, pending snapshots and commit receipts are stored in the
+encrypted SQLCipher database. The ratchet update and receipt are committed in
+one SQLite transaction, so a process restart between commit and response does
+not lose the result. A pending stage survives restart for five minutes; a
+commit receipt is also retained for five minutes. At most four pages can be
+pending per database.
+
+If native commit returns `conflict: true`, another crypto operation changed
+the live state. The host must atomically roll back only this page using
+`rollback.messageIds`, `rollback.attachmentIds`, and
+`rollback.progressEnvelopeIds`, restore any pre-existing attachment records it
+updated, reload crypto state, and retry the page. Keep the replay token with
+the page's rollback journal until commit succeeds or the page is rolled back.
+If the token is unknown or expired, roll back that journaled page before
+fetching and replaying it again. Do not merge the staged ratchet state. If the
+host abandons a page before saving it, call discard.
+
+The browser WASM workflow keeps staged snapshots and receipts in the current
+WASM instance's memory (15-minute token lifetime; at most 32 pending pages).
+Its `commitHistoryReplayWorkflow` callback must atomically compare
+`baseSignalSnapshot`, persist the page, attachment keys, progress IDs,
+`signalSnapshot`, and a durable receipt keyed by `replayToken` in IndexedDB.
+On a conflict before any writes, return
+`{ committed: false, conflict: true }`. If the host saved the page separately,
+the callback must remove only that token's page and progress in its rollback
+phase and return `{ rolledBack: true }`. Keep a host-side journal for pending
+tokens across page reloads: if WASM reports an unknown or expired token, use
+that journal to roll back an uncommitted page, or use the durable receipt to
+recognize a transaction that already committed. A page reload destroys
+in-memory WASM stages regardless of the token's remaining lifetime.
 
 ### Attachments (encrypted)
 

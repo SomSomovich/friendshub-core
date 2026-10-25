@@ -36,6 +36,39 @@ pub trait EventHandler: Send + Sync + 'static {
     fn on_ws_disconnected(&self, _event: &Event) {}
     fn on_ws_stopped(&self, _event: &Event) {}
     fn on_envelope_received(&self, _event: &Event) {}
+    /// Semantic callbacks default to the legacy raw-envelope callback so
+    /// existing handlers continue receiving decrypted envelopes they do not
+    /// yet handle explicitly.
+    fn on_message_received(&self, event: &Event) {
+        self.on_semantic_envelope_unhandled(event);
+    }
+    fn on_poll_received(&self, event: &Event) {
+        self.on_semantic_envelope_unhandled(event);
+    }
+    fn on_message_edited(&self, event: &Event) {
+        self.on_semantic_envelope_unhandled(event);
+    }
+    fn on_message_deleted(&self, event: &Event) {
+        self.on_semantic_envelope_unhandled(event);
+    }
+    fn on_message_reaction(&self, event: &Event) {
+        self.on_semantic_envelope_unhandled(event);
+    }
+    fn on_attachment_key_received(&self, event: &Event) {
+        self.on_semantic_envelope_unhandled(event);
+    }
+    fn on_call_signal_received(&self, event: &Event) {
+        self.on_semantic_envelope_unhandled(event);
+    }
+    fn on_history_chunk_received(&self, event: &Event) {
+        self.on_semantic_envelope_unhandled(event);
+    }
+    fn on_history_complete_received(&self, event: &Event) {
+        self.on_semantic_envelope_unhandled(event);
+    }
+    fn on_sender_key_received(&self, event: &Event) {
+        self.on_semantic_envelope_unhandled(event);
+    }
     fn on_receipt(&self, _event: &Event) {}
     fn on_server_error(&self, _event: &Event) {}
     fn on_fatal_error(&self, _event: &Event) {}
@@ -74,4 +107,13 @@ pub trait EventHandler: Send + Sync + 'static {
 
     /// Receives a kind or WebRTC subtype not recognized by this version.
     fn on_unhandled(&self, _event: &Event) {}
+
+    fn on_semantic_envelope_unhandled(&self, event: &Event) {
+        let mut raw = event.clone();
+        raw.kind = "envelope_received".into();
+        if let Some(payload) = raw.payload.as_object_mut() {
+            payload.remove("decrypted_payload");
+        }
+        self.on_envelope_received(&raw);
+    }
 }

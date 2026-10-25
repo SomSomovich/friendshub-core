@@ -7,10 +7,14 @@ pub mod device_cache;
 pub mod error;
 #[cfg(feature = "native")]
 pub mod groups;
+pub mod history_protocol;
+#[cfg(feature = "native")]
+pub mod history_stage;
 #[cfg(feature = "native")]
 pub mod init;
 #[cfg(feature = "native")]
 pub mod manager;
+pub mod receive;
 #[cfg(feature = "native")]
 pub mod send;
 #[cfg(feature = "native")]

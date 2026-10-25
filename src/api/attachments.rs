@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -9,7 +10,9 @@ use crate::crypto::attachments::{
     BASE_NONCE_LEN, KEY_LEN, TAG_LEN, decode_key_and_base, new_key_and_base, open_chunk, seal_chunk,
 };
 use crate::error::{Error, Result};
+use crate::proto::{ClientFrame, Envelope, EnvelopeUpload, client_frame};
 use crate::runtime::ActorState;
+use crate::util::time::now_unix;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct RecommendRequest {
@@ -342,6 +345,14 @@ pub async fn send_key(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u
 
     // Validate the key material locally before spending a network round trip.
     let _ = decode_key_and_base(&req.key_hex, &req.base_nonce_hex)?;
+    let _attachment_id = uuid_bytes(&req.attachment_id, "attachment_id")?;
+    let recipient_id = uuid_bytes(&req.recipient_account_id, "recipient_account_id")?;
+    let conversation_id = req
+        .conversation_id
+        .as_deref()
+        .map(|id| uuid_bytes(id, "conversation_id"))
+        .transpose()?
+        .unwrap_or_default();
 
     let inner = serde_json::json!({
         "kind": "attachment_key",
@@ -357,47 +368,330 @@ pub async fn send_key(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u
         .ok_or(Error::NotAuthenticated)?;
     let sender_account_id = auth.account_id.clone().ok_or(Error::NotAuthenticated)?;
     let sender_device_number = auth.device_number.unwrap_or(1);
+    let sender_id = uuid_bytes(&sender_account_id, "sender_account_id")?;
+    let sender_device_number_proto = protobuf_device_number(sender_device_number, "sender")?;
     let token = bearer(state).await?;
 
     let devices = crate::crypto::device_cache::get(state, &req.recipient_account_id).await?;
-    if devices.is_empty() {
-        return Err(Error::InvalidPayload(format!(
-            "recipient {} has no active devices",
-            req.recipient_account_id
-        )));
+    for device in &devices {
+        protobuf_device_number(device.device_number, "recipient")?;
     }
 
-    let mut sent = Vec::new();
-    let mut errors = Vec::new();
-    for d in &devices {
-        match crate::crypto::send::send_one(
-            state,
-            &token,
-            &sender_account_id,
-            sender_device_number,
-            &req.recipient_account_id,
-            d.device_number,
-            &inner_bytes,
-            ENVELOPE_TYPE_ATTACHMENT_KEY,
-            req.conversation_id.as_deref(),
-        )
+    let encrypt_state = Arc::clone(state);
+    let upload_state = Arc::clone(state);
+    let token = token.clone();
+    let recipient_account_id = req.recipient_account_id.clone();
+    let plaintext = inner_bytes;
+    let crypto_snapshot = crate::crypto::history_stage::load_snapshot(&state.db)
         .await
-        {
-            Ok(info) => sent.push(info),
-            Err(e) => errors.push(serde_json::json!({
-                "device_number": d.device_number,
-                "error": e.to_string(),
-            })),
-        }
-    }
+        .map_err(|error| Error::Database(format!("failed to snapshot crypto state: {error}")))?;
+    let rollback_state = Arc::clone(&state);
+    let prepared = encrypt_then_upload(
+        &devices,
+        move |device_number| {
+            let state = Arc::clone(&encrypt_state);
+            let token = token.clone();
+            let recipient_account_id = recipient_account_id.clone();
+            let recipient_id = recipient_id.clone();
+            let sender_id = sender_id.clone();
+            let conversation_id = conversation_id.clone();
+            let plaintext = plaintext.clone();
+            async move {
+                let recipient_device_number = protobuf_device_number(device_number, "recipient")?;
+                if !crate::crypto::manager::has_session(
+                    &state,
+                    &recipient_account_id,
+                    device_number,
+                )
+                .await
+                .map_err(Error::from)?
+                {
+                    let path = format!(
+                        "/api/v1/accounts/{recipient_account_id}/devices/{device_number}/bundle"
+                    );
+                    let bundle: serde_json::Value = state.http.get(&path, Some(&token)).await?;
+                    crate::crypto::manager::establish_outbound_session(
+                        &state,
+                        &recipient_account_id,
+                        device_number,
+                        &bundle,
+                    )
+                    .await
+                    .map_err(Error::from)?;
+                }
+
+                let (ciphertext, is_prekey_message) = crate::crypto::manager::encrypt_for_device(
+                    &state,
+                    &recipient_account_id,
+                    device_number,
+                    &plaintext,
+                )
+                .await
+                .map_err(Error::from)?;
+                let envelope_id = uuid::Uuid::now_v7();
+                let sent = crate::crypto::send::SentEnvelope {
+                    device_number,
+                    envelope_id: envelope_id.to_string(),
+                    is_prekey_message,
+                    ciphertext_len: ciphertext.len(),
+                };
+                let envelope = Envelope {
+                    envelope_id: envelope_id.as_bytes().to_vec(),
+                    sender_account_id: sender_id,
+                    sender_device_number: sender_device_number_proto,
+                    recipient_account_id: recipient_id,
+                    recipient_device_number,
+                    conversation_id,
+                    ciphertext,
+                    is_prekey_message,
+                    envelope_type: ENVELOPE_TYPE_ATTACHMENT_KEY,
+                    client_timestamp: now_unix(),
+                    sender_is_bot: false,
+                    send_at: 0,
+                };
+                Ok(PreparedKeyEnvelope { envelope, sent })
+            }
+        },
+        move || {
+            let state = Arc::clone(&rollback_state);
+            let snapshot = crypto_snapshot.clone();
+            async move {
+                crate::crypto::history_stage::replace_snapshot(&state.db, &snapshot)
+                    .await
+                    .map_err(|error| {
+                        Error::Database(format!("failed to restore crypto state: {error}"))
+                    })
+            }
+        },
+        move |prepared| async move {
+            let envelopes = prepared
+                .into_iter()
+                .map(|prepared| prepared.envelope)
+                .collect();
+            upload_state
+                .ws
+                .send_frame(ClientFrame {
+                    kind: Some(client_frame::Kind::Upload(EnvelopeUpload { envelopes })),
+                })
+                .await
+        },
+    )
+    .await?;
+
+    let sent = prepared
+        .into_iter()
+        .map(|prepared| prepared.sent)
+        .collect::<Vec<_>>();
 
     Ok(serde_json::to_vec(&serde_json::json!({
         "envelopes": sent,
-        "device_errors": errors,
+        "device_errors": [],
     }))?)
+}
+
+#[derive(Clone)]
+struct PreparedKeyEnvelope {
+    envelope: Envelope,
+    sent: crate::crypto::send::SentEnvelope,
+}
+
+/// Encrypt every target first, then upload all resulting envelopes in a single
+/// frame. An encryption failure therefore never uploads a partial fanout.
+async fn encrypt_then_upload<
+    T,
+    EncryptOne,
+    EncryptFuture,
+    Rollback,
+    RollbackFuture,
+    Upload,
+    UploadFuture,
+>(
+    devices: &[crate::crypto::device_cache::CachedDevice],
+    mut encrypt_one: EncryptOne,
+    rollback_crypto: Rollback,
+    upload_batch: Upload,
+) -> Result<Vec<T>>
+where
+    T: Clone,
+    EncryptOne: FnMut(i64) -> EncryptFuture,
+    EncryptFuture: Future<Output = Result<T>>,
+    Rollback: FnOnce() -> RollbackFuture,
+    RollbackFuture: Future<Output = Result<()>>,
+    Upload: FnOnce(Vec<T>) -> UploadFuture,
+    UploadFuture: Future<Output = Result<()>>,
+{
+    if devices.is_empty() {
+        return Err(Error::InvalidPayload(
+            "recipient has no active devices".into(),
+        ));
+    }
+
+    let mut prepared = Vec::with_capacity(devices.len());
+    for device in devices {
+        match encrypt_one(device.device_number).await {
+            Ok(envelope) => prepared.push(envelope),
+            Err(error) => {
+                if let Err(rollback_error) = rollback_crypto().await {
+                    return Err(Error::Database(format!(
+                        "{error}; failed to restore crypto state after fanout preparation: {rollback_error}"
+                    )));
+                }
+                return Err(error);
+            }
+        }
+    }
+
+    upload_batch(prepared.clone()).await?;
+    Ok(prepared)
+}
+
+fn uuid_bytes(value: &str, field: &str) -> Result<Vec<u8>> {
+    uuid::Uuid::parse_str(value)
+        .map(|id| id.as_bytes().to_vec())
+        .map_err(|error| Error::InvalidPayload(format!("{field}: {error}")))
+}
+
+fn protobuf_device_number(device_number: i64, field: &str) -> Result<u32> {
+    let number = u32::try_from(device_number)
+        .map_err(|_| Error::InvalidPayload(format!("{field} device number is invalid")))?;
+    libsignal_protocol::DeviceId::try_from(number)
+        .map_err(|_| Error::InvalidPayload(format!("{field} device number is invalid")))?;
+    Ok(number)
 }
 
 #[allow(dead_code)]
 fn _consts(_: [usize; 3]) -> [usize; 3] {
     [KEY_LEN, BASE_NONCE_LEN, TAG_LEN]
+}
+
+#[cfg(test)]
+mod send_key_batch_tests {
+    use super::encrypt_then_upload;
+    use crate::crypto::device_cache::CachedDevice;
+    use crate::error::Error;
+    use std::sync::{Arc, Mutex};
+
+    fn devices(numbers: &[i64]) -> Vec<CachedDevice> {
+        numbers
+            .iter()
+            .map(|number| CachedDevice {
+                device_number: *number,
+                registration_id: 1,
+                identity_key_pub: String::new(),
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn send_key_encrypts_all_devices_before_one_batch_upload() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let uploaded = Arc::new(Mutex::new(Vec::new()));
+        let encrypt_order = order.clone();
+        let upload_order = order.clone();
+        let uploaded_batches = uploaded.clone();
+
+        let prepared = encrypt_then_upload(
+            &devices(&[2, 4, 9]),
+            move |device_number| {
+                let order = encrypt_order.clone();
+                async move {
+                    order.lock().unwrap().push(device_number);
+                    Ok(device_number * 10)
+                }
+            },
+            || async { Ok(()) },
+            move |batch| {
+                let order = upload_order.clone();
+                let uploaded = uploaded_batches.clone();
+                async move {
+                    assert_eq!(*order.lock().unwrap(), vec![2, 4, 9]);
+                    uploaded.lock().unwrap().push(batch);
+                    Ok(())
+                }
+            },
+        )
+        .await
+        .expect("complete fanout should upload");
+
+        assert_eq!(prepared, vec![20, 40, 90]);
+        assert_eq!(*uploaded.lock().unwrap(), vec![vec![20, 40, 90]]);
+    }
+
+    #[tokio::test]
+    async fn send_key_stops_at_first_encryption_error_without_uploading_partial_batch() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let upload_count = Arc::new(Mutex::new(0));
+        let ratchet_updates = Arc::new(Mutex::new(Vec::new()));
+        let encrypt_order = order.clone();
+        let upload_calls = upload_count.clone();
+        let encrypted_devices = ratchet_updates.clone();
+        let rollback_devices = ratchet_updates.clone();
+
+        let result = encrypt_then_upload(
+            &devices(&[2, 4, 9]),
+            move |device_number| {
+                let order = encrypt_order.clone();
+                let ratchets = encrypted_devices.clone();
+                async move {
+                    order.lock().unwrap().push(device_number);
+                    ratchets.lock().unwrap().push(device_number);
+                    if device_number == 4 {
+                        Err(Error::Network("device encryption failed".into()))
+                    } else {
+                        Ok(device_number)
+                    }
+                }
+            },
+            move || {
+                let ratchets = rollback_devices.clone();
+                async move {
+                    ratchets.lock().unwrap().clear();
+                    Ok(())
+                }
+            },
+            move |_batch| {
+                let count = upload_calls.clone();
+                async move {
+                    *count.lock().unwrap() += 1;
+                    Ok(())
+                }
+            },
+        )
+        .await;
+
+        assert!(
+            matches!(result, Err(Error::Network(message)) if message == "device encryption failed")
+        );
+        assert_eq!(*order.lock().unwrap(), vec![2, 4]);
+        assert_eq!(*upload_count.lock().unwrap(), 0);
+        assert!(
+            ratchet_updates.lock().unwrap().is_empty(),
+            "failed batch preparation must restore every earlier ratchet update"
+        );
+    }
+
+    #[tokio::test]
+    async fn send_key_rejects_a_recipient_with_no_active_devices() {
+        let upload_count = Arc::new(Mutex::new(0));
+        let upload_calls = upload_count.clone();
+        let result = encrypt_then_upload(
+            &[],
+            |_device_number| async { Ok(1_i32) },
+            || async { Ok(()) },
+            move |_batch| {
+                let count = upload_calls.clone();
+                async move {
+                    *count.lock().unwrap() += 1;
+                    Ok(())
+                }
+            },
+        )
+        .await;
+
+        assert!(matches!(
+            result,
+            Err(Error::InvalidPayload(message)) if message == "recipient has no active devices"
+        ));
+        assert_eq!(*upload_count.lock().unwrap(), 0);
+    }
 }

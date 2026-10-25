@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use futures::future::BoxFuture;
 use tokio::runtime::Runtime;
-use tokio::sync::mpsc;
+use tokio::sync::{Mutex, mpsc};
 use tokio::task::LocalSet;
 
 use crate::config::Config;
@@ -42,6 +42,11 @@ pub struct ActorState {
     pub ws: Arc<WsClient>,
     pub events: Arc<EventQueue>,
     pub webrtc: Arc<WebRtcManager>,
+    /// Serializes every operation that reads or mutates Signal/sender-key
+    /// state. Snapshot rollback replaces complete crypto tables, so it must
+    /// not overlap another ratchet update or identity-change notification.
+    pub(crate) crypto_state_lock: Arc<Mutex<()>>,
+    pub(crate) history_replay_stages: Arc<Mutex<crate::crypto::history_stage::ReplayStages>>,
 }
 
 fn run_local_set<F>(runtime: &Runtime, local: LocalSet, future: F)
@@ -73,6 +78,10 @@ impl ActorState {
             ws: Arc::new(WsClient::new()),
             events,
             webrtc: Arc::new(WebRtcManager::new()),
+            crypto_state_lock: Arc::new(Mutex::new(())),
+            history_replay_stages: Arc::new(Mutex::new(
+                crate::crypto::history_stage::ReplayStages::default(),
+            )),
         }
     }
 }
@@ -128,8 +137,9 @@ impl Actor {
                     // without bound. Runs for the lifetime of the actor.
                     {
                         let db = state.db.clone();
+                        let crypto_state_lock = state.crypto_state_lock.clone();
                         tokio::task::spawn_local(async move {
-                            crate::db::cleanup::run(db).await;
+                            crate::db::cleanup::run(db, crypto_state_lock).await;
                         });
                     }
 

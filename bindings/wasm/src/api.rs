@@ -12,6 +12,7 @@ use wasm_bindgen_futures::JsFuture;
 use web_sys::AbortSignal;
 
 mod messaging;
+mod workflows;
 
 #[wasm_bindgen]
 pub struct BrowserApi {

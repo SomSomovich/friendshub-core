@@ -12,8 +12,6 @@ use crate::runtime::ActorState;
 
 /// ENVELOPE_TYPE_MESSAGE from friendshub.proto.
 pub(crate) const ENVELOPE_TYPE_MESSAGE: i32 = 1;
-/// ENVELOPE_TYPE_SYNC from friendshub.proto.
-pub(crate) const ENVELOPE_TYPE_SYNC: i32 = 2;
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct EstablishSessionRequest {
@@ -199,22 +197,12 @@ pub async fn send_message(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<V
     let mut sync_errors = Vec::new();
 
     if req.sync && !envelopes.is_empty() {
-        let sync_payload = serde_json::json!({
-            "kind": "sync_sent",
-            "to_account": req.recipient_account_id,
-            "to_devices": target_devices,
-            "conversation_id": req.conversation_id,
-            "plaintext_hex": req.plaintext_hex,
-            "envelope_ids": envelopes.iter().map(|e| e.envelope_id.clone()).collect::<Vec<_>>(),
-        });
-        let sync_bytes = serde_json::to_vec(&sync_payload)?;
-
         match sync_to_own_devices(
             state,
             &token,
             &sender_account_id,
             sender_device_number,
-            &sync_bytes,
+            &plaintext,
             req.conversation_id.as_deref(),
         )
         .await
@@ -264,7 +252,7 @@ async fn sync_to_own_devices(
             sender_account_id,
             d.device_number,
             payload,
-            ENVELOPE_TYPE_SYNC,
+            ENVELOPE_TYPE_MESSAGE,
             conversation_id,
         )
         .await

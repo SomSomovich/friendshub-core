@@ -253,6 +253,7 @@ async fn run_once(
         .clone()
         .filter(|t| !t.is_empty())
         .ok_or(Error::NotAuthenticated)?;
+    let local_account_id = auth.account_id.clone();
     let device_number = auth.device_number.unwrap_or(1);
 
     let (ws, _resp) = with_ws_timeout("ws connect", CONNECT_TIMEOUT, async {
@@ -364,8 +365,21 @@ async fn run_once(
                         if let Some(server_frame::Kind::Pong(pong)) = frame.kind.as_ref() {
                             resolve_pending_ping(&mut pending_pings, pong.client_timestamp);
                         }
-                        let action = handle_frame(state, frame).await;
-                        crate::api::emit_pending_identity_changes(state).await;
+                        let crypto_guard = if matches!(
+                            frame.kind.as_ref(),
+                            Some(server_frame::Kind::Delivery(_))
+                        ) {
+                            Some(state.crypto_state_lock.lock().await)
+                        } else {
+                            None
+                        };
+                        let action = handle_frame(state, frame, local_account_id.as_deref()).await;
+                        if crypto_guard.is_some() {
+                            crate::api::emit_pending_identity_changes(state).await;
+                        } else {
+                            let _crypto_guard = state.crypto_state_lock.lock().await;
+                            crate::api::emit_pending_identity_changes(state).await;
+                        }
                         match action {
                             FrameAction::Continue => {}
                             FrameAction::Reconnect => {
@@ -436,7 +450,11 @@ fn resolve_pending_ping(
     }
 }
 
-async fn handle_frame(state: &Arc<ActorState>, frame: ServerFrame) -> FrameAction {
+async fn handle_frame(
+    state: &Arc<ActorState>,
+    frame: ServerFrame,
+    local_account_id: Option<&str>,
+) -> FrameAction {
     let Some(kind) = frame.kind else {
         return FrameAction::Continue;
     };
@@ -454,7 +472,7 @@ async fn handle_frame(state: &Arc<ActorState>, frame: ServerFrame) -> FrameActio
 
         server_frame::Kind::Delivery(d) => {
             for env in &d.envelopes {
-                handle_envelope(state, env).await;
+                handle_envelope(state, env, local_account_id).await;
             }
         }
 
@@ -800,8 +818,9 @@ fn bot_callback_answered_event(answer: BotCallbackAnswered) -> Event {
 ///   a group message. Decrypted through the group path.
 /// - anything else: an ordinary Signal-encrypted envelope, decrypted through
 ///   the pairwise session.
-async fn handle_envelope(state: &Arc<ActorState>, env: &Envelope) {
+async fn handle_envelope(state: &Arc<ActorState>, env: &Envelope, local_account_id: Option<&str>) {
     let mut payload = envelope_to_json(env);
+    attach_local_account_id(&mut payload, local_account_id);
 
     let sender_account_id = uuid_or_hex(&env.sender_account_id);
     let sender_device_number = env.sender_device_number as i64;
@@ -812,16 +831,22 @@ async fn handle_envelope(state: &Arc<ActorState>, env: &Envelope) {
     };
 
     let outcome = if env.envelope_type == ENVELOPE_TYPE_SENDER_KEY {
-        match groups::process_distribution(
-            state,
-            &sender_account_id,
-            sender_device_number,
-            &env.ciphertext,
-        )
-        .await
-        {
-            Ok(()) => EnvelopeOutcome::DistributionStored,
-            Err(e) => EnvelopeOutcome::Failed(e.to_string()),
+        match crate::crypto::manager::decrypt_envelope(state, &payload).await {
+            Ok(plaintext) => match decode_sender_key_distribution(&plaintext) {
+                Ok(distribution) => match groups::process_distribution(
+                    state,
+                    &sender_account_id,
+                    sender_device_number,
+                    &distribution,
+                )
+                .await
+                {
+                    Ok(()) => EnvelopeOutcome::DistributionStored,
+                    Err(error) => EnvelopeOutcome::Failed(error.to_string()),
+                },
+                Err(error) => EnvelopeOutcome::Failed(error.to_string()),
+            },
+            Err(error) => EnvelopeOutcome::Failed(error.to_string()),
         }
     } else if env.envelope_type == ENVELOPE_TYPE_MESSAGE
         && groups::looks_like_sender_key_message(&env.ciphertext)
@@ -903,10 +928,35 @@ async fn handle_envelope(state: &Arc<ActorState>, env: &Envelope) {
     });
 }
 
+fn attach_local_account_id(payload: &mut serde_json::Value, local_account_id: Option<&str>) {
+    let (Some(local_account_id), Some(object)) = (local_account_id, payload.as_object_mut()) else {
+        return;
+    };
+    object.insert("local_account_id".into(), json!(local_account_id));
+}
+
 enum EnvelopeOutcome {
     Plaintext(String),
     DistributionStored,
     Failed(String),
+}
+
+/// WEB pairwise-encrypts the sender-key distribution's hexadecimal text.
+/// Recover its binary SKDM only after decrypting the ordinary Signal envelope.
+fn decode_sender_key_distribution(plaintext: &[u8]) -> Result<Vec<u8>> {
+    let encoded = std::str::from_utf8(plaintext).map_err(|error| {
+        Error::InvalidPayload(format!(
+            "sender-key distribution is not UTF-8 hex text: {error}"
+        ))
+    })?;
+    if encoded.is_empty() {
+        return Err(Error::InvalidPayload(
+            "sender-key distribution is empty".into(),
+        ));
+    }
+    hex::decode(encoded).map_err(|error| {
+        Error::InvalidPayload(format!("sender-key distribution hex is invalid: {error}"))
+    })
 }
 
 fn envelope_to_json(e: &Envelope) -> serde_json::Value {
@@ -1138,6 +1188,34 @@ fn get_bool(v: &serde_json::Value, key: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn envelope_event_carries_authenticated_local_account_identity_for_history_validation() {
+        let mut payload = json!({
+            "sender_account_id":"account-a",
+            "recipient_account_id":"account-a"
+        });
+        attach_local_account_id(&mut payload, Some("account-a"));
+        assert_eq!(payload["local_account_id"], "account-a");
+
+        let mut unavailable = json!({
+            "sender_account_id":"account-a",
+            "recipient_account_id":"account-a"
+        });
+        attach_local_account_id(&mut unavailable, None);
+        assert!(unavailable.get("local_account_id").is_none());
+    }
+
+    #[test]
+    fn sender_key_distribution_plaintext_matches_web_pairwise_hex_contract() {
+        assert_eq!(
+            decode_sender_key_distribution(b"0001ff").unwrap(),
+            [0x00, 0x01, 0xff]
+        );
+        assert!(decode_sender_key_distribution(&[0x00, 0x01, 0xff]).is_err());
+        assert!(decode_sender_key_distribution(b"0001 ").is_err());
+        assert!(decode_sender_key_distribution(b"").is_err());
+    }
 
     #[test]
     fn call_signal_event_preserves_fields_and_base64_encodes_payload() {

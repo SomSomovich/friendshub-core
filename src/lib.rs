@@ -26,6 +26,8 @@ pub mod events;
 pub mod ffi;
 #[cfg(feature = "native")]
 pub mod logging;
+#[cfg(any(feature = "native", feature = "wasm"))]
+pub mod message_payload;
 #[cfg(feature = "native")]
 pub mod method_ids;
 pub mod proto;

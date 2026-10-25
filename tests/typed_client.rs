@@ -7,6 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use friendshub_core::Client;
 use friendshub_core::config::{Config, DiscoveryConfig};
+use friendshub_core::error::Error;
 use friendshub_core::proto::rest::identity;
 use prost::Message;
 use serde::{Deserialize, Serialize};
@@ -135,6 +136,84 @@ fn named_native_methods_serialize_requests_and_decode_owned_responses() {
         .join()
         .expect("fixture thread should not panic")
         .expect("serve fixture");
+    remove_database_files(&database_path);
+}
+
+#[test]
+fn typed_history_sender_routes_before_network_and_requires_authentication() {
+    keyring::use_memory_keyring();
+    let database_path = unique_database_path();
+    let client = Client::open(Config {
+        db_path: database_path.clone(),
+        api_base: "http://127.0.0.1:1".into(),
+        ws_url: "ws://127.0.0.1:1/ws".into(),
+        discovery: DiscoveryConfig {
+            enabled: false,
+            ..DiscoveryConfig::default()
+        },
+        log_level: "error".into(),
+        log_format: "text".into(),
+    })
+    .expect("open client without authenticating");
+
+    let request = serde_json::json!({
+        "from_device_number": 2,
+        "conversation_ids": [],
+        "items": []
+    });
+    let error = client
+        .ws_send_history::<_, serde_json::Value>(&request)
+        .expect_err("the typed history sender must require an authenticated account");
+    assert!(matches!(error, Error::NotAuthenticated));
+
+    drop(client);
+    remove_database_files(&database_path);
+}
+
+#[test]
+fn typed_history_replay_routes_before_network_and_requires_authentication() {
+    keyring::use_memory_keyring();
+    let database_path = unique_database_path();
+    let client = Client::open(Config {
+        db_path: database_path.clone(),
+        api_base: "http://127.0.0.1:1".into(),
+        ws_url: "ws://127.0.0.1:1/ws".into(),
+        discovery: DiscoveryConfig {
+            enabled: false,
+            ..DiscoveryConfig::default()
+        },
+        log_level: "error".into(),
+        log_format: "text".into(),
+    })
+    .expect("open client without authenticating");
+
+    let conversation_request = serde_json::json!({
+        "conversationId": "11111111-1111-4111-8111-111111111111"
+    });
+    let error = client
+        .history_replay_begin_conversation_page::<_, serde_json::Value>(&conversation_request)
+        .expect_err("conversation history replay must require authentication");
+    assert!(matches!(error, Error::NotAuthenticated));
+
+    let error = client
+        .history_replay_begin_saved_page::<_, serde_json::Value>(&serde_json::json!({}))
+        .expect_err("Saved Messages history replay must require authentication");
+    assert!(matches!(error, Error::NotAuthenticated));
+
+    let token = serde_json::json!({
+        "replayToken": "00000000-0000-4000-8000-000000000000"
+    });
+    let error = client
+        .history_replay_commit::<_, serde_json::Value>(&token)
+        .expect_err("commit must reject an unknown replay token");
+    assert!(matches!(error, Error::InvalidPayload(_)));
+
+    let discarded: serde_json::Value = client
+        .history_replay_discard::<_, serde_json::Value>(&token)
+        .expect("discard of an unknown token is idempotent");
+    assert_eq!(discarded["discarded"], false);
+
+    drop(client);
     remove_database_files(&database_path);
 }
 

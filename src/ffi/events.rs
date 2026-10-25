@@ -68,6 +68,104 @@ pub struct FhEventCallbacks {
     pub on_unhandled: FhEventCallback,
 }
 
+/// Size/version-prefixed callback table for semantic receive callbacks.
+///
+/// This is a separate registration ABI: callers must set `struct_size` to the
+/// size of the table they provide and `abi_version` to
+/// [`FH_EVENT_CALLBACKS_V2_ABI_VERSION`]. The legacy table remains a nested,
+/// unchanged prefix, followed by callbacks for decoded receive payloads.
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+pub struct FhEventCallbacksV2 {
+    pub struct_size: usize,
+    pub abi_version: u32,
+    pub legacy: FhEventCallbacks,
+    pub on_message_received: FhEventCallback,
+    pub on_poll_received: FhEventCallback,
+    pub on_message_edited: FhEventCallback,
+    pub on_message_deleted: FhEventCallback,
+    pub on_message_reaction: FhEventCallback,
+    pub on_attachment_key_received: FhEventCallback,
+    pub on_call_signal_received: FhEventCallback,
+    pub on_history_chunk_received: FhEventCallback,
+    pub on_history_complete_received: FhEventCallback,
+    pub on_sender_key_received: FhEventCallback,
+}
+
+pub const FH_EVENT_CALLBACKS_V2_ABI_VERSION: u32 = 2;
+
+/// Copies a V2 table only after its fixed header declares the current version
+/// and enough readable bytes for every current field.
+///
+/// # Safety
+///
+/// `callbacks` must point to a readable prefix through `abi_version`. If that
+/// prefix declares a supported full-sized table, the complete current table
+/// must be readable.
+pub(crate) unsafe fn copy_v2_callback_table(
+    callbacks: *const FhEventCallbacksV2,
+) -> Option<FhEventCallbacksV2> {
+    if callbacks.is_null() {
+        return None;
+    }
+    // SAFETY: the function contract guarantees that the fixed header exists.
+    let struct_size = unsafe { std::ptr::read_unaligned(callbacks.cast::<usize>()) };
+    let version_offset = std::mem::offset_of!(FhEventCallbacksV2, abi_version);
+    // SAFETY: the function contract guarantees that abi_version exists.
+    let abi_version = unsafe {
+        std::ptr::read_unaligned((callbacks.cast::<u8>().add(version_offset)).cast::<u32>())
+    };
+    if abi_version != FH_EVENT_CALLBACKS_V2_ABI_VERSION
+        || struct_size < std::mem::size_of::<FhEventCallbacksV2>()
+    {
+        return None;
+    }
+    // SAFETY: the fixed header passed both checks and its size covers the table.
+    Some(unsafe { std::ptr::read_unaligned(callbacks) })
+}
+
+#[derive(Clone, Copy, Default)]
+struct CallbackSet {
+    legacy: FhEventCallbacks,
+    on_message_received: FhEventCallback,
+    on_poll_received: FhEventCallback,
+    on_message_edited: FhEventCallback,
+    on_message_deleted: FhEventCallback,
+    on_message_reaction: FhEventCallback,
+    on_attachment_key_received: FhEventCallback,
+    on_call_signal_received: FhEventCallback,
+    on_history_chunk_received: FhEventCallback,
+    on_history_complete_received: FhEventCallback,
+    on_sender_key_received: FhEventCallback,
+}
+
+impl From<FhEventCallbacks> for CallbackSet {
+    fn from(legacy: FhEventCallbacks) -> Self {
+        Self {
+            legacy,
+            ..Self::default()
+        }
+    }
+}
+
+impl From<FhEventCallbacksV2> for CallbackSet {
+    fn from(callbacks: FhEventCallbacksV2) -> Self {
+        Self {
+            legacy: callbacks.legacy,
+            on_message_received: callbacks.on_message_received,
+            on_poll_received: callbacks.on_poll_received,
+            on_message_edited: callbacks.on_message_edited,
+            on_message_deleted: callbacks.on_message_deleted,
+            on_message_reaction: callbacks.on_message_reaction,
+            on_attachment_key_received: callbacks.on_attachment_key_received,
+            on_call_signal_received: callbacks.on_call_signal_received,
+            on_history_chunk_received: callbacks.on_history_chunk_received,
+            on_history_complete_received: callbacks.on_history_complete_received,
+            on_sender_key_received: callbacks.on_sender_key_received,
+        }
+    }
+}
+
 #[derive(Default)]
 struct CallbackState {
     closing: bool,
@@ -79,7 +177,7 @@ struct CallbackState {
 /// caller promises the pointed-to context remains valid until unregister or
 /// `fh_destroy` returns. EventQueue invokes each handler on one worker thread.
 pub(crate) struct FfiEventHandler {
-    callbacks: FhEventCallbacks,
+    callbacks: CallbackSet,
     user_data: *mut c_void,
     state: Mutex<CallbackState>,
     idle: Condvar,
@@ -97,6 +195,14 @@ thread_local! {
 
 impl FfiEventHandler {
     pub(crate) fn new(callbacks: FhEventCallbacks, user_data: *mut c_void) -> Self {
+        Self::with_callbacks(callbacks.into(), user_data)
+    }
+
+    pub(crate) fn new_v2(callbacks: FhEventCallbacksV2, user_data: *mut c_void) -> Self {
+        Self::with_callbacks(callbacks.into(), user_data)
+    }
+
+    fn with_callbacks(callbacks: CallbackSet, user_data: *mut c_void) -> Self {
         Self {
             callbacks,
             user_data,
@@ -177,14 +283,31 @@ impl FfiEventHandler {
             current.set(previous);
         });
     }
+
+    fn invoke_semantic(&self, callback: FhEventCallback, event: &Event) {
+        if let Some(callback) = callback {
+            self.invoke(Some(callback), event);
+            return;
+        }
+        let mut raw = event.clone();
+        raw.kind = "envelope_received".into();
+        if let Some(payload) = raw.payload.as_object_mut() {
+            payload.remove("decrypted_payload");
+        }
+        self.invoke(self.callbacks.legacy.on_envelope_received, &raw);
+    }
 }
 
 macro_rules! callback_methods {
-    ($($method:ident => $field:ident),+ $(,)?) => {
+    ($($method:ident => ($semantic:literal, $($field:ident).+)),+ $(,)?) => {
         impl EventHandler for FfiEventHandler {
             $(
                 fn $method(&self, event: &Event) {
-                    self.invoke(self.callbacks.$field, event);
+                    if $semantic {
+                        self.invoke_semantic(self.callbacks.$($field).+, event);
+                    } else {
+                        self.invoke(self.callbacks.$($field).+, event);
+                    }
                 }
             )+
         }
@@ -192,44 +315,54 @@ macro_rules! callback_methods {
 }
 
 callback_methods!(
-    on_ws_connected => on_ws_connected,
-    on_ws_disconnected => on_ws_disconnected,
-    on_ws_stopped => on_ws_stopped,
-    on_envelope_received => on_envelope_received,
-    on_receipt => on_receipt,
-    on_server_error => on_server_error,
-    on_fatal_error => on_fatal_error,
-    on_presence_updated => on_presence_updated,
-    on_bot_message => on_bot_message,
-    on_channel_post => on_channel_post,
-    on_typing => on_typing,
-    on_read_receipt => on_read_receipt,
-    on_conversation_updated => on_conversation_updated,
-    on_history_request => on_history_request,
-    on_nudge => on_nudge,
-    on_nudge_result => on_nudge_result,
-    on_conversation_expired => on_conversation_expired,
-    on_scheduled_created => on_scheduled_created,
-    on_scheduled_cancelled => on_scheduled_cancelled,
-    on_folders_updated => on_folders_updated,
-    on_bot_message_edited => on_bot_message_edited,
-    on_bot_message_deleted => on_bot_message_deleted,
-    on_bot_callback_answered => on_bot_callback_answered,
-    on_poll_updated => on_poll_updated,
-    on_poll_deleted => on_poll_deleted,
-    on_call_signal => on_call_signal,
-    on_identity_changed => on_identity_changed,
-    on_webrtc_ice_candidate => on_webrtc_ice_candidate,
-    on_webrtc_signaling_state_changed => on_webrtc_signaling_state_changed,
-    on_webrtc_ice_connection_state_changed => on_webrtc_ice_connection_state_changed,
-    on_webrtc_ice_gathering_state_changed => on_webrtc_ice_gathering_state_changed,
-    on_webrtc_connection_state_changed => on_webrtc_connection_state_changed,
-    on_webrtc_data_channel_opened => on_webrtc_data_channel_opened,
-    on_webrtc_data_channel_closed => on_webrtc_data_channel_closed,
-    on_webrtc_data_channel_message => on_webrtc_data_channel_message,
-    on_webrtc_track_received => on_webrtc_track_received,
-    on_webrtc_closed => on_webrtc_closed,
-    on_unhandled => on_unhandled,
+    on_ws_connected => (false, legacy.on_ws_connected),
+    on_ws_disconnected => (false, legacy.on_ws_disconnected),
+    on_ws_stopped => (false, legacy.on_ws_stopped),
+    on_envelope_received => (false, legacy.on_envelope_received),
+    on_message_received => (true, on_message_received),
+    on_poll_received => (true, on_poll_received),
+    on_message_edited => (true, on_message_edited),
+    on_message_deleted => (true, on_message_deleted),
+    on_message_reaction => (true, on_message_reaction),
+    on_attachment_key_received => (true, on_attachment_key_received),
+    on_call_signal_received => (true, on_call_signal_received),
+    on_history_chunk_received => (true, on_history_chunk_received),
+    on_history_complete_received => (true, on_history_complete_received),
+    on_sender_key_received => (true, on_sender_key_received),
+    on_receipt => (false, legacy.on_receipt),
+    on_server_error => (false, legacy.on_server_error),
+    on_fatal_error => (false, legacy.on_fatal_error),
+    on_presence_updated => (false, legacy.on_presence_updated),
+    on_bot_message => (false, legacy.on_bot_message),
+    on_channel_post => (false, legacy.on_channel_post),
+    on_typing => (false, legacy.on_typing),
+    on_read_receipt => (false, legacy.on_read_receipt),
+    on_conversation_updated => (false, legacy.on_conversation_updated),
+    on_history_request => (false, legacy.on_history_request),
+    on_nudge => (false, legacy.on_nudge),
+    on_nudge_result => (false, legacy.on_nudge_result),
+    on_conversation_expired => (false, legacy.on_conversation_expired),
+    on_scheduled_created => (false, legacy.on_scheduled_created),
+    on_scheduled_cancelled => (false, legacy.on_scheduled_cancelled),
+    on_folders_updated => (false, legacy.on_folders_updated),
+    on_bot_message_edited => (false, legacy.on_bot_message_edited),
+    on_bot_message_deleted => (false, legacy.on_bot_message_deleted),
+    on_bot_callback_answered => (false, legacy.on_bot_callback_answered),
+    on_poll_updated => (false, legacy.on_poll_updated),
+    on_poll_deleted => (false, legacy.on_poll_deleted),
+    on_call_signal => (false, legacy.on_call_signal),
+    on_identity_changed => (false, legacy.on_identity_changed),
+    on_webrtc_ice_candidate => (false, legacy.on_webrtc_ice_candidate),
+    on_webrtc_signaling_state_changed => (false, legacy.on_webrtc_signaling_state_changed),
+    on_webrtc_ice_connection_state_changed => (false, legacy.on_webrtc_ice_connection_state_changed),
+    on_webrtc_ice_gathering_state_changed => (false, legacy.on_webrtc_ice_gathering_state_changed),
+    on_webrtc_connection_state_changed => (false, legacy.on_webrtc_connection_state_changed),
+    on_webrtc_data_channel_opened => (false, legacy.on_webrtc_data_channel_opened),
+    on_webrtc_data_channel_closed => (false, legacy.on_webrtc_data_channel_closed),
+    on_webrtc_data_channel_message => (false, legacy.on_webrtc_data_channel_message),
+    on_webrtc_track_received => (false, legacy.on_webrtc_track_received),
+    on_webrtc_closed => (false, legacy.on_webrtc_closed),
+    on_unhandled => (false, legacy.on_unhandled),
 );
 
 #[cfg(test)]
@@ -238,7 +371,10 @@ mod tests {
     use std::sync::mpsc;
     use std::time::Duration;
 
-    use super::{FfiEventHandler, FhEventCallbacks, FhEventView};
+    use super::{
+        FH_EVENT_CALLBACKS_V2_ABI_VERSION, FfiEventHandler, FhEventCallbacks, FhEventCallbacksV2,
+        FhEventView,
+    };
     use crate::events::types::{Event, EventHandler};
 
     unsafe extern "C" fn on_typing(user_data: *mut c_void, event: *const FhEventView) {
@@ -266,5 +402,68 @@ mod tests {
         assert_eq!(id, 42);
         assert!(json.contains("conversation_id"));
         assert!(json.contains("\"kind\":\"typing\""));
+    }
+
+    #[test]
+    fn v2_semantic_callback_receives_the_original_durable_id() {
+        let (tx, rx): (mpsc::Sender<(u64, String)>, _) = mpsc::channel();
+        let callbacks = FhEventCallbacksV2 {
+            struct_size: std::mem::size_of::<FhEventCallbacksV2>(),
+            abi_version: FH_EVENT_CALLBACKS_V2_ABI_VERSION,
+            on_message_received: Some(on_typing),
+            ..FhEventCallbacksV2::default()
+        };
+        let handler = FfiEventHandler::new_v2(callbacks, &tx as *const _ as *mut c_void);
+        handler.on_message_received(&Event {
+            id: Some(9001),
+            kind: "message_received".into(),
+            payload: serde_json::json!({"decrypted_payload":{"message_id":"m1"}}),
+        });
+        handler.close();
+        let (id, json) = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(id, 9001);
+        assert!(json.contains("message_received"));
+        assert!(json.contains("message_id"));
+    }
+
+    #[test]
+    fn legacy_c_registration_receives_raw_envelopes_for_new_semantic_events() {
+        let (tx, rx): (mpsc::Sender<(u64, String)>, _) = mpsc::channel();
+        let mut callbacks = FhEventCallbacks::default();
+        callbacks.on_envelope_received = Some(on_typing);
+        let handler = FfiEventHandler::new(callbacks, &tx as *const _ as *mut c_void);
+        handler.on_message_received(&Event {
+            id: Some(9002),
+            kind: "message_received".into(),
+            payload: serde_json::json!({
+                "envelope_id":"e1", "decrypted_payload":{"message_id":"m1"}
+            }),
+        });
+        handler.close();
+        let (id, json) = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(id, 9002);
+        assert!(json.contains("\"kind\":\"envelope_received\""));
+        assert!(json.contains("envelope_id"));
+        assert!(!json.contains("decrypted_payload"));
+    }
+
+    #[test]
+    fn v2_table_rejects_a_short_header_without_reading_callback_slots() {
+        let header_size = std::mem::offset_of!(FhEventCallbacksV2, legacy);
+        let mut bytes = vec![0_u8; header_size];
+        let version_offset = std::mem::offset_of!(FhEventCallbacksV2, abi_version);
+        // SAFETY: the byte buffer is exactly large enough for the fixed header;
+        // the helper must reject it before reading the callback table.
+        unsafe {
+            std::ptr::write_unaligned(bytes.as_mut_ptr().cast::<usize>(), header_size);
+            std::ptr::write_unaligned(
+                bytes.as_mut_ptr().add(version_offset).cast::<u32>(),
+                FH_EVENT_CALLBACKS_V2_ABI_VERSION,
+            );
+        }
+        // SAFETY: the buffer contains the declared header but no callback slots.
+        let copied =
+            unsafe { super::copy_v2_callback_table(bytes.as_ptr().cast::<FhEventCallbacksV2>()) };
+        assert!(copied.is_none());
     }
 }
