@@ -127,6 +127,14 @@ uint32_t fh_abi_version(void);
  */
 int32_t fh_android_init(void *java_vm, void *application_context_global_ref);
 
+/**
+ * Reuses the JavaVM and process-lifetime Application context already
+ * registered by android-activity. Call after android-activity startup and
+ * before fh_init or Client::open. Returns 0 on success, -1 on failure, and
+ * -2 on non-Android targets.
+ */
+int32_t fh_android_init_from_ndk_context(void);
+
 
 /**
  * Installs per-event callbacks, or clears callbacks when `callbacks` is null.

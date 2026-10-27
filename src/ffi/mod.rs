@@ -82,6 +82,31 @@ pub unsafe extern "C" fn fh_android_init(
     })
 }
 
+/// Registers an Android context already initialized by `android-activity`.
+/// This is intended for hosts such as Slint's Android backend, which installs
+/// the process-lifetime Application context before entering `android_main`.
+/// Unlike [`fh_android_init`], this function reuses `ndk-context`'s existing
+/// handles and does not initialize its singleton again. Call it after the
+/// Android activity runtime startup and before `fh_init` or `Client::open`.
+/// Returns 0 on success, -1 on failure (including a call before the context is
+/// available), and -2 on non-Android targets.
+#[unsafe(no_mangle)]
+pub extern "C" fn fh_android_init_from_ndk_context() -> i32 {
+    guard(-1, || {
+        #[cfg(target_os = "android")]
+        {
+            match db::key_store::android::initialize_existing_ndk_context() {
+                Ok(()) => 0,
+                Err(_) => -1,
+            }
+        }
+        #[cfg(not(target_os = "android"))]
+        {
+            -2
+        }
+    })
+}
+
 /// Initialises a handle for one account and supplies any result through a
 /// synchronous callback borrow. On success the result is empty; on failure it
 /// is a JSON error object. The result memory is owned and released by the

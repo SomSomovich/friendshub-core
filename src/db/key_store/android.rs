@@ -73,19 +73,16 @@ mod platform {
         Error::Config("Android context initialization failed".into())
     }
 
-    /// # Safety
-    /// Both pointers must be valid for the process lifetime. The context must
-    /// be a JNI global reference to Application.getApplicationContext(). The
-    /// host must not initialize/release ndk-context independently.
-    pub(crate) unsafe fn initialize_android_context(
+    fn register_context(
         java_vm: *mut c_void,
         application_context_global_ref: *mut c_void,
+        initialize_ndk_context: bool,
     ) -> Result<()> {
         if java_vm.is_null() || application_context_global_ref.is_null() {
             return Err(context_error());
         }
         let mut context = CONTEXT.lock().map_err(|_| context_error())?;
-        // SAFETY: validity and lifetime of VM/global reference are host contracts.
+        // SAFETY: the caller guarantees that java_vm is the process JavaVM.
         let vm = unsafe { JavaVM::from_raw(java_vm.cast()) }.map_err(|_| context_error())?;
         let env = vm.attach_current_thread().map_err(|_| context_error())?;
         let same = if let Some((old_vm, old_ref)) = context.pointers {
@@ -103,15 +100,43 @@ mod platform {
         };
         let initialize = context.state.register(same)?;
         if initialize {
-            // SAFETY: the startup mutex serializes first registration, and
-            // the host excludes independent ndk-context initialization/users.
-            // Registered contexts are never released or replaced.
-            unsafe {
-                ndk_context::initialize_android_context(java_vm, application_context_global_ref);
+            if initialize_ndk_context {
+                // SAFETY: the startup mutex serializes first registration, and
+                // the host excludes independent ndk-context initialization/users.
+                // Registered contexts are never released or replaced.
+                unsafe {
+                    ndk_context::initialize_android_context(
+                        java_vm,
+                        application_context_global_ref,
+                    );
+                }
             }
             context.pointers = Some((java_vm as usize, application_context_global_ref as usize));
         }
         Ok(())
+    }
+
+    /// # Safety
+    /// Both pointers must be valid for the process lifetime. The context must
+    /// be a JNI global reference to Application.getApplicationContext(). The
+    /// host must not initialize/release ndk-context independently.
+    pub(crate) unsafe fn initialize_android_context(
+        java_vm: *mut c_void,
+        application_context_global_ref: *mut c_void,
+    ) -> Result<()> {
+        // SAFETY: validity and lifetime of VM/global reference are host contracts.
+        unsafe { register_context(java_vm, application_context_global_ref, true) }
+    }
+
+    /// Registers the Android context already installed by android-activity.
+    /// Its startup hook stores an Application global reference in ndk-context;
+    /// this path records the same borrowed pointers in core without attempting
+    /// to initialize ndk-context a second time.
+    pub(crate) fn initialize_existing_ndk_context() -> Result<()> {
+        // SAFETY: callers must invoke this only after android-activity has
+        // initialized ndk-context with its process-lifetime Application ref.
+        let context = ndk_context::android_context();
+        register_context(context.vm(), context.context(), false)
     }
 
     pub(crate) struct AndroidOpenGuard {
@@ -147,7 +172,9 @@ mod platform {
 }
 
 #[cfg(target_os = "android")]
-pub(crate) use platform::{begin_core_open, initialize_android_context};
+pub(crate) use platform::{
+    begin_core_open, initialize_android_context, initialize_existing_ndk_context,
+};
 
 #[cfg(test)]
 mod tests {

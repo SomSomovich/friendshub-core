@@ -1152,7 +1152,7 @@ dependencies = [
 
 [[package]]
 name = "friendshub-core"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "android-native-keyring-store",
  "anyhow",
