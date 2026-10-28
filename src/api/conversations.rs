@@ -17,6 +17,9 @@ pub struct ConversationItem {
     pub updated_at: i64,
     pub archived_at: Option<i64>,
     pub muted_until: Option<i64>,
+    /// Number of envelopes addressed to this account/device after its read marker.
+    #[serde(default)]
+    pub unread_count: i64,
 }
 
 pub async fn list(state: &Arc<ActorState>, _payload: Vec<u8>) -> Result<Vec<u8>> {
