@@ -2,6 +2,36 @@ use crate::db::auth as db_auth;
 use crate::error::{Error, Result};
 use crate::runtime::ActorState;
 
+/// The WebSocket dispatcher accepts scheduled envelopes up to one day ahead.
+pub const MAX_SCHEDULED_SEND_HORIZON_SECONDS: i64 = 24 * 60 * 60;
+/// Time reserved for request transit and server-side fanout before delivery.
+pub const SCHEDULED_SEND_SAFETY_MARGIN_SECONDS: i64 = 60;
+
+/// Converts an optional scheduled delivery time into the envelope value and
+/// rejects timestamps that the server would silently discard.
+pub fn validate_scheduled_send_at(send_at: Option<i64>) -> Result<i64> {
+    let Some(send_at) = send_at else {
+        return Ok(0);
+    };
+    if send_at == 0 {
+        return Ok(0);
+    }
+    let now = crate::util::time::now_unix();
+    if send_at < 0 || send_at <= now {
+        return Err(Error::InvalidPayload(
+            "send_at must be a future Unix timestamp".to_owned(),
+        ));
+    }
+    let max_client_horizon =
+        MAX_SCHEDULED_SEND_HORIZON_SECONDS - SCHEDULED_SEND_SAFETY_MARGIN_SECONDS;
+    if send_at > now.saturating_add(max_client_horizon) {
+        return Err(Error::InvalidPayload(format!(
+            "send_at must be no more than {max_client_horizon} seconds in the future"
+        )));
+    }
+    Ok(send_at)
+}
+
 /// Loads the stored session token, or fails when the account is signed out.
 pub async fn bearer(state: &ActorState) -> Result<String> {
     let auth = db_auth::load(&state.db)

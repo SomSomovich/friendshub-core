@@ -2,11 +2,11 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::api::common::bearer;
+use crate::api::common::{bearer, validate_scheduled_send_at};
 use crate::api::conversations::ConversationDetail;
 use crate::crypto::device_cache;
 use crate::crypto::groups;
-use crate::crypto::send::{SentEnvelope, send_one};
+use crate::crypto::send::{SentEnvelope, send_one, send_one_with_send_at};
 use crate::db::auth as db_auth;
 use crate::error::{Error, Result};
 use crate::runtime::ActorState;
@@ -132,7 +132,7 @@ pub async fn create_distribution(state: &Arc<ActorState>, payload: Vec<u8>) -> R
 // Encrypt once, fan out to every member device, sync to own devices
 // ---------------------------------------------------------------
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SendGroupRequest {
     pub conversation_id: String,
     /// Hex-encoded shared message payload (the `message_payload` builder's
@@ -143,6 +143,17 @@ pub struct SendGroupRequest {
     /// conversation state would otherwise not reflect what the caller sent.
     #[serde(default = "default_true")]
     pub sync: bool,
+}
+
+/// Wrapper for the existing group-send request with optional scheduled
+/// delivery. Serde flattens `request`, preserving the current JSON keys.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ScheduledSendGroupRequest {
+    #[serde(flatten)]
+    pub request: SendGroupRequest,
+    /// Unix timestamp in seconds. `None` or zero means immediate delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_at: Option<i64>,
 }
 
 fn default_true() -> bool {
@@ -166,7 +177,9 @@ pub struct SendGroupResponse {
 /// its own sender-key output, so sync carries the same plaintext payload that
 /// was encrypted for the group.
 pub async fn send_group_message(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
-    let req: SendGroupRequest = serde_json::from_slice(&payload)?;
+    let scheduled: ScheduledSendGroupRequest = serde_json::from_slice(&payload)?;
+    let req = scheduled.request;
+    let send_at = validate_scheduled_send_at(scheduled.send_at)?;
     let plaintext = hex::decode(&req.plaintext_hex)
         .map_err(|e| Error::InvalidPayload(format!("plaintext hex: {e}")))?;
 
@@ -214,6 +227,7 @@ pub async fn send_group_message(state: &Arc<ActorState>, payload: Vec<u8>) -> Re
                 d.device_number,
                 &skm,
                 &req.conversation_id,
+                send_at,
             )
             .await
             {
@@ -240,7 +254,7 @@ pub async fn send_group_message(state: &Arc<ActorState>, payload: Vec<u8>) -> Re
             if d.device_number == sender_device_number {
                 continue;
             }
-            match send_one(
+            match send_one_with_send_at(
                 state,
                 &token,
                 &sender_account_id,
@@ -252,6 +266,7 @@ pub async fn send_group_message(state: &Arc<ActorState>, payload: Vec<u8>) -> Re
                 &plaintext,
                 ENVELOPE_TYPE_MESSAGE,
                 Some(&req.conversation_id),
+                send_at,
             )
             .await
             {
@@ -287,6 +302,7 @@ fn pairwise_distribution_plaintext(skdm: &[u8]) -> Vec<u8> {
 /// Builds the websocket envelope for a group ciphertext. Group ciphertext is
 /// already encrypted with Sender Keys and must remain byte-for-byte intact in
 /// the protobuf Envelope; it is not encrypted through a pairwise session.
+#[cfg(test)]
 fn raw_group_envelope(
     sender_account_id: &str,
     sender_device_number: i64,
@@ -297,7 +313,32 @@ fn raw_group_envelope(
     client_timestamp: i64,
     ciphertext: &[u8],
 ) -> serde_json::Value {
-    serde_json::json!({
+    raw_group_envelope_with_send_at(
+        sender_account_id,
+        sender_device_number,
+        recipient_account_id,
+        recipient_device_number,
+        conversation_id,
+        envelope_id,
+        client_timestamp,
+        ciphertext,
+        0,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn raw_group_envelope_with_send_at(
+    sender_account_id: &str,
+    sender_device_number: i64,
+    recipient_account_id: &str,
+    recipient_device_number: i64,
+    conversation_id: &str,
+    envelope_id: &str,
+    client_timestamp: i64,
+    ciphertext: &[u8],
+    send_at: i64,
+) -> serde_json::Value {
+    let mut envelope = serde_json::json!({
         "envelope_id": envelope_id,
         "sender_account_id": sender_account_id,
         "sender_device_number": sender_device_number,
@@ -309,7 +350,11 @@ fn raw_group_envelope(
         "client_timestamp": client_timestamp,
         "conversation_id": conversation_id,
         "sender_is_bot": false,
-    })
+    });
+    if send_at > 0 {
+        envelope["send_at"] = serde_json::json!(send_at);
+    }
+    envelope
 }
 
 async fn send_sender_key_message(
@@ -320,9 +365,10 @@ async fn send_sender_key_message(
     recipient_device_number: i64,
     ciphertext: &[u8],
     conversation_id: &str,
+    send_at: i64,
 ) -> Result<SentEnvelope> {
     let envelope_id = uuid::Uuid::now_v7().to_string();
-    let value = raw_group_envelope(
+    let value = raw_group_envelope_with_send_at(
         sender_account_id,
         sender_device_number,
         recipient_account_id,
@@ -331,6 +377,7 @@ async fn send_sender_key_message(
         &envelope_id,
         now_unix(),
         ciphertext,
+        send_at,
     );
     upload_envelope(state, value).await?;
 

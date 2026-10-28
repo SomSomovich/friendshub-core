@@ -2,10 +2,10 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
-use crate::api::common::bearer;
+use crate::api::common::{bearer, validate_scheduled_send_at};
 use crate::crypto::device_cache;
 use crate::crypto::manager::{decrypt_envelope, encrypt_for_device, establish_outbound_session};
-use crate::crypto::send::{SentEnvelope, send_one};
+use crate::crypto::send::{SentEnvelope, send_one_with_send_at};
 use crate::db::auth as db_auth;
 use crate::error::{Error, Result};
 use crate::runtime::ActorState;
@@ -112,6 +112,18 @@ pub struct SendMessageRequest {
     pub sync: bool,
 }
 
+/// Wrapper for the existing message request with optional scheduled delivery.
+/// Serde flattens `request`, so the JSON remains compatible with the existing
+/// `SendMessageRequest` wire shape and adds only the optional `send_at` key.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ScheduledSendMessageRequest {
+    #[serde(flatten)]
+    pub request: SendMessageRequest,
+    /// Unix timestamp in seconds. `None` or zero means immediate delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub send_at: Option<i64>,
+}
+
 fn default_true() -> bool {
     true
 }
@@ -137,7 +149,9 @@ pub struct SendMessageResponse {
 /// recipient side the response still returns, with an empty `envelopes` and
 /// a populated `device_errors`; the caller decides whether to retry.
 pub async fn send_message(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
-    let req: SendMessageRequest = serde_json::from_slice(&payload)?;
+    let scheduled: ScheduledSendMessageRequest = serde_json::from_slice(&payload)?;
+    let req = scheduled.request;
+    let send_at = validate_scheduled_send_at(scheduled.send_at)?;
     let plaintext = hex::decode(&req.plaintext_hex)
         .map_err(|e| Error::InvalidPayload(format!("plaintext hex: {e}")))?;
 
@@ -172,7 +186,7 @@ pub async fn send_message(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<V
     let mut device_errors = Vec::new();
 
     for device_number in &target_devices {
-        match send_one(
+        match send_one_with_send_at(
             state,
             &token,
             &sender_account_id,
@@ -182,6 +196,7 @@ pub async fn send_message(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<V
             &plaintext,
             ENVELOPE_TYPE_MESSAGE,
             req.conversation_id.as_deref(),
+            send_at,
         )
         .await
         {
@@ -204,6 +219,7 @@ pub async fn send_message(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<V
             sender_device_number,
             &plaintext,
             req.conversation_id.as_deref(),
+            send_at,
         )
         .await
         {
@@ -235,6 +251,7 @@ async fn sync_to_own_devices(
     sender_device_number: i64,
     payload: &[u8],
     conversation_id: Option<&str>,
+    send_at: i64,
 ) -> Result<(Vec<SentEnvelope>, Vec<DeviceError>)> {
     let devices = device_cache::get(state, sender_account_id).await?;
     let mut envelopes = Vec::new();
@@ -244,7 +261,7 @@ async fn sync_to_own_devices(
         if d.device_number == sender_device_number {
             continue;
         }
-        match send_one(
+        match send_one_with_send_at(
             state,
             token,
             sender_account_id,
@@ -254,6 +271,7 @@ async fn sync_to_own_devices(
             payload,
             ENVELOPE_TYPE_MESSAGE,
             conversation_id,
+            send_at,
         )
         .await
         {

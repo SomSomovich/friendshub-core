@@ -38,6 +38,36 @@ pub async fn send_one(
     envelope_type: i32,
     conversation_id: Option<&str>,
 ) -> Result<SentEnvelope> {
+    send_one_with_send_at(
+        state,
+        token,
+        sender_account_id,
+        sender_device_number,
+        recipient_account_id,
+        device_number,
+        plaintext,
+        envelope_type,
+        conversation_id,
+        0,
+    )
+    .await
+}
+
+/// Sends one payload to one device, optionally scheduling its server delivery
+/// at the supplied Unix timestamp. A value of zero means immediate delivery.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn send_one_with_send_at(
+    state: &Arc<ActorState>,
+    token: &str,
+    sender_account_id: &str,
+    sender_device_number: i64,
+    recipient_account_id: &str,
+    device_number: i64,
+    plaintext: &[u8],
+    envelope_type: i32,
+    conversation_id: Option<&str>,
+    send_at: i64,
+) -> Result<SentEnvelope> {
     let have = has_session(state, recipient_account_id, device_number)
         .await
         .map_err(Error::from)?;
@@ -71,7 +101,7 @@ pub async fn send_one(
 
     let envelope_id = uuid::Uuid::now_v7().to_string();
 
-    let envelope = serde_json::json!({
+    let mut envelope = serde_json::json!({
         "envelope_id": envelope_id,
         "sender_account_id": sender_account_id,
         "sender_device_number": sender_device_number,
@@ -84,6 +114,9 @@ pub async fn send_one(
         "conversation_id": conversation_id,
         "sender_is_bot": false,
     });
+    if send_at > 0 {
+        envelope["send_at"] = serde_json::json!(send_at);
+    }
 
     upload_envelope(state, envelope).await?;
 
