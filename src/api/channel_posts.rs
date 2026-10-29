@@ -34,13 +34,34 @@ pub struct PublishRequest {
     pub forward_from: Option<String>,
 }
 
+/// Creates a new key for one channel-post publication intent. Callers should
+/// retain it while retrying that same publication after an uncertain result.
+pub fn new_idempotency_key() -> String {
+    Uuid::new_v4().to_string()
+}
+
 pub async fn publish(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
     let token = bearer(state).await?;
-    let v: serde_json::Value = serde_json::from_slice(&payload)?;
+    let mut v: serde_json::Value = serde_json::from_slice(&payload)?;
+    let idempotency_key = match v
+        .as_object_mut()
+        .and_then(|object| object.remove("__core_idempotency_key"))
+    {
+        Some(Value::String(key)) => key,
+        Some(_) => {
+            return Err(Error::InvalidPayload(
+                "channel post idempotency key must be a string".into(),
+            ));
+        }
+        None => new_idempotency_key(),
+    };
     let channel_id = str_field(&v, "channel_id")?;
     let req: PublishRequest = serde_json::from_value(v)?;
     let path = format!("/api/v1/channels/{channel_id}/posts");
-    let post: PostItem = state.http.post(&path, &req, Some(&token)).await?;
+    let post: PostItem = state
+        .http
+        .post_with_idempotency_key(&path, &req, Some(&token), &idempotency_key)
+        .await?;
     Ok(serde_json::to_vec(&post)?)
 }
 

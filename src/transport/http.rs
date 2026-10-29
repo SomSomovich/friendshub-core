@@ -57,6 +57,36 @@ impl HttpClient {
             .await
     }
 
+    /// Sends a POST with a caller-owned idempotency key. Rate-limit retries
+    /// retain the same key, and the key is never included in the request body.
+    pub async fn post_with_idempotency_key<B: Serialize, R: DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &B,
+        bearer: Option<&str>,
+        idempotency_key: &str,
+    ) -> Result<R> {
+        if idempotency_key.is_empty()
+            || idempotency_key.len() > 128
+            || !idempotency_key
+                .bytes()
+                .all(|byte| (0x21..=0x7e).contains(&byte))
+        {
+            return Err(Error::InvalidPayload(
+                "Idempotency-Key must contain 1-128 visible ASCII characters".into(),
+            ));
+        }
+        self.send_with_retry_and_idempotency_key(
+            Method::POST,
+            path,
+            Some(body),
+            bearer,
+            true,
+            Some(idempotency_key),
+        )
+        .await
+    }
+
     /// Sends a mutation without retrying HTTP 429, matching APIs where the
     /// web client deliberately surfaces rate limiting to the caller.
     pub async fn post_no_rate_limit_retry<B: Serialize, R: DeserializeOwned>(
@@ -368,6 +398,26 @@ impl HttpClient {
         bearer: Option<&str>,
         retry_on_rate_limit: bool,
     ) -> Result<R> {
+        self.send_with_retry_and_idempotency_key(
+            method,
+            path,
+            body,
+            bearer,
+            retry_on_rate_limit,
+            None,
+        )
+        .await
+    }
+
+    async fn send_with_retry_and_idempotency_key<B: Serialize, R: DeserializeOwned>(
+        &self,
+        method: Method,
+        path: &str,
+        body: Option<&B>,
+        bearer: Option<&str>,
+        retry_on_rate_limit: bool,
+        idempotency_key: Option<&str>,
+    ) -> Result<R> {
         let url = format!("{}{}", self.base, path);
         let protocol = protobuf::protocol_for(method.as_str(), path)?;
         let encoded_body = match protocol {
@@ -401,6 +451,9 @@ impl HttpClient {
             let mut req = self.client.request(method.clone(), &url);
             if let Some(token) = bearer {
                 req = req.bearer_auth(token);
+            }
+            if let Some(key) = idempotency_key {
+                req = req.header("Idempotency-Key", key);
             }
             match protocol {
                 Protocol::Json => {

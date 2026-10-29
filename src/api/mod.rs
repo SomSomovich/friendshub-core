@@ -6,6 +6,7 @@ use crate::events::types::Event;
 use crate::runtime::ActorState;
 
 pub mod account_deletion;
+pub mod attachment_keys;
 pub mod attachments;
 pub mod auth;
 pub mod avatars;
@@ -28,6 +29,7 @@ pub mod history_sync;
 pub mod invites;
 pub mod message_actions;
 pub mod messages;
+pub mod native_history;
 pub mod poll_crypto;
 pub mod prekeys;
 pub mod profile;
@@ -120,6 +122,9 @@ pub async fn dispatch(state: Arc<ActorState>, method: u32, payload: Vec<u8>) -> 
         0x0006_0004 => attachments::release(&state, payload).await,
         0x0006_0005 => attachments::recommend(&state, payload).await,
         0x0006_0006 => attachments::send_key(&state, payload).await,
+        0x0006_0007 => attachment_keys::store(&state, payload).await,
+        0x0006_0008 => attachment_keys::get(&state, payload).await,
+        0x0006_0009 => attachment_keys::delete(&state, payload).await,
 
         // avatars
         0x0007_0001 => avatars::upload(&state, payload).await,
@@ -131,6 +136,8 @@ pub async fn dispatch(state: Arc<ActorState>, method: u32, payload: Vec<u8>) -> 
         0x0007_0007 => avatars::delete_group(&state, payload).await,
         0x0007_0008 => avatars::upload_channel(&state, payload).await,
         0x0007_0009 => avatars::delete_channel(&state, payload).await,
+        0x0007_000A => avatars::get_group(&state, payload).await,
+        0x0007_000B => avatars::get_channel(&state, payload).await,
 
         // bots
         0x0008_0001 => bots::list(&state, payload).await,
@@ -307,6 +314,18 @@ pub async fn dispatch(state: Arc<ActorState>, method: u32, payload: Vec<u8>) -> 
         }
         crate::method_ids::HISTORY_REPLAY_COMMIT => history_replay::commit(&state, payload).await,
         crate::method_ids::HISTORY_REPLAY_DISCARD => history_replay::discard(&state, payload).await,
+        crate::method_ids::HISTORY_SYNC_RECEIVE_CHUNK => {
+            native_history::receive_chunk(&state, payload).await
+        }
+        crate::method_ids::HISTORY_SYNC_LIST_ITEMS => {
+            native_history::list_native_items(&state, payload).await
+        }
+        crate::method_ids::HISTORY_SYNC_RESPOND_REQUEST => {
+            native_history::respond_request(&state, payload).await
+        }
+        crate::method_ids::HISTORY_SYNC_LOAD_LOCAL_PAGE => {
+            native_history::load_local_page(&state, payload).await
+        }
 
         // webrtc
         0x0011_0001 => webrtc::ice_servers(&state, payload).await,
@@ -370,6 +389,8 @@ fn method_mutates_crypto_state(method: u32) -> bool {
             | crate::method_ids::POLL_CRYPTO_ENCRYPT_POLL_OPTION
             | crate::method_ids::POLL_CRYPTO_DECRYPT_POLL_PAYLOAD
             | crate::method_ids::HISTORY_REPLAY_COMMIT
+            | crate::method_ids::HISTORY_SYNC_RESPOND_REQUEST
+            | crate::method_ids::HISTORY_SYNC_LOAD_LOCAL_PAGE
             | crate::method_ids::WS_SEND_HISTORY
             | 0x0012_0010..=0x0012_0014
     )
@@ -412,6 +433,8 @@ mod crypto_state_serialization_tests {
             crate::method_ids::POLL_CRYPTO_ENCRYPT_POLL_OPTION,
             crate::method_ids::POLL_CRYPTO_DECRYPT_POLL_PAYLOAD,
             crate::method_ids::HISTORY_REPLAY_COMMIT,
+            crate::method_ids::HISTORY_SYNC_RESPOND_REQUEST,
+            crate::method_ids::HISTORY_SYNC_LOAD_LOCAL_PAGE,
             crate::method_ids::WS_SEND_HISTORY,
             0x0012_0010, // call offer
             0x0012_0011, // call answer

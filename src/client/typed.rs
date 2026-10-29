@@ -10,7 +10,33 @@ use serde::Serialize;
 use serde::de::DeserializeOwned;
 
 use super::{Client, method_ids};
-use crate::error::Result;
+use crate::error::{Error, Result};
+
+impl Client {
+    /// Publishes a channel post using a key retained by the caller for retries.
+    /// The request must serialize as an object with the regular publication
+    /// fields. The core carries the key separately and sends it only as the
+    /// `Idempotency-Key` HTTP header.
+    pub fn channel_posts_publish_with_idempotency_key<Q, R>(
+        &self,
+        request: &Q,
+        idempotency_key: &str,
+    ) -> Result<R>
+    where
+        Q: Serialize,
+        R: DeserializeOwned,
+    {
+        let mut payload = serde_json::to_value(request)?;
+        let object = payload.as_object_mut().ok_or_else(|| {
+            Error::InvalidPayload("channel post request must be an object".into())
+        })?;
+        object.insert(
+            "__core_idempotency_key".into(),
+            serde_json::Value::String(idempotency_key.to_owned()),
+        );
+        self.call_json(method_ids::CHANNEL_POSTS_PUBLISH, &payload)
+    }
+}
 
 macro_rules! request_methods {
     ($($name:ident => $method_id:ident, $operation:literal;)+) => {
@@ -88,6 +114,9 @@ request_methods! {
     attachments_release => ATTACHMENTS_RELEASE, "attachments_release";
     attachments_recommend => ATTACHMENTS_RECOMMEND, "attachments_recommend";
     attachments_send_key => ATTACHMENTS_SEND_KEY, "attachments_send_key";
+    attachments_key_store => ATTACHMENTS_KEY_STORE, "attachments_key_store";
+    attachments_key_get => ATTACHMENTS_KEY_GET, "attachments_key_get";
+    attachments_key_delete => ATTACHMENTS_KEY_DELETE, "attachments_key_delete";
     avatars_upload => AVATARS_UPLOAD, "avatars_upload";
     avatars_serve => AVATARS_SERVE, "avatars_serve";
     avatars_init_upload => AVATARS_INIT_UPLOAD, "avatars_init_upload";
@@ -96,6 +125,8 @@ request_methods! {
     avatars_delete_group => AVATARS_DELETE_GROUP, "avatars_delete_group";
     avatars_upload_channel => AVATARS_UPLOAD_CHANNEL, "avatars_upload_channel";
     avatars_delete_channel => AVATARS_DELETE_CHANNEL, "avatars_delete_channel";
+    avatars_get_group => AVATARS_GET_GROUP, "avatars_get_group";
+    avatars_get_channel => AVATARS_GET_CHANNEL, "avatars_get_channel";
     bots_set_profile => BOTS_SET_PROFILE, "bots_set_profile";
     bots_rotate_token => BOTS_ROTATE_TOKEN, "bots_rotate_token";
     bots_delete => BOTS_DELETE, "bots_delete";
@@ -207,6 +238,10 @@ request_methods! {
     history_replay_begin_saved_page => HISTORY_REPLAY_BEGIN_SAVED_PAGE, "history_replay_begin_saved_page";
     history_replay_commit => HISTORY_REPLAY_COMMIT, "history_replay_commit";
     history_replay_discard => HISTORY_REPLAY_DISCARD, "history_replay_discard";
+    history_sync_receive_chunk => HISTORY_SYNC_RECEIVE_CHUNK, "history_sync_receive_chunk";
+    history_sync_list_items => HISTORY_SYNC_LIST_ITEMS, "history_sync_list_items";
+    history_sync_respond_request => HISTORY_SYNC_RESPOND_REQUEST, "history_sync_respond_request";
+    history_sync_load_local_page => HISTORY_SYNC_LOAD_LOCAL_PAGE, "history_sync_load_local_page";
     chat_extras_saved_messages => CHAT_EXTRAS_SAVED_MESSAGES, "chat_extras_saved_messages";
     chat_extras_folder_create => CHAT_EXTRAS_FOLDER_CREATE, "chat_extras_folder_create";
     chat_extras_folder_update => CHAT_EXTRAS_FOLDER_UPDATE, "chat_extras_folder_update";

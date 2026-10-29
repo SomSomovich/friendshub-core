@@ -208,6 +208,16 @@ fn platform_store() -> keyring_core::Result<Arc<keyring_core::CredentialStore>> 
 pub(crate) struct SystemKeyStore;
 
 impl SystemKeyStore {
+    pub(crate) fn remove(&self, account: &str) -> Result<()> {
+        match keyring_core::Entry::new(SERVICE, account)
+            .map_err(store_error)?
+            .delete_credential()
+        {
+            Ok(()) | Err(keyring_core::Error::NoEntry) => Ok(()),
+            Err(error) => Err(store_error(error)),
+        }
+    }
+
     pub(crate) fn new() -> Result<Self> {
         static INITIALIZED: Mutex<bool> = Mutex::new(false);
         let mut initialized = INITIALIZED

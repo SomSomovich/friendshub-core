@@ -407,6 +407,61 @@ impl WebRtcManager {
         Ok(offer.sdp)
     }
 
+    /// Creates a first offer with an Opus audio track already attached.
+    /// This must happen before the first SDP is created: adding a track after
+    /// setting a local offer requires a full renegotiation.
+    pub async fn create_offer_with_audio(
+        &self,
+        call_id: &str,
+        ice_servers: Vec<serde_json::Value>,
+    ) -> Result<String> {
+        let call_lock = self.call_operation_lock(call_id).await;
+        let _call_guard = call_lock.lock().await;
+        let existing = self.peers.lock().await.get(call_id).cloned();
+        let pc = match existing {
+            Some(pc) => pc,
+            None => self.build_peer(call_id, ice_servers).await?,
+        };
+
+        if !self.audio.has_local(call_id).await {
+            let track = match self.audio.register_local(call_id, "audio").await {
+                Ok(track) => track,
+                Err(error) => {
+                    self.audio.drop_call(call_id).await;
+                    let _ = pc.close().await;
+                    return Err(error);
+                }
+            };
+            if let Err(error) = pc.add_track(track).await {
+                self.audio.drop_call(call_id).await;
+                let _ = pc.close().await;
+                return Err(Error::Internal(format!("add audio track: {error}")));
+            }
+        }
+
+        let result = async {
+            let offer = pc
+                .create_offer(None)
+                .await
+                .map_err(|e| Error::Internal(format!("create_offer: {e}")))?;
+            pc.set_local_description(offer.clone())
+                .await
+                .map_err(|e| Error::Internal(format!("set_local_description: {e}")))?;
+            self.peers
+                .lock()
+                .await
+                .insert(call_id.to_string(), pc.clone());
+            Ok(offer.sdp)
+        }
+        .await;
+
+        if result.is_err() {
+            self.audio.drop_call(call_id).await;
+            let _ = pc.close().await;
+        }
+        result
+    }
+
     pub async fn accept_offer(
         &self,
         call_id: &str,
@@ -420,11 +475,17 @@ impl WebRtcManager {
             Some(pc) => pc,
             None => self.build_peer(call_id, ice_servers).await?,
         };
-        let remote = RTCSessionDescription::offer(remote_sdp.to_string())
-            .map_err(|e| Error::Internal(format!("bad offer: {e}")))?;
-        pc.set_remote_description(remote)
-            .await
-            .map_err(|e| Error::Internal(format!("set_remote_description: {e}")))?;
+        let remote = match RTCSessionDescription::offer(remote_sdp.to_string()) {
+            Ok(remote) => remote,
+            Err(error) => {
+                let _ = pc.close().await;
+                return Err(Error::Internal(format!("bad offer: {error}")));
+            }
+        };
+        if let Err(error) = pc.set_remote_description(remote).await {
+            let _ = pc.close().await;
+            return Err(Error::Internal(format!("set_remote_description: {error}")));
+        }
         let answer = pc
             .create_answer(None)
             .await
@@ -434,6 +495,69 @@ impl WebRtcManager {
             .map_err(|e| Error::Internal(format!("set_local_description: {e}")))?;
         self.peers.lock().await.insert(call_id.to_string(), pc);
         Ok(answer.sdp)
+    }
+
+    /// Applies a remote offer and answers it with an Opus audio track when
+    /// the offer contains an audio media section. The track is attached after
+    /// the offer is set so WebRTC can bind it to the offered audio transceiver.
+    pub async fn accept_offer_with_audio(
+        &self,
+        call_id: &str,
+        remote_sdp: &str,
+        ice_servers: Vec<serde_json::Value>,
+        with_audio: bool,
+    ) -> Result<String> {
+        let call_lock = self.call_operation_lock(call_id).await;
+        let _call_guard = call_lock.lock().await;
+        let existing = self.peers.lock().await.get(call_id).cloned();
+        let pc = match existing {
+            Some(pc) => pc,
+            None => self.build_peer(call_id, ice_servers).await?,
+        };
+        let remote = RTCSessionDescription::offer(remote_sdp.to_string())
+            .map_err(|e| Error::Internal(format!("bad offer: {e}")))?;
+        pc.set_remote_description(remote)
+            .await
+            .map_err(|e| Error::Internal(format!("set_remote_description: {e}")))?;
+
+        let has_remote_audio = remote_sdp.lines().any(|line| line.starts_with("m=audio "));
+        if with_audio && has_remote_audio && !self.audio.has_local(call_id).await {
+            let track = match self.audio.register_local(call_id, "audio").await {
+                Ok(track) => track,
+                Err(error) => {
+                    self.audio.drop_call(call_id).await;
+                    let _ = pc.close().await;
+                    return Err(error);
+                }
+            };
+            if let Err(error) = pc.add_track(track).await {
+                self.audio.drop_call(call_id).await;
+                let _ = pc.close().await;
+                return Err(Error::Internal(format!("add audio track: {error}")));
+            }
+        }
+
+        let result = async {
+            let answer = pc
+                .create_answer(None)
+                .await
+                .map_err(|e| Error::Internal(format!("create_answer: {e}")))?;
+            pc.set_local_description(answer.clone())
+                .await
+                .map_err(|e| Error::Internal(format!("set_local_description: {e}")))?;
+            self.peers
+                .lock()
+                .await
+                .insert(call_id.to_string(), pc.clone());
+            Ok(answer.sdp)
+        }
+        .await;
+
+        if result.is_err() {
+            self.audio.drop_call(call_id).await;
+            let _ = pc.close().await;
+        }
+        result
     }
 
     pub async fn apply_answer(&self, call_id: &str, remote_sdp: &str) -> Result<()> {

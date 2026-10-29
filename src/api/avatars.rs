@@ -115,6 +115,39 @@ pub async fn delete_channel(state: &Arc<ActorState>, payload: Vec<u8>) -> Result
     delete_conversation(state, payload, "channels").await
 }
 
+/// Fetches a group's public avatar through the shared conversation-avatar
+/// route. Bytes are base64-wrapped so the response remains JSON over FFI.
+pub async fn get_group(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
+    serve_conversation(state, payload).await
+}
+
+/// Fetches a channel's public avatar through the shared conversation-avatar
+/// route. Bytes are base64-wrapped so the response remains JSON over FFI.
+pub async fn get_channel(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
+    serve_conversation(state, payload).await
+}
+
+async fn serve_conversation(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
+    let params: ConversationAvatarParams = serde_json::from_slice(&payload)?;
+    let conversation_id = path_segment(&params.conversation_id, "conversation_id")?;
+    let path = format!("/api/v1/conversations/{conversation_id}/avatar");
+    let bytes = state.http.get_absolute_relative(&path).await?;
+    validate_avatar_bytes(&bytes)?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Ok(serde_json::to_vec(&ConversationAvatarResult {
+        conversation_id: params.conversation_id,
+        content_type: "image/webp".into(),
+        data_base64: encoded,
+    })?)
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ConversationAvatarResult {
+    pub conversation_id: String,
+    pub content_type: String,
+    pub data_base64: String,
+}
+
 async fn upload_conversation(
     state: &Arc<ActorState>,
     payload: Vec<u8>,

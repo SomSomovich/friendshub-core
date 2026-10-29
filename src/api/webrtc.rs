@@ -153,12 +153,21 @@ pub async fn list_active(state: &Arc<ActorState>, _payload: Vec<u8>) -> Result<V
 pub struct InitiateCallRequest {
     pub recipient_account_id: String,
     pub call_id: String,
+    #[serde(default)]
+    pub with_audio: bool,
 }
 
 pub async fn initiate_call(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
     let req: InitiateCallRequest = serde_json::from_slice(&payload)?;
     let ice = fetch_ice(state).await?;
-    let sdp = state.webrtc.create_offer(&req.call_id, ice).await?;
+    let sdp = if req.with_audio {
+        state
+            .webrtc
+            .create_offer_with_audio(&req.call_id, ice)
+            .await?
+    } else {
+        state.webrtc.create_offer(&req.call_id, ice).await?
+    };
     let sent = match crate::webrtc::signal::send_call_offer(
         state,
         &req.recipient_account_id,
@@ -185,15 +194,24 @@ pub struct AcceptIncomingCallRequest {
     pub recipient_account_id: String,
     pub call_id: String,
     pub remote_sdp: String,
+    #[serde(default)]
+    pub with_audio: bool,
 }
 
 pub async fn accept_call(state: &Arc<ActorState>, payload: Vec<u8>) -> Result<Vec<u8>> {
     let req: AcceptIncomingCallRequest = serde_json::from_slice(&payload)?;
     let ice = fetch_ice(state).await?;
-    let sdp = state
-        .webrtc
-        .accept_offer(&req.call_id, &req.remote_sdp, ice)
-        .await?;
+    let sdp = if req.with_audio {
+        state
+            .webrtc
+            .accept_offer_with_audio(&req.call_id, &req.remote_sdp, ice, true)
+            .await?
+    } else {
+        state
+            .webrtc
+            .accept_offer(&req.call_id, &req.remote_sdp, ice)
+            .await?
+    };
     let sent = match crate::webrtc::signal::send_call_answer(
         state,
         &req.recipient_account_id,

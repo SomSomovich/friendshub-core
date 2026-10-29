@@ -308,6 +308,32 @@ not lose the result. A pending stage survives restart for five minutes; a
 commit receipt is also retained for five minutes. At most four pages can be
 pending per database.
 
+### Native history transfer storage
+
+Native history transfer stores incomplete chunks, imported message records,
+attachment keys, and replay cursors in the account SQLCipher database.
+`history_sync_receive_chunk` is called with authenticated envelope metadata
+and a decoded history chunk; callers acknowledge the durable envelope only
+after this method succeeds. It validates the own-device identity, assembles the
+WEB wire format, and stores complete records before returning. Attachment keys
+are written to the existing encrypted attachment-key table in the same
+transaction.
+
+| ID | Typed Rust method | Request | Response |
+|---|---|---|---|
+| `0x0013_0040` | `history_sync_receive_chunk` | authenticated envelope metadata plus `decrypted_payload` history chunk | assembly progress and completed durable item, when available |
+| `0x0013_0041` | `history_sync_list_items` | `{"conversation_id":"uuid","limit":5000}` | imported message items from SQLCipher |
+| `0x0013_0042` | `history_sync_respond_request` | `{"from_device_number":2,"conversation_ids":["uuid"]}` | WEB-compatible send result; partial queue submission is reported with `complete:false` |
+| `0x0013_0043` | `history_sync_load_local_page` | `{"conversation_id":"uuid","older":false}` | imported message count and `hasOlder` state |
+
+`history_sync_respond_request` verifies the target is another active account
+device and excludes channel conversations. It replays server history page by
+page, persists each page and attachment keys before committing the replay
+token, and then sends the account's durable history items over the core
+WebSocket. `history_sync_load_local_page` uses the same persist-before-commit
+ordering for history on the current device. A failed replay commit rolls back
+only records introduced by that page.
+
 If native commit returns `conflict: true`, another crypto operation changed
 the live state. The host must atomically roll back only this page using
 `rollback.messageIds`, `rollback.attachmentIds`, and
@@ -346,6 +372,20 @@ envelope with `envelope_type = 9` (`ENVELOPE_TYPE_ATTACHMENT_KEY`).
 | `0x0006_0004` | `{"id":"uuid"}` | drop a reference; blob deleted when last claim goes |
 | `0x0006_0005` | `{"total_size":123456}` | chunk layout recommendation |
 | `0x0006_0006` | `{"recipient_account_id":"...","attachment_id":"...","key_hex":"...","base_nonce_hex":"..."}` | forward the key to every device of the recipient |
+| `0x0006_0007` | `{"attachment_id":"...","key_hex":"...","base_nonce_hex":"...","conversation_id":"..."}` | save key material in the encrypted account database; identical saves are idempotent and conflicting values are rejected |
+| `0x0006_0008` | `{"attachment_id":"..."}` | return the saved key record, or JSON `null` |
+| `0x0006_0009` | `{"attachment_id":"..."}` | remove the saved key record; return `{"deleted":true/false}` |
+
+The `conversation_id` field for key storage is optional and may be `null`.
+The local key record never leaves the encrypted account database except when
+the client explicitly uses it to decrypt or forward the attachment key.
+
+### Community avatars
+
+| ID | Request | Notes |
+|---|---|---|
+| `0x0007_000A` | `{"conversation_id":"..."}` | fetch a group's public avatar as `{conversation_id, content_type, data_base64}` |
+| `0x0007_000B` | `{"conversation_id":"..."}` | fetch a channel's public avatar as `{conversation_id, content_type, data_base64}` |
 
 ### WebRTC calls
 

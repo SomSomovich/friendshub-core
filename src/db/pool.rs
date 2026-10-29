@@ -33,6 +33,15 @@ async fn acquire_open_lock(
     tokio::task::spawn_blocking(move || {
         let path = key_store::normalize_path(&requested_path)?;
         let open_lock = DatabaseOpenLock::acquire(&path)?;
+        match std::fs::symlink_metadata(removal_marker_path(&path)) {
+            Ok(_) => return Err(Error::Database("local account removal is pending".into())),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => {
+                return Err(Error::Database(
+                    "could not inspect database removal marker".into(),
+                ));
+            }
+        }
         let file_state = encryption::classify(&path)?;
         if file_state == DatabaseFileState::PlaintextSqlite {
             return Err(Error::Database(
@@ -43,6 +52,97 @@ async fn acquire_open_lock(
     })
     .await
     .map_err(|_| Error::Database("database startup lock task failed".into()))?
+}
+
+/// App-owned durable journal filename. Its presence prevents database opens
+/// even after a crash between tombstoning and physical cleanup.
+pub fn removal_marker_path(path: &Path) -> std::path::PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(".removing.json");
+    name.into()
+}
+
+/// Non-sensitive cleanup stage, preserved for a specific native UI retry
+/// message without exposing SQLite paths or credential-provider payloads.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum LocalDatabaseRemovalError {
+    InvalidPath,
+    LockUnavailable,
+    MissingMarker,
+    Files,
+    SecureStore,
+}
+
+/// Retryable physical cleanup, protected by the same lifetime lock used by
+/// database opens. Missing files/credentials mean an earlier retry removed
+/// them. The marker is retained by the caller until the manifest is committed.
+pub fn remove_local_database(path: &Path) -> std::result::Result<(), LocalDatabaseRemovalError> {
+    let fail = || LocalDatabaseRemovalError::Files;
+    if !path.is_absolute() {
+        return Err(fail());
+    }
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if !metadata.file_type().is_file() => return Err(fail()),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(_) => return Err(fail()),
+    }
+    let path =
+        key_store::normalize_path(path).map_err(|_| LocalDatabaseRemovalError::InvalidPath)?;
+    let _lock =
+        DatabaseOpenLock::acquire(&path).map_err(|_| LocalDatabaseRemovalError::LockUnavailable)?;
+    // Never follow a database symlink to another account or a hard link to a
+    // shared file. Validate all siblings before removing any of them.
+    let paths = ["", "-wal", "-shm", "-journal"].map(|suffix| {
+        let mut file = path.as_os_str().to_os_string();
+        file.push(suffix);
+        std::path::PathBuf::from(file)
+    });
+    for path in &paths {
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) => {
+                if !metadata.file_type().is_file() {
+                    return Err(fail());
+                }
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    if metadata.nlink() != 1 {
+                        return Err(fail());
+                    }
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(fail()),
+        }
+    }
+    let marker = removal_marker_path(&path);
+    if !std::fs::symlink_metadata(&marker)
+        .map_err(|_| LocalDatabaseRemovalError::MissingMarker)?
+        .file_type()
+        .is_file()
+    {
+        return Err(LocalDatabaseRemovalError::MissingMarker);
+    }
+    let store = SystemKeyStore::new().map_err(|_| LocalDatabaseRemovalError::SecureStore)?;
+    let account = key_store::account_for_normalized_path(&path)
+        .map_err(|_| LocalDatabaseRemovalError::InvalidPath)?;
+    for path in paths {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(_) => return Err(fail()),
+        }
+    }
+    #[cfg(unix)]
+    std::fs::File::open(path.parent().ok_or_else(fail)?)
+        .and_then(|directory| directory.sync_all())
+        .map_err(|_| fail())?;
+    // Delete the credential last; a failed file unlink must not make the
+    // remaining encrypted database permanently unreadable.
+    store
+        .remove(&account)
+        .map_err(|_| LocalDatabaseRemovalError::SecureStore)
 }
 
 async fn open_normalized_with_key_store(
@@ -80,9 +180,13 @@ async fn open_normalized_with_key_store(
         .pragma("temp_store", "MEMORY")
         .foreign_keys(true);
 
+    // Keep the cross-process path lock for the complete pool lifetime, not
+    // just key setup. Purge must never unlink another live client's database.
+    let open_lock = Arc::new(open_lock);
     let pool = SqlitePoolOptions::new()
         .max_connections(4)
         .after_connect(move |connection, _metadata| {
+            let _open_lock = &open_lock;
             let key = connection_key.clone();
             Box::pin(async move {
                 encryption::apply_key(connection, key.as_ref()).await?;
@@ -102,6 +206,5 @@ async fn open_normalized_with_key_store(
     }
 
     drop(key);
-    drop(open_lock);
     Ok(pool)
 }

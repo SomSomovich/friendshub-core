@@ -1,5 +1,6 @@
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 use std::thread;
 use std::time::Duration;
 
@@ -32,7 +33,9 @@ pub struct Request {
 pub struct Actor {
     tx: mpsc::UnboundedSender<ActorMessage>,
     thread_done: crossbeam_channel::Receiver<()>,
-    thread: Option<thread::JoinHandle<()>>,
+    thread: StdMutex<Option<thread::JoinHandle<()>>>,
+    closed: AtomicBool,
+    shutdown_failed: AtomicBool,
 }
 
 pub struct ActorState {
@@ -110,6 +113,8 @@ impl Actor {
                 };
 
                 let local = LocalSet::new();
+                let database = std::rc::Rc::new(std::cell::RefCell::new(None::<Db>));
+                let database_for_actor = database.clone();
                 run_local_set(&rt, local, async move {
                     let state = match init().await {
                         Ok(s) => s,
@@ -122,6 +127,9 @@ impl Actor {
                         let _ = init_tx.send(Err(error));
                         return;
                     }
+                    // Retain a pool handle outside LocalSet so shutdown can
+                    // close physical connections after all local tasks drop.
+                    *database_for_actor.borrow_mut() = Some(state.db.clone());
                     let state = Arc::new(state);
 
                     // WebRTC event forwarder. Runs for the lifetime of the actor.
@@ -150,6 +158,10 @@ impl Actor {
 
                     run(rx, state).await;
                 });
+                if let Some(database) = database.borrow_mut().take() {
+                    rt.block_on(database.close());
+                    drop(database);
+                }
                 drop(rt);
                 let _ = thread_done_tx.send(());
             })
@@ -159,7 +171,9 @@ impl Actor {
             Ok(Ok(())) => Ok(Self {
                 tx,
                 thread_done,
-                thread: Some(thread),
+                thread: StdMutex::new(Some(thread)),
+                closed: AtomicBool::new(false),
+                shutdown_failed: AtomicBool::new(false),
             }),
             Ok(Err(e)) => {
                 let _ = thread.join();
@@ -172,7 +186,32 @@ impl Actor {
         }
     }
 
+    pub fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::SeqCst)
+    }
+
+    /// Join the worker only after its tasks, SQLite connections and runtime
+    /// have been released. Unlike Drop's bounded best effort, this is the
+    /// explicit barrier required before deleting account-owned files.
+    pub fn shutdown(&self) -> Result<()> {
+        self.closed.store(true, Ordering::SeqCst);
+        let mut thread = self.thread.lock().map_err(|_| Error::ActorClosed)?;
+        if let Some(worker) = thread.take() {
+            let _ = self.tx.send(ActorMessage::Shutdown);
+            if worker.join().is_err() {
+                self.shutdown_failed.store(true, Ordering::SeqCst);
+            }
+        }
+        if self.shutdown_failed.load(Ordering::SeqCst) {
+            return Err(Error::Internal("core shutdown worker failed".into()));
+        }
+        Ok(())
+    }
+
     pub fn call(&self, method: u32, payload: Vec<u8>) -> Result<Vec<u8>> {
+        if self.is_closed() {
+            return Err(Error::ActorClosed);
+        }
         let (reply_tx, reply_rx) = crossbeam_channel::bounded(1);
         let req = Request {
             method,
@@ -190,10 +229,18 @@ impl Drop for Actor {
     fn drop(&mut self) {
         // The completion signal arrives after LocalSet and Tokio runtime
         // teardown, because SQLx connections can be returned while tasks drop.
+        self.closed.store(true, Ordering::SeqCst);
+        let thread = self
+            .thread
+            .get_mut()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if thread.is_none() {
+            return;
+        }
         let _ = self.tx.send(ActorMessage::Shutdown);
         match self.thread_done.recv_timeout(Duration::from_secs(2)) {
             Ok(()) | Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                if let Some(thread) = self.thread.take() {
+                if let Some(thread) = thread.take() {
                     let _ = thread.join();
                 }
             }
