@@ -356,6 +356,7 @@ macro_rules! browser_api_methods {
 browser_api_methods! {
     // The backend health endpoint is mounted at the root (outside `/api/v1`).
     (getHealth, "GET", "/health", none, false, &[]),
+    (getMetrics, "GET", "/metrics", none, false, &[]),
     (register, "POST", "/register", input, false, &[]),
     (login, "POST", "/login", input, false, &[]),
     (loginWithTotp, "POST", "/login/2fa", input, false, &[]),
@@ -1638,9 +1639,14 @@ mod tests {
     }
 
     #[test]
-    fn health_operation_uses_the_root_mounted_protobuf_endpoint() {
+    fn health_and_metrics_use_their_root_endpoint_wire_formats() {
         let health = prepare_rest_request("GET", "/health", None, None, None).unwrap();
-        assert_eq!(health.protocol, RestProtocol::Protobuf);
+        assert_eq!(health.protocol, RestProtocol::Json);
+        assert_eq!(health.accept, None);
+
+        let metrics = prepare_rest_request("GET", "/metrics", None, None, None).unwrap();
+        assert_eq!(metrics.protocol, RestProtocol::PrometheusText);
+        assert_eq!(metrics.accept, Some("text/plain; version=0.0.4"));
     }
 
     #[test]

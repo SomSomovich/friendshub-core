@@ -10,12 +10,13 @@ service workers, and notification permission/delivery remain in WEB.
 ## BrowserApi
 
 `new BrowserApi(apiBase)` exposes named operations corresponding to the direct
-REST calls in `friendshubWEB/src/api`. It covers 182 exported WEB operations,
+REST calls in `friendshubWEB/src/api`. It covers 183 exported operations,
 including session/device management, conversations, attachments, groups,
-channels, bots, profile/search, calls, and WebRTC ICE server discovery. Pass
-the same camelCase fields used by WEB; route construction, query aliases,
-protobuf conversion, binary uploads, idempotency headers, and device-header
-policy are handled by the binding.
+channels, bots, profile/search, calls, WebRTC ICE server discovery, and the
+root health and Prometheus metrics endpoints. `getHealth()` returns JSON;
+`getMetrics()` returns Prometheus text. Pass the same camelCase fields used by
+WEB; route construction, query aliases, protobuf conversion, binary uploads,
+idempotency headers, and device-header policy are handled by the binding.
 
 ```js
 const api = new BrowserApi('https://api.example.test/api/v1')
@@ -34,7 +35,7 @@ response handling.
 
 `new BrowserRestClient(apiBase)` accepts the API origin or `/api/v1` URL used
 by WEB. `request(method, path, body, bearer, signal, responseType)` handles
-registered protobuf routes and the existing JSON exceptions. Use
+registered protobuf routes, JSON endpoints, and Prometheus metrics. Use
 `request_raw(method, path, body, contentType, bearer, signal, responseType)`
 for registered binary uploads; a browser `Blob` can be passed through as the
 body without first copying the complete file into Rust memory. Set the

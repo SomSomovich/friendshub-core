@@ -235,7 +235,9 @@ impl HttpClient {
 
             if !status.is_success() {
                 let body = match protocol {
-                    Protocol::Protobuf(_) | Protocol::RawProtobufErrors => {
+                    Protocol::Protobuf(_)
+                    | Protocol::RawProtobufErrors
+                    | Protocol::PrometheusText => {
                         let bytes = resp.bytes().await.unwrap_or_default();
                         protobuf::decode_http_error_body(protocol, &bytes)
                     }
@@ -254,6 +256,7 @@ impl HttpClient {
             let bytes = match protocol {
                 Protocol::Protobuf(route) => protobuf::decode_response_body(route, &bytes)?,
                 Protocol::Json | Protocol::RawProtobufErrors => bytes.to_vec(),
+                Protocol::PrometheusText => protobuf::decode_prometheus_text(&bytes)?,
             };
             if bytes.is_empty() {
                 return serde_json::from_slice(b"null")
@@ -444,6 +447,14 @@ impl HttpClient {
                     "raw avatar responses must use get_absolute_relative".into(),
                 ));
             }
+            Protocol::PrometheusText => {
+                if body.is_some() {
+                    return Err(Error::InvalidPayload(
+                        "Prometheus metrics requests do not accept a request body".into(),
+                    ));
+                }
+                None
+            }
         };
         let mut attempt: u32 = 0;
 
@@ -460,6 +471,9 @@ impl HttpClient {
                     if let Some(body) = body {
                         req = req.json(body);
                     }
+                }
+                Protocol::PrometheusText => {
+                    req = req.header(ACCEPT, protobuf::PROMETHEUS_MEDIA_TYPE);
                 }
                 Protocol::Protobuf(route) => {
                     req = req.header(ACCEPT, PROTOBUF_MEDIA_TYPE);
@@ -493,7 +507,9 @@ impl HttpClient {
 
             if !status.is_success() {
                 let body = match protocol {
-                    Protocol::Protobuf(_) | Protocol::RawProtobufErrors => {
+                    Protocol::Protobuf(_)
+                    | Protocol::RawProtobufErrors
+                    | Protocol::PrometheusText => {
                         let bytes = resp.bytes().await.unwrap_or_default();
                         protobuf::decode_http_error_body(protocol, &bytes)
                     }
@@ -513,6 +529,7 @@ impl HttpClient {
                 Protocol::Protobuf(route) => protobuf::decode_response_body(route, &bytes)?,
                 Protocol::Json if bytes.is_empty() => b"null".to_vec(),
                 Protocol::Json => bytes.to_vec(),
+                Protocol::PrometheusText => protobuf::decode_prometheus_text(&bytes)?,
                 Protocol::RawProtobufErrors => unreachable!("raw response was rejected above"),
             };
             return serde_json::from_slice(&bytes)

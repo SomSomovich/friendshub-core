@@ -13,6 +13,7 @@ use crate::proto::rest::{chat, community, identity};
 
 const API_PREFIX: &str = "/api/v1";
 const PROTOBUF_MEDIA_TYPE: &str = "application/x-protobuf";
+pub(super) const PROMETHEUS_MEDIA_TYPE: &str = "text/plain; version=0.0.4";
 
 /// Wire protocol selected for a REST endpoint.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -20,6 +21,7 @@ pub enum RestProtocol {
     Json,
     Protobuf,
     RawProtobufErrors,
+    PrometheusText,
 }
 
 /// Encoded request ready to send over a platform-specific HTTP adapter.
@@ -182,20 +184,6 @@ macro_rules! raw_request_route {
         }
     };
 }
-
-static HEALTH_ROUTE: RouteSpec = RouteSpec {
-    method: "GET",
-    path: "/health",
-    request: RequestBody::None,
-    response: Some((
-        decode_response::<crate::proto::rest::HealthResponse>,
-        ResponseShape::Object,
-    )),
-    #[cfg(test)]
-    request_round_trip: None,
-    #[cfg(test)]
-    response_fixture: Some(encode_default::<crate::proto::rest::HealthResponse>),
-};
 
 static ROUTES: &[RouteSpec] = &[
     // Authentication, sessions and account deletion.
@@ -498,6 +486,9 @@ pub(super) enum Protocol {
     Protobuf(&'static RouteSpec),
     /// Public avatar bytes stay raw; only error envelopes use protobuf.
     RawProtobufErrors,
+    /// Prometheus scrape output is plain text on the wire and a JSON string
+    /// at the platform binding boundary.
+    PrometheusText,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -527,7 +518,10 @@ pub(super) fn protocol_for(method: &str, path_and_query: &str) -> Result<Protoco
         .split_once('?')
         .map_or(path_and_query, |(path, _)| path);
     if method == "GET" && path == "/health" {
-        return Ok(Protocol::Protobuf(&HEALTH_ROUTE));
+        return Ok(Protocol::Json);
+    }
+    if matches!(method, "GET" | "HEAD") && path == "/metrics" {
+        return Ok(Protocol::PrometheusText);
     }
     let Some(local_path) = path
         .strip_prefix(API_PREFIX)
@@ -602,6 +596,19 @@ pub fn prepare_rest_request(
                 body,
             })
         }
+        Protocol::PrometheusText => {
+            if json_body.is_some() || raw_body.is_some() {
+                return Err(Error::InvalidPayload(
+                    "this REST endpoint does not accept a request body".into(),
+                ));
+            }
+            Ok(RestRequest {
+                protocol: RestProtocol::PrometheusText,
+                accept: Some(PROMETHEUS_MEDIA_TYPE),
+                content_type: None,
+                body: None,
+            })
+        }
         Protocol::Protobuf(route) => match route.request {
             RequestBody::None => {
                 if json_body.is_some() || raw_body.is_some() {
@@ -665,8 +672,9 @@ pub fn prepare_rest_request(
 }
 
 /// Decodes a successful HTTP response using the endpoint's registered wire
-/// contract. Raw media responses remain raw bytes; structured responses become
-/// JSON bytes suitable for conversion by the platform binding.
+/// contract. Raw media responses remain raw bytes. Prometheus text is encoded
+/// as a JSON string, and structured responses become JSON bytes for the
+/// platform binding.
 pub fn finish_rest_response(
     method: &str,
     path_and_query: &str,
@@ -684,6 +692,7 @@ pub fn finish_rest_response(
     match protocol {
         Protocol::Json if body.is_empty() => Ok(b"null".to_vec()),
         Protocol::Json | Protocol::RawProtobufErrors => Ok(body.to_vec()),
+        Protocol::PrometheusText => decode_prometheus_text(body),
         Protocol::Protobuf(route) => decode_response_body(route, body),
     }
 }
@@ -757,15 +766,16 @@ pub(super) fn decode_error_body(bytes: &[u8]) -> String {
 
 pub(super) fn decode_http_error_body(protocol: Protocol, bytes: &[u8]) -> String {
     match protocol {
-        Protocol::Protobuf(route) if route.path == "/health" => {
-            match decode_response_body(route, bytes) {
-                Ok(body) => String::from_utf8_lossy(&body).into_owned(),
-                Err(_) => String::from_utf8_lossy(bytes).into_owned(),
-            }
-        }
         Protocol::Protobuf(_) | Protocol::RawProtobufErrors => decode_error_body(bytes),
-        Protocol::Json => String::from_utf8_lossy(bytes).into_owned(),
+        Protocol::Json | Protocol::PrometheusText => String::from_utf8_lossy(bytes).into_owned(),
     }
+}
+
+pub(super) fn decode_prometheus_text(bytes: &[u8]) -> Result<Vec<u8>> {
+    let text = std::str::from_utf8(bytes).map_err(|error| {
+        Error::InvalidPayload(format!("Prometheus response is not UTF-8: {error}"))
+    })?;
+    serde_json::to_vec(text).map_err(|error| Error::InvalidPayload(error.to_string()))
 }
 
 fn encode_request<M>(value: Value) -> Result<Vec<u8>>
@@ -1277,21 +1287,16 @@ mod tests {
             "update this coverage assertion when the registered API changes"
         );
 
-        assert_eq!(HEALTH_ROUTE.method, "GET");
-        assert_eq!(HEALTH_ROUTE.path, "/health");
-        let Protocol::Protobuf(health_route) = protocol_for("GET", "/health").unwrap() else {
-            panic!("health did not select protobuf");
-        };
-        assert!(std::ptr::eq(&HEALTH_ROUTE, health_route));
-        let Some((decode, shape)) = HEALTH_ROUTE.response else {
-            panic!("health must decode a protobuf response");
-        };
-        let health_wire = HEALTH_ROUTE
-            .response_fixture
-            .expect("health route must have a response fixture")();
-        let health_value = decode(&health_wire, shape).unwrap();
-        assert!(health_value.is_object());
-        assert!(finish_rest_response("GET", "/health", 200, &health_wire).is_ok());
+        assert!(matches!(
+            protocol_for("GET", "/health").unwrap(),
+            Protocol::Json
+        ));
+        let health_json =
+            br#"{"status":"ok","version":"0.1.0","uptime_secs":1,"database":"ok","timestamp":2}"#;
+        assert_eq!(
+            finish_rest_response("GET", "/health", 200, health_json).unwrap(),
+            health_json
+        );
     }
 
     #[test]
@@ -1344,6 +1349,18 @@ mod tests {
             serde_json::from_slice::<Value>(bot_request.body.as_deref().unwrap()).unwrap(),
             serde_json::json!({"callback_query_id": "callback"})
         );
+
+        let metrics_request = prepare_rest_request("GET", "/metrics", None, None, None).unwrap();
+        assert_eq!(metrics_request.protocol, RestProtocol::PrometheusText);
+        assert_eq!(metrics_request.accept, Some(PROMETHEUS_MEDIA_TYPE));
+        assert_eq!(metrics_request.body, None);
+        let metrics_body =
+            b"# TYPE friendshub_http_requests_total counter\nfriendshub_http_requests_total 1\n";
+        let decoded_metrics: String = serde_json::from_slice(
+            &finish_rest_response("GET", "/metrics", 200, metrics_body).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(decoded_metrics.as_bytes(), metrics_body);
 
         let avatar_request =
             prepare_rest_request("GET", "/api/v1/avatars/account", None, None, None).unwrap();
@@ -1490,7 +1507,11 @@ mod tests {
         ));
         assert!(matches!(
             protocol_for("GET", "/health").unwrap(),
-            Protocol::Protobuf(_)
+            Protocol::Json
+        ));
+        assert!(matches!(
+            protocol_for("GET", "/metrics").unwrap(),
+            Protocol::PrometheusText
         ));
         assert!(protocol_for("GET", "/api/v1/not-registered").is_err());
     }
@@ -1517,21 +1538,9 @@ mod tests {
 
     #[test]
     fn health_error_body_keeps_health_response_fields() {
-        let encoded = crate::proto::rest::HealthResponse {
-            status: "degraded".into(),
-            version: "0.1.0".into(),
-            uptime_secs: 12,
-            database: "down".into(),
-            timestamp: 34,
-        }
-        .encode_to_vec();
-        let Protocol::Protobuf(route) = protocol_for("GET", "/health").unwrap() else {
-            panic!("health must use protobuf");
-        };
-
+        let health_json = br#"{"status":"degraded","version":"0.1.0","uptime_secs":12,"database":"down","timestamp":34}"#;
         let body: Value =
-            serde_json::from_str(&decode_http_error_body(Protocol::Protobuf(route), &encoded))
-                .unwrap();
+            serde_json::from_str(&decode_http_error_body(Protocol::Json, health_json)).unwrap();
         assert_eq!(body["status"], "degraded");
         assert_eq!(body["database"], "down");
     }

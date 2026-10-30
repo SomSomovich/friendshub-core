@@ -15,13 +15,3 @@ message ErrorDetails {
   optional int64 kyber_one_time_available = 2;
   optional int64 minimum_required = 3;
 }
-
-// Public process and database status. /health remains an HTTP GET, but its
-// body uses the same protobuf media type as the first-party REST API.
-message HealthResponse {
-  string status = 1;
-  string version = 2;
-  uint64 uptime_secs = 3;
-  string database = 4;
-  int64 timestamp = 5;
-}

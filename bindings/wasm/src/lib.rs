@@ -164,7 +164,11 @@ impl BrowserRestClient {
         )
         .map_err(request_core_error_to_js)?;
         let absolute_url = is_absolute_http_url(&path);
-        if !matches!(prepared.protocol, RestProtocol::Protobuf) && !absolute_url {
+        if !matches!(
+            prepared.protocol,
+            RestProtocol::Protobuf | RestProtocol::Json
+        ) && !absolute_url
+        {
             return Err(RestError::new(
                 "invalid_request",
                 0,
@@ -698,7 +702,7 @@ impl BrowserRestClient {
         } else {
             format!("/{path}")
         };
-        if path == "/health" {
+        if matches!(path.as_str(), "/health" | "/metrics") {
             return Ok(format!("{}{path}", self.origin));
         }
         if path.starts_with("/api/") {
@@ -1362,7 +1366,7 @@ mod tests {
     }
 
     #[test]
-    fn absolute_and_api_paths_keep_their_route_and_health_is_root_mounted() {
+    fn absolute_and_api_paths_keep_their_route_and_health_metrics_are_root_mounted() {
         let base = normalize_api_base("https://api.example.test/api/v1").unwrap();
         let client = BrowserRestClient {
             origin: base.origin,
@@ -1378,6 +1382,10 @@ mod tests {
         assert_eq!(
             client.request_url("/health").unwrap(),
             "https://api.example.test/health"
+        );
+        assert_eq!(
+            client.request_url("/metrics").unwrap(),
+            "https://api.example.test/metrics"
         );
         assert_eq!(
             client.request_url("/api/bot/v1/messages?offset=2").unwrap(),
@@ -1403,6 +1411,7 @@ mod tests {
         };
         assert_eq!(client.request_url("/api/v1/me").unwrap(), "/api/v1/me");
         assert_eq!(client.request_url("/health").unwrap(), "/health");
+        assert_eq!(client.request_url("/metrics").unwrap(), "/metrics");
         assert_eq!(client.request_url("/contacts").unwrap(), "/api/v1/contacts");
     }
 
