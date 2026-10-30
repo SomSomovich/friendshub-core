@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "api_base": "https://api.fh.somuch-system.ru",
-  "ws_url": "wss://api.fh.somuch-system.ru/ws",
+  "api_base": "https://api-fh.somuch-system.ru",
+  "ws_url": "wss://api-fh.somuch-system.ru/ws",
   "updated_at": null
 }
